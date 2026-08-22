@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use khronos_egl as egl;
 use libloading::Library;
+use x11rb::protocol::damage;
 
 use crate::graphics::renderer;
 use crate::x11::capture::CapturedPixmap;
@@ -27,6 +28,9 @@ pub struct EglContext {
     captured_image: Option<egl::Image>,
     captured_pixmap: Option<u32>,
     capture_renderer: Option<renderer::CaptureRenderer>,
+    damage: Option<damage::Damage>,
+    source_window: Option<u32>,
+    source_size: Option<(u16, u16)>,
     width: i32,
     height: i32,
 }
@@ -39,7 +43,7 @@ impl EglContext {
         instance.make_current(display, None, None, Some(context))?;
         renderer::load(|name| instance.get_proc_address(name).map_or(std::ptr::null(), |pointer| pointer as *const c_void));
 
-        Ok(Self { instance, display, context, surface: None, window: None, colormap: None, connection: None, _native_window: None, captured_image: None, captured_pixmap: None, capture_renderer: None, width: 1, height: 1 })
+        Ok(Self { instance, display, context, surface: None, window: None, colormap: None, connection: None, _native_window: None, captured_image: None, captured_pixmap: None, capture_renderer: None, damage: None, source_window: None, source_size: None, width: 1, height: 1 })
     }
 
     pub fn create(mut connection: X11Connection) -> Result<Self, Box<dyn Error>> {
@@ -61,7 +65,7 @@ impl EglContext {
         renderer::load(|name| instance.get_proc_address(name).map_or(std::ptr::null(), |pointer| pointer as *const c_void));
         renderer::resize(640, 360);
 
-        Ok(Self { instance, display, context, surface: Some(surface), window: Some(window), colormap: Some(colormap), connection: Some(connection), _native_window: Some(native_window), captured_image: None, captured_pixmap: None, capture_renderer: None, width: 640, height: 360 })
+        Ok(Self { instance, display, context, surface: Some(surface), window: Some(window), colormap: Some(colormap), connection: Some(connection), _native_window: Some(native_window), captured_image: None, captured_pixmap: None, capture_renderer: None, damage: None, source_window: None, source_size: None, width: 640, height: 360 })
     }
 
     fn base(connection: &X11Connection) -> Result<(Arc<egl::DynamicInstance<egl::EGL1_5>>, egl::Display, egl::Config), Box<dyn Error>> {
@@ -92,6 +96,12 @@ impl EglContext {
 
     pub fn import_pixmap(&mut self, capture: CapturedPixmap) -> Result<(), Box<dyn Error>> {
         const EGL_NATIVE_PIXMAP_KHR: egl::Enum = 0x30B0;
+        let connection = self.connection.as_ref().ok_or("X11 connection is not available")?;
+        let damage = connection.create_damage(capture.window)?;
+        self.damage = Some(damage);
+        self.source_window = Some(capture.window);
+        self.source_size = Some((capture.width, capture.height));
+        println!("Damage: created (report level: NonEmpty)");
         let client_buffer = unsafe { egl::ClientBuffer::from_ptr(capture.pixmap as usize as *mut c_void) };
         self.check_import_capabilities()?;
         let image_attributes: [egl::Int; 3] = [
@@ -154,6 +164,12 @@ impl EglContext {
 
     pub fn window(&self) -> Option<u32> { self.window }
 
+    pub fn damage(&self) -> Option<damage::Damage> { self.damage }
+
+    pub fn source_window(&self) -> Option<u32> { self.source_window }
+
+    pub fn source_size(&self) -> Option<(u16, u16)> { self.source_size }
+
     pub fn run_event_loop(&mut self) -> Result<(), Box<dyn Error>> {
         let mut connection = self.connection.take().ok_or("X11 connection is not available")?;
         let result = connection.run_event_loop(self);
@@ -211,6 +227,7 @@ impl Drop for EglContext {
         }
 
         if let Some(connection) = self.connection.as_ref() {
+            if let Some(damage) = self.damage { let _ = connection.destroy_damage(damage); }
             if let Some(window) = self.window { let _ = connection.destroy_window(window); }
             if let Some(colormap) = self.colormap { let _ = connection.free_colormap(colormap); }
             if let Some(pixmap) = self.captured_pixmap { let _ = connection.free_pixmap(pixmap); }
@@ -219,4 +236,3 @@ impl Drop for EglContext {
         let _ = self.instance.terminate(self.display);
     }
 }
-

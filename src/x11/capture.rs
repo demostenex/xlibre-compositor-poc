@@ -1,11 +1,14 @@
 use std::error::Error;
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::ConnectionExt as CompositeConnectionExt;
-use x11rb::protocol::xproto::{ConnectionExt, MapState, Window, WindowClass};
+use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt, EventMask, MapState, Window, WindowClass};
 use super::connection::X11Connection;
 
 pub struct CapturedPixmap {
+    pub(crate) window: Window,
     pub(crate) pixmap: u32,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
 }
 
 pub fn parse_window_id(value: &str) -> Result<Window, Box<dyn Error>> {
@@ -35,6 +38,11 @@ impl X11Connection {
             return Err("capture target is not viewable".into());
         }
 
+        self.inner.change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )?.check()?;
+
         let version = self.inner.composite_query_version(0, 4)?.reply()?;
         println!("\nComposite:");
         println!("version: {}.{}", version.major_version, version.minor_version);
@@ -46,7 +54,6 @@ impl X11Connection {
         self.inner.composite_name_window_pixmap(window, pixmap)?.check()?;
         println!("\nNameWindowPixmap: OK");
         println!("pixmap: 0x{pixmap:08x}");
-        Ok(CapturedPixmap { pixmap })
+        Ok(CapturedPixmap { window, pixmap, width: geometry.width, height: geometry.height })
     }
 }
-

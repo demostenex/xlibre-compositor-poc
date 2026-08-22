@@ -30,6 +30,9 @@ Este modo nomeia o backing Pixmap de uma única janela com XComposite e
 importa-o como EGLImage/texture OpenGL. Ele não redireciona sub-janelas,
 não possui `_NET_WM_CM_S0` e não interfere com compositores existentes.
 
-Esta milestone não implementa redirection global, Damage, Present scheduling,
-composição de todas as janelas ou integração com i3.
-
+Nesta milestone, XDamage usa `ReportLevel::NON_EMPTY`: a extensão sinaliza que
+há dano acumulado sem gerar um evento por retângulo. Depois de cada
+`DamageNotify`, a PoC chama `DamageSubtract` com `None` para limpar a região
+acumulada, renderiza e apresenta o frame. O event loop permanece bloqueante
+quando não há eventos; não há polling nem renderização contínua.
+Redimensionamento da janela fonte fica para a Milestone 2C.
