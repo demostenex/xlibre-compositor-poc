@@ -20,5 +20,16 @@ cargo run
 Uma janela X11 de 640x360 deve aparecer com fundo azul-escuro.
 `WM_DELETE_WINDOW` e `KeyPress` encerram a PoC.
 
-Esta milestone não implementa XComposite, redirection, Damage,
-NameWindowPixmap, texturas de janelas ou composição.
+## Capturar uma janela existente
+
+```bash
+cargo run -- --capture 0x60000e
+```
+
+Este modo nomeia o backing Pixmap de uma única janela com XComposite e
+importa-o como EGLImage/texture OpenGL. Ele não redireciona sub-janelas,
+não possui `_NET_WM_CM_S0` e não interfere com compositores existentes.
+
+Esta milestone não implementa redirection global, Damage, Present scheduling,
+composição de todas as janelas ou integração com i3.
+

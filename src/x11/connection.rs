@@ -85,4 +85,10 @@ impl X11Connection {
         self.inner.free_colormap(colormap)?.check()?;
         Ok(())
     }
+
+    pub fn free_pixmap(&self, pixmap: u32) -> Result<(), Box<dyn Error>> {
+        self.inner.free_pixmap(pixmap)?.check()?;
+        Ok(())
+    }
 }
+
