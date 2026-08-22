@@ -1,0 +1,10 @@
+[package]
+name = "xlibre-compositor-poc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gl = "0.14"
+khronos-egl = { version = "6.0", features = ["dynamic"] }
+libloading = "0.8"
+x11rb = { version = "0.14", features = ["allow-unsafe-code", "as-raw-xcb-connection", "composite", "damage", "dri3", "present", "randr", "xfixes"] }
