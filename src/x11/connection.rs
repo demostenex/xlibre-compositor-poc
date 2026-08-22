@@ -1,14 +1,14 @@
 use std::error::Error;
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{self, Atom, AtomEnum, ClientMessageEvent, Colormap, ConfigureNotifyEvent, CreateWindowAux, EventMask, Window, WindowClass};
+use x11rb::protocol::xproto::{self, Atom, AtomEnum, ClientMessageEvent, Colormap, CreateWindowAux, EventMask, MapState, Window, WindowClass};
 use x11rb::protocol::Event;
 use x11rb::protocol::damage::{self, ConnectionExt as DamageConnectionExt};
 use x11rb::protocol::xproto::ConnectionExt;
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::xcb_ffi::XCBConnection;
 
-use crate::graphics::egl::EglContext;
+use crate::graphics::egl::{CaptureState, EglContext};
 
 pub struct X11Connection {
     pub(crate) inner: XCBConnection,
@@ -63,7 +63,7 @@ impl X11Connection {
         Ok(colormap)
     }
 
-    pub fn create_window(&mut self, visual: u32, depth: u8, colormap: Colormap) -> Result<Window, Box<dyn Error>> {
+    pub fn create_window(&self, visual: u32, depth: u8, colormap: Colormap) -> Result<Window, Box<dyn Error>> {
         let screen = &self.inner.setup().roots[self.screen_num];
         let window = self.inner.generate_id()?;
 
@@ -79,7 +79,7 @@ impl X11Connection {
         Ok(window)
     }
 
-    pub fn run_event_loop(&mut self, graphics: &mut EglContext) -> Result<(), Box<dyn Error>> {
+    pub fn run_event_loop(&self, graphics: &mut EglContext<'_>) -> Result<(), Box<dyn Error>> {
         loop {
             match self.inner.wait_for_event()? {
                 Event::ClientMessage(ClientMessageEvent { window, type_, data, .. }) if graphics.window() == Some(window) && type_ == self.wm_protocols && data.as_data32()[0] == self.wm_delete_window => break,
@@ -87,33 +87,91 @@ impl X11Connection {
                     graphics.render();
                     graphics.swap_buffers()?;
                 }
-                Event::ConfigureNotify(ConfigureNotifyEvent { window, width, height, .. }) if graphics.window() == Some(window) => {
-                    graphics.resize(width as i32, height as i32);
-                    graphics.render();
-                    graphics.swap_buffers()?;
+                Event::ConfigureNotify(event) => {
+                    if graphics.window() == Some(event.window) {
+                        graphics.resize(event.width as i32, event.height as i32);
+                        graphics.render();
+                        graphics.swap_buffers()?;
+                    } else if graphics.source_window() == Some(event.window) {
+                        let old_size = graphics.source_size().unwrap_or((event.width, event.height));
+                        let size_changed = old_size != (event.width, event.height);
+                        println!("Source ConfigureNotify:");
+                        println!("old size: {}x{}", old_size.0, old_size.1);
+                        println!("new size: {}x{}", event.width, event.height);
+                        println!("size_changed: {}", if size_changed { "yes" } else { "no" });
+                        println!("x={}", event.x);
+                        println!("y={}", event.y);
+                        println!("width={}", event.width);
+                        println!("height={}", event.height);
+                        println!("border_width={}", event.border_width);
+                        if size_changed && graphics.capture_state() == Some(CaptureState::Active) {
+                            if let Err(error) = graphics.resize_capture(event.width, event.height) {
+                                eprintln!("capture resize failed; keeping previous resources: {error}");
+                            } else {
+                                graphics.render();
+                                graphics.swap_buffers()?;
+                            }
+                        }
+                    }
+                }
+                Event::UnmapNotify(event) => {
+                    if self.source_root_is_top_level(graphics, event.event, event.window) {
+                        if let Some(state) = self.source_map_state(graphics) {
+                            if matches!(state, MapState::UNVIEWABLE | MapState::UNMAPPED) {
+                                println!("source top-level unmapped");
+                                println!("source map_state: {}", Self::map_state_name(state));
+                                graphics.suspend_capture();
+                                println!("capture suspended");
+                            }
+                        }
+                    }
+                }
+                Event::MapNotify(event) => {
+                    if self.source_root_is_top_level(graphics, event.event, event.window) {
+                        println!("source top-level mapped");
+                        if let Some(state) = self.source_map_state(graphics) {
+                            println!("source map_state: {}", Self::map_state_name(state));
+                            if state == MapState::VIEWABLE && graphics.capture_state() == Some(CaptureState::Suspended) {
+                                println!("recreating capture after remap");
+                                self.try_resume_capture(graphics)?;
+                            } else if state != MapState::VIEWABLE {
+                                println!("source mapped but not viewable yet");
+                            }
+                        }
+                    }
+                }
+                Event::VisibilityNotify(event) => {
+                    println!("VisibilityNotify: state={}", Self::visibility_state_name(event.state));
+                    if graphics.source_window() == Some(event.window) {
+                        if graphics.capture_state() == Some(CaptureState::Suspended) {
+                            self.try_resume_capture(graphics)?;
+                        }
+                    }
+                }
+                Event::ReparentNotify(event) => {
+                    if graphics.source_window() == Some(event.window) {
+                        if let Err(error) = graphics.refresh_source_hierarchy() {
+                            eprintln!("source hierarchy refresh failed: {error}");
+                        }
+                    }
+                }
+                Event::DestroyNotify(event) => {
+                    if graphics.source_window() == Some(event.window) {
+                        graphics.destroy_capture();
+                        break;
+                    }
                 }
                 Event::DamageNotify(event) if graphics.damage() == Some(event.damage) => {
-                    println!("DamageNotify:");
-                    println!("damage={}", event.damage);
-                    println!("drawable={}", event.drawable);
-                    println!("area={}x{}+{}+{}", event.area.width, event.area.height, event.area.x, event.area.y);
-                    println!("geometry={}x{}+{}+{}", event.geometry.width, event.geometry.height, event.geometry.x, event.geometry.y);
                     self.subtract_damage(event.damage)?;
-                    graphics.render();
-                    graphics.swap_buffers()?;
-                }
-                Event::ConfigureNotify(event) if graphics.source_window() == Some(event.window) => {
-                    let size_changed = graphics
-                        .source_size()
-                        .map(|(width, height)| (width, height) != (event.width, event.height))
-                        .unwrap_or(false);
-                    println!("source ConfigureNotify:");
-                    println!("x={}", event.x);
-                    println!("y={}", event.y);
-                    println!("width={}", event.width);
-                    println!("height={}", event.height);
-                    println!("border_width={}", event.border_width);
-                    println!("size_changed: {}", if size_changed { "yes" } else { "no" });
+                    if graphics.capture_state() == Some(CaptureState::Active) {
+                        println!("DamageNotify:");
+                        println!("damage={}", event.damage);
+                        println!("drawable={}", event.drawable);
+                        println!("area={}x{}+{}+{}", event.area.width, event.area.height, event.area.x, event.area.y);
+                        println!("geometry={}x{}+{}+{}", event.geometry.width, event.geometry.height, event.geometry.x, event.geometry.y);
+                        graphics.render();
+                        graphics.swap_buffers()?;
+                    }
                 }
                 _ => {}
             }
@@ -134,5 +192,62 @@ impl X11Connection {
     pub fn free_pixmap(&self, pixmap: u32) -> Result<(), Box<dyn Error>> {
         self.inner.free_pixmap(pixmap)?.check()?;
         Ok(())
+    }
+
+    fn source_root_is_top_level(&self, graphics: &EglContext<'_>, event_window: Window, affected_window: Window) -> bool {
+        graphics.source_root() == Some(event_window) && graphics.source_top_level() == Some(affected_window)
+    }
+
+    fn source_map_state(&self, graphics: &EglContext<'_>) -> Option<MapState> {
+        let source_window = graphics.source_window()?;
+        match self.inner.get_window_attributes(source_window) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(attributes) => Some(attributes.map_state),
+                Err(error) => {
+                    eprintln!("source get_window_attributes reply failed: {error}");
+                    None
+                }
+            },
+            Err(error) => {
+                eprintln!("source get_window_attributes request failed: {error}");
+                None
+            }
+        }
+    }
+
+    fn try_resume_capture(&self, graphics: &mut EglContext<'_>) -> Result<(), Box<dyn Error>> {
+        match graphics.resume_capture() {
+            Ok(true) => {
+                println!("capture resumed");
+                graphics.render();
+                graphics.swap_buffers()?;
+            }
+            Ok(false) if graphics.capture_state() == Some(CaptureState::Suspended) => {
+                println!("source mapped but not viewable yet");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("capture resume failed; keeping capture suspended: {error}");
+            }
+        }
+        Ok(())
+    }
+
+    fn map_state_name(state: MapState) -> &'static str {
+        match state {
+            MapState::UNMAPPED => "UNMAPPED",
+            MapState::UNVIEWABLE => "UNVIEWABLE",
+            MapState::VIEWABLE => "VIEWABLE",
+            _ => "UNKNOWN",
+        }
+    }
+
+    fn visibility_state_name(state: xproto::Visibility) -> &'static str {
+        match state {
+            xproto::Visibility::UNOBSCURED => "Unobscured",
+            xproto::Visibility::PARTIALLY_OBSCURED => "PartiallyObscured",
+            xproto::Visibility::FULLY_OBSCURED => "FullyObscured",
+            _ => "Unknown",
+        }
     }
 }

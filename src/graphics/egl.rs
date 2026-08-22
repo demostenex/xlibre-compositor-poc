@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use khronos_egl as egl;
 use libloading::Library;
+use x11rb::connection::Connection;
 use x11rb::protocol::damage;
+use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
 
 use crate::graphics::renderer;
 use crate::x11::capture::CapturedPixmap;
@@ -16,14 +18,21 @@ use crate::x11::connection::X11Connection;
 const EGL_PLATFORM_XCB_EXT: egl::Enum = 0x31DC;
 const EGL_PLATFORM_XCB_SCREEN_EXT: egl::Attrib = 0x31DE;
 
-pub struct EglContext {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureState {
+    Active,
+    Suspended,
+    Destroyed,
+}
+
+pub struct EglContext<'a> {
     instance: Arc<egl::DynamicInstance<egl::EGL1_5>>,
     display: egl::Display,
     context: egl::Context,
     surface: Option<egl::Surface>,
     window: Option<u32>,
     colormap: Option<u32>,
-    connection: Option<X11Connection>,
+    connection: &'a X11Connection,
     _native_window: Option<Box<u32>>,
     captured_image: Option<egl::Image>,
     captured_pixmap: Option<u32>,
@@ -31,23 +40,27 @@ pub struct EglContext {
     damage: Option<damage::Damage>,
     source_window: Option<u32>,
     source_size: Option<(u16, u16)>,
+    source_hierarchy: Option<Vec<u32>>,
+    source_root: Option<u32>,
+    source_top_level: Option<u32>,
+    capture_state: Option<CaptureState>,
     width: i32,
     height: i32,
 }
 
-impl EglContext {
-    pub fn diagnostics(connection: &X11Connection) -> Result<Self, Box<dyn Error>> {
+impl<'a> EglContext<'a> {
+    pub fn diagnostics(connection: &'a X11Connection) -> Result<EglContext<'a>, Box<dyn Error>> {
         let (instance, display, config) = Self::base(connection)?;
         let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::CONTEXT_MINOR_VERSION, 3, egl::CONTEXT_OPENGL_PROFILE_MASK, egl::CONTEXT_OPENGL_CORE_PROFILE_BIT, egl::NONE];
         let context = instance.create_context(display, config, None, &context_attributes)?;
         instance.make_current(display, None, None, Some(context))?;
         renderer::load(|name| instance.get_proc_address(name).map_or(std::ptr::null(), |pointer| pointer as *const c_void));
 
-        Ok(Self { instance, display, context, surface: None, window: None, colormap: None, connection: None, _native_window: None, captured_image: None, captured_pixmap: None, capture_renderer: None, damage: None, source_window: None, source_size: None, width: 1, height: 1 })
+        Ok(Self { instance, display, context, surface: None, window: None, colormap: None, connection, _native_window: None, captured_image: None, captured_pixmap: None, capture_renderer: None, damage: None, source_window: None, source_size: None, source_hierarchy: None, source_root: None, source_top_level: None, capture_state: None, width: 1, height: 1 })
     }
 
-    pub fn create(mut connection: X11Connection) -> Result<Self, Box<dyn Error>> {
-        let (instance, display, config) = Self::base(&connection)?;
+    pub fn create(connection: &'a X11Connection) -> Result<EglContext<'a>, Box<dyn Error>> {
+        let (instance, display, config) = Self::base(connection)?;
         let visual_id = instance.get_config_attrib(display, config, egl::NATIVE_VISUAL_ID)? as u32;
         let depth = connection.visual_depth(visual_id).ok_or("EGL visual is not present in X11 setup")?;
         let colormap = connection.create_colormap(visual_id)?;
@@ -65,7 +78,7 @@ impl EglContext {
         renderer::load(|name| instance.get_proc_address(name).map_or(std::ptr::null(), |pointer| pointer as *const c_void));
         renderer::resize(640, 360);
 
-        Ok(Self { instance, display, context, surface: Some(surface), window: Some(window), colormap: Some(colormap), connection: Some(connection), _native_window: Some(native_window), captured_image: None, captured_pixmap: None, capture_renderer: None, damage: None, source_window: None, source_size: None, width: 640, height: 360 })
+        Ok(Self { instance, display, context, surface: Some(surface), window: Some(window), colormap: Some(colormap), connection, _native_window: Some(native_window), captured_image: None, captured_pixmap: None, capture_renderer: None, damage: None, source_window: None, source_size: None, source_hierarchy: None, source_root: None, source_top_level: None, capture_state: None, width: 640, height: 360 })
     }
 
     fn base(connection: &X11Connection) -> Result<(Arc<egl::DynamicInstance<egl::EGL1_5>>, egl::Display, egl::Config), Box<dyn Error>> {
@@ -95,15 +108,37 @@ impl EglContext {
     }
 
     pub fn import_pixmap(&mut self, capture: CapturedPixmap) -> Result<(), Box<dyn Error>> {
-        const EGL_NATIVE_PIXMAP_KHR: egl::Enum = 0x30B0;
-        let connection = self.connection.as_ref().ok_or("X11 connection is not available")?;
-        let damage = connection.create_damage(capture.window)?;
+        let damage = self.connection.create_damage(capture.window)?;
         self.damage = Some(damage);
         self.source_window = Some(capture.window);
         self.source_size = Some((capture.width, capture.height));
+        self.source_hierarchy = Some(capture.hierarchy);
+        self.source_root = Some(capture.root);
+        self.source_top_level = Some(capture.top_level);
         println!("Damage: created (report level: NonEmpty)");
-        let client_buffer = unsafe { egl::ClientBuffer::from_ptr(capture.pixmap as usize as *mut c_void) };
         self.check_import_capabilities()?;
+        let (image, texture) = self.create_capture_resources(capture.pixmap)?;
+        let capture_renderer = match renderer::CaptureRenderer::new(texture) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                renderer::delete_texture(texture);
+                let _ = self.instance.destroy_image(self.display, image);
+                return Err(error);
+            }
+        };
+        println!("Import:");
+        println!("backend: EGL_KHR_image_pixmap");
+        println!("texture: OK");
+        self.captured_image = Some(image);
+        self.captured_pixmap = Some(capture.pixmap);
+        self.capture_renderer = Some(capture_renderer);
+        self.capture_state = Some(CaptureState::Active);
+        Ok(())
+    }
+
+    fn create_capture_resources(&self, pixmap: u32) -> Result<(egl::Image, u32), Box<dyn Error>> {
+        const EGL_NATIVE_PIXMAP_KHR: egl::Enum = 0x30B0;
+        let client_buffer = unsafe { egl::ClientBuffer::from_ptr(pixmap as usize as *mut c_void) };
         let image_attributes: [egl::Int; 3] = [
             egl::IMAGE_PRESERVED,
             egl::TRUE as egl::Int,
@@ -120,14 +155,107 @@ impl EglContext {
         };
         let proc = self.instance.get_proc_address("glEGLImageTargetTexture2DOES").ok_or("glEGLImageTargetTexture2DOES is unavailable")?;
         let image_target: unsafe extern "system" fn(u32, *const c_void) = unsafe { std::mem::transmute(proc) };
-        let texture = renderer::create_egl_texture(image_target, image.as_ptr().cast())?;
-        let capture_renderer = renderer::CaptureRenderer::new(texture)?;
-        println!("Import:");
-        println!("backend: EGL_KHR_image_pixmap");
+        let texture = match renderer::create_egl_texture(image_target, image.as_ptr().cast()) {
+            Ok(texture) => texture,
+            Err(error) => {
+                let _ = self.instance.destroy_image(self.display, image);
+                return Err(error);
+            }
+        };
+        Ok((image, texture))
+    }
+
+    pub fn resize_capture(&mut self, width: u16, height: u16) -> Result<(), Box<dyn Error>> {
+        if self.capture_state != Some(CaptureState::Active) {
+            return Ok(());
+        }
+        self.recreate_capture(width, height)
+    }
+
+    pub fn suspend_capture(&mut self) {
+        if self.capture_state == Some(CaptureState::Active) {
+            self.capture_state = Some(CaptureState::Suspended);
+        }
+    }
+
+    pub fn resume_capture(&mut self) -> Result<bool, Box<dyn Error>> {
+        if self.capture_state != Some(CaptureState::Suspended) {
+            return Ok(false);
+        }
+        let window = self.source_window.ok_or("capture source window is not available")?;
+        let attributes = self.connection.inner.get_window_attributes(window)?.reply()?;
+        if attributes.map_state != x11rb::protocol::xproto::MapState::VIEWABLE {
+            return Ok(false);
+        }
+        let geometry = self.connection.inner.get_geometry(window)?.reply()?;
+        self.recreate_capture(geometry.width, geometry.height)?;
+        self.clear_damage()?;
+        self.capture_state = Some(CaptureState::Active);
+        Ok(true)
+    }
+
+    pub fn destroy_capture(&mut self) {
+        self.capture_state = Some(CaptureState::Destroyed);
+        self.capture_renderer.take();
+        if let Some(image) = self.captured_image.take() {
+            let _ = self.instance.destroy_image(self.display, image);
+        }
+        if let Some(damage) = self.damage.take() {
+            let _ = self.connection.destroy_damage(damage);
+        }
+        if let Some(pixmap) = self.captured_pixmap.take() {
+            let _ = self.connection.free_pixmap(pixmap);
+        }
+        self.source_window = None;
+        self.source_size = None;
+    }
+
+    fn clear_damage(&self) -> Result<(), Box<dyn Error>> {
+        if let Some(damage) = self.damage {
+            self.connection.subtract_damage(damage)?;
+        }
+        Ok(())
+    }
+
+    fn recreate_capture(&mut self, width: u16, height: u16) -> Result<(), Box<dyn Error>> {
+        let window = self.source_window.ok_or("capture source window is not available")?;
+        let new_pixmap = self.connection.inner.generate_id()?;
+        if let Err(error) = self.connection.name_window_pixmap(window, new_pixmap) {
+            let _ = self.connection.free_pixmap(new_pixmap);
+            return Err(error);
+        }
+        println!("Recreating capture:");
+        println!("new pixmap: 0x{new_pixmap:08x}");
+
+        let (new_image, new_texture) = match self.create_capture_resources(new_pixmap) {
+            Ok(resources) => resources,
+            Err(error) => {
+                let _ = self.connection.free_pixmap(new_pixmap);
+                return Err(error);
+            }
+        };
+        println!("EGLImage: OK");
         println!("texture: OK");
-        self.captured_image = Some(image);
-        self.captured_pixmap = Some(capture.pixmap);
-        self.capture_renderer = Some(capture_renderer);
+
+        let old_texture = match self.capture_renderer.as_mut() {
+            Some(capture_renderer) => capture_renderer.replace_texture(new_texture),
+            None => {
+                renderer::delete_texture(new_texture);
+                let _ = self.instance.destroy_image(self.display, new_image);
+                let _ = self.connection.free_pixmap(new_pixmap);
+                return Err("capture renderer is not available".into());
+            }
+        };
+        let old_image = self.captured_image.replace(new_image);
+        let old_pixmap = self.captured_pixmap.replace(new_pixmap);
+        self.source_size = Some((width, height));
+
+        renderer::delete_texture(old_texture);
+        if let Some(image) = old_image { let _ = self.instance.destroy_image(self.display, image); }
+        if let Some(pixmap) = old_pixmap {
+            let _ = self.connection.free_pixmap(pixmap);
+        }
+        println!("capture resources replaced");
         Ok(())
     }
 
@@ -170,12 +298,21 @@ impl EglContext {
 
     pub fn source_size(&self) -> Option<(u16, u16)> { self.source_size }
 
-    pub fn run_event_loop(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut connection = self.connection.take().ok_or("X11 connection is not available")?;
-        let result = connection.run_event_loop(self);
-        self.connection = Some(connection);
-        result
+    pub fn source_root(&self) -> Option<u32> { self.source_root }
+
+    pub fn source_top_level(&self) -> Option<u32> { self.source_top_level }
+
+    pub fn refresh_source_hierarchy(&mut self) -> Result<(), Box<dyn Error>> {
+        let source = self.source_window.ok_or("capture source window is not available")?;
+        let (hierarchy, root, top_level) = self.connection.query_source_hierarchy(source)?;
+        self.source_hierarchy = Some(hierarchy);
+        self.source_root = Some(root);
+        self.source_top_level = Some(top_level);
+        Ok(())
     }
+
+    pub fn capture_state(&self) -> Option<CaptureState> { self.capture_state }
+
 }
 
 unsafe fn create_native_pixmap_image(
@@ -214,7 +351,7 @@ unsafe fn create_native_pixmap_image(
     Ok(unsafe { egl::Image::from_ptr(image) })
 }
 
-impl Drop for EglContext {
+impl Drop for EglContext<'_> {
     fn drop(&mut self) {
         self.capture_renderer.take();
         let _ = self.instance.make_current(self.display, None, None, None);
@@ -226,12 +363,10 @@ impl Drop for EglContext {
             let _ = self.instance.destroy_image(self.display, image);
         }
 
-        if let Some(connection) = self.connection.as_ref() {
-            if let Some(damage) = self.damage { let _ = connection.destroy_damage(damage); }
-            if let Some(window) = self.window { let _ = connection.destroy_window(window); }
-            if let Some(colormap) = self.colormap { let _ = connection.free_colormap(colormap); }
-            if let Some(pixmap) = self.captured_pixmap { let _ = connection.free_pixmap(pixmap); }
-        }
+        if let Some(damage) = self.damage { let _ = self.connection.destroy_damage(damage); }
+        if let Some(window) = self.window { let _ = self.connection.destroy_window(window); }
+        if let Some(colormap) = self.colormap { let _ = self.connection.free_colormap(colormap); }
+        if let Some(pixmap) = self.captured_pixmap { let _ = self.connection.free_pixmap(pixmap); }
 
         let _ = self.instance.terminate(self.display);
     }

@@ -120,6 +120,14 @@ impl CaptureRenderer {
             gl::UseProgram(0);
         }
     }
+
+    pub fn replace_texture(&mut self, texture: u32) -> u32 {
+        std::mem::replace(&mut self.texture, texture)
+    }
+}
+
+pub fn delete_texture(texture: u32) {
+    unsafe { gl::DeleteTextures(1, &texture); }
 }
 
 impl Drop for CaptureRenderer {

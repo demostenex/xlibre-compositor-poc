@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
-    let connection = x11::connection::X11Connection::connect()?;
+    let mut connection = x11::connection::X11Connection::connect()?;
     diagnostics::print_x11(&connection)?;
 
     if diagnostics_only {
@@ -25,14 +25,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let capture = capture_window.map(|value| connection.capture_window(&value)).transpose()?;
-    let mut graphics = graphics::egl::EglContext::create(connection)?;
+    let mut graphics = graphics::egl::EglContext::create(&connection)?;
     if let Some(capture) = capture {
         graphics.import_pixmap(capture)?;
     }
     graphics.print();
     graphics.render();
     graphics.swap_buffers()?;
-    graphics.run_event_loop()?;
+    connection.run_event_loop(&mut graphics)?;
     Ok(())
 }
-
