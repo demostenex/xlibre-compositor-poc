@@ -18,6 +18,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut compositor_probe = false;
     let mut claim_compositor = false;
     let mut compositor_capture_window = None;
+    let mut compositor_hierarchy_probe_window = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--diagnostics" => diagnostics_only = true,
@@ -26,6 +27,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--compositor-capture" => {
                 compositor_capture_window =
                     Some(args.next().ok_or("--compositor-capture requires WINDOW_ID")?)
+            }
+            "--compositor-hierarchy-probe" => {
+                compositor_hierarchy_probe_window = Some(
+                    args.next()
+                        .ok_or("--compositor-hierarchy-probe requires WINDOW_ID")?,
+                )
             }
             "--capture" => {
                 capture_window = Some(args.next().ok_or("--capture requires WINDOW_ID")?)
@@ -40,6 +47,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             || diagnostics_only
             || capture_window.is_some()
             || compositor_capture_window.is_some()
+            || compositor_hierarchy_probe_window.is_some()
         {
             return Err("--compositor-probe cannot be combined with another mode".into());
         }
@@ -47,12 +55,24 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     if claim_compositor {
-        if diagnostics_only || capture_window.is_some() || compositor_capture_window.is_some() {
+        if diagnostics_only
+            || capture_window.is_some()
+            || compositor_capture_window.is_some()
+            || compositor_hierarchy_probe_window.is_some()
+        {
             return Err("--claim-compositor cannot be combined with another mode".into());
         }
         let ownership = x11::compositor::CompositorOwnership::claim(&connection)?;
         ownership.run_event_loop(&connection)?;
         return Ok(());
+    }
+    if let Some(value) = compositor_hierarchy_probe_window {
+        if diagnostics_only || capture_window.is_some() || compositor_capture_window.is_some() {
+            return Err(
+                "--compositor-hierarchy-probe cannot be combined with another mode".into(),
+            );
+        }
+        return run_compositor_hierarchy_probe(&connection, &value);
     }
     if let Some(value) = compositor_capture_window {
         if diagnostics_only || capture_window.is_some() {
@@ -79,6 +99,91 @@ fn run() -> Result<(), Box<dyn Error>> {
     graphics.render();
     graphics.swap_buffers()?;
     connection.run_event_loop(&mut graphics, None, None)?;
+    Ok(())
+}
+
+fn run_compositor_hierarchy_probe(
+    connection: &x11::connection::X11Connection,
+    value: &str,
+) -> Result<(), Box<dyn Error>> {
+    let ownership = x11::compositor::CompositorOwnership::claim(connection)?;
+    let _version = match connection.require_composite() {
+        Ok(version) => version,
+        Err(error) => {
+            if let Err(cleanup_error) = ownership.release(connection) {
+                eprintln!("compositor ownership cleanup failed: {cleanup_error}");
+            }
+            return Err(error);
+        }
+    };
+    let info = match connection.inspect_hierarchy_probe(value) {
+        Ok(info) => info,
+        Err(error) => {
+            if let Err(cleanup_error) = ownership.release(connection) {
+                eprintln!("compositor ownership cleanup failed: {cleanup_error}");
+            }
+            return Err(error);
+        }
+    };
+    x11::connection::X11Connection::print_hierarchy_probe(&info);
+    if info.root != ownership.root {
+        let error = format!(
+            "hierarchy root does not match compositor ownership root: hierarchy 0x{:08x}, ownership 0x{:08x}",
+            info.root, ownership.root
+        );
+        if let Err(cleanup_error) = ownership.release(connection) {
+            eprintln!("compositor ownership cleanup failed: {cleanup_error}");
+        }
+        return Err(error.into());
+    }
+    let redirected = match x11::compositor::RedirectedSubwindows::redirect(
+        connection,
+        info.root,
+    ) {
+        Ok(redirected) => redirected,
+        Err(error) => {
+            if let Err(cleanup_error) = ownership.release(connection) {
+                eprintln!("compositor ownership cleanup failed: {cleanup_error}");
+            }
+            return Err(error);
+        }
+    };
+
+    println!("\nNameWindowPixmap probes:");
+    let mut probe_error = None;
+    for (label, window) in [
+        ("direct root child", info.direct_root_child),
+        ("requested client", info.client),
+    ] {
+        if let Err(error) = connection.probe_name_window_pixmap(label, window) {
+            if probe_error.is_none() {
+                probe_error = Some(error);
+            }
+            break;
+        }
+    }
+
+    let unredirect_error = redirected.unredirect(connection).err();
+    let release_error = ownership.release(connection).err();
+    if let Some(error) = probe_error {
+        if let Some(cleanup_error) = unredirect_error {
+            eprintln!("CompositeUnredirectSubwindows cleanup failed: {cleanup_error}");
+        }
+        if let Some(cleanup_error) = release_error {
+            eprintln!("compositor ownership cleanup failed: {cleanup_error}");
+        }
+        return Err(error);
+    }
+    if let Some(error) = unredirect_error {
+        if let Some(cleanup_error) = release_error {
+            eprintln!("compositor ownership cleanup failed: {cleanup_error}");
+        }
+        return Err(error);
+    }
+    if let Some(error) = release_error {
+        return Err(error);
+    }
+    println!("compositor ownership released");
     Ok(())
 }
 

@@ -120,6 +120,15 @@ pub struct CapturedPixmap {
     pub(crate) height: u16,
 }
 
+pub(crate) struct HierarchyProbeInfo {
+    pub(crate) client: Window,
+    pub(crate) direct_root_child: Window,
+    pub(crate) root: Window,
+    pub(crate) path: Vec<Window>,
+    pub(crate) client_metadata: WindowMetadata,
+    pub(crate) direct_root_child_metadata: WindowMetadata,
+}
+
 pub fn parse_window_id(value: &str) -> Result<Window, Box<dyn Error>> {
     if let Some(value) = value.strip_prefix("0x") {
         return Ok(u32::from_str_radix(value, 16)?);
@@ -128,6 +137,19 @@ pub fn parse_window_id(value: &str) -> Result<Window, Box<dyn Error>> {
 }
 
 impl X11Connection {
+    pub fn require_composite(&self) -> Result<(u32, u32), Box<dyn Error>> {
+        let version = self.inner.composite_query_version(0, 4)?.reply()?;
+        println!("\nComposite:");
+        println!(
+            "version: {}.{}",
+            version.major_version, version.minor_version
+        );
+        if (version.major_version, version.minor_version) < (0, 2) {
+            return Err("Composite 0.2 or newer is required".into());
+        }
+        Ok((version.major_version as u32, version.minor_version as u32))
+    }
+
     pub fn capture_window(&self, value: &str) -> Result<CapturedPixmap, Box<dyn Error>> {
         let (window, width, height, _) = self.prepare_capture_window(value)?;
         self.capture_pixmap(window, width, height)
@@ -138,15 +160,7 @@ impl X11Connection {
         value: &str,
     ) -> Result<(Window, u16, u16, WindowRole), Box<dyn Error>> {
         let window = parse_window_id(value)?;
-        let version = self.inner.composite_query_version(0, 4)?.reply()?;
-        println!("\nComposite:");
-        println!(
-            "version: {}.{}",
-            version.major_version, version.minor_version
-        );
-        if (version.major_version, version.minor_version) < (0, 2) {
-            return Err("Composite 0.2 or newer is required".into());
-        }
+        self.require_composite()?;
         let hierarchy = self.query_source_hierarchy(window)?;
         let source = self.window_metadata(window, hierarchy)?;
         let top_level = self.window_metadata(hierarchy.top_level, hierarchy)?;
@@ -209,6 +223,45 @@ impl X11Connection {
         })
     }
 
+    pub(crate) fn inspect_hierarchy_probe(
+        &self,
+        value: &str,
+    ) -> Result<HierarchyProbeInfo, Box<dyn Error>> {
+        let client = parse_window_id(value)?;
+        let (hierarchy, path, direct_root_child) = self.resolve_hierarchy_path(client)?;
+        let client_metadata = self.window_metadata(client, hierarchy)?;
+        let direct_root_child_metadata =
+            self.window_metadata(direct_root_child, hierarchy)?;
+        Ok(HierarchyProbeInfo {
+            client,
+            direct_root_child,
+            root: hierarchy.root,
+            path,
+            client_metadata,
+            direct_root_child_metadata,
+        })
+    }
+
+    pub(crate) fn print_hierarchy_probe(info: &HierarchyProbeInfo) {
+        println!("\nHierarchy probe:");
+        println!("requested client: 0x{:08x}", info.client);
+        println!(
+            "direct root child: 0x{:08x}",
+            info.direct_root_child
+        );
+        println!("root: 0x{:08x}", info.root);
+        println!("hierarchy:");
+        for (index, window) in info.path.iter().enumerate() {
+            if index == 0 {
+                println!("0x{window:08x}");
+            } else {
+                println!("  -> 0x{window:08x}");
+            }
+        }
+        print_metadata("requested client", &info.client_metadata);
+        print_metadata("direct root child", &info.direct_root_child_metadata);
+    }
+
     pub fn name_window_pixmap(&self, window: Window, pixmap: u32) -> Result<(), Box<dyn Error>> {
         match self
             .inner
@@ -225,6 +278,34 @@ impl X11Connection {
                     map_state: capture.source.map_state,
                     role: capture.source.role,
                 }))
+            }
+            Err(error) => Err(Box::new(error)),
+        }
+    }
+
+    pub(crate) fn probe_name_window_pixmap(
+        &self,
+        label: &str,
+        window: Window,
+    ) -> Result<(), Box<dyn Error>> {
+        println!("\n{label} NameWindowPixmap:");
+        println!("window: 0x{window:08x}");
+        let pixmap = self.inner.generate_id()?;
+        match self
+            .inner
+            .composite_name_window_pixmap(window, pixmap)?
+            .check()
+        {
+            Ok(()) => {
+                println!("result: OK");
+                println!("pixmap: 0x{pixmap:08x}");
+                self.inner.free_pixmap(pixmap)?.check()?;
+                self.inner.flush()?;
+                Ok(())
+            }
+            Err(error) if is_name_window_pixmap_observation_error(&error) => {
+                println!("result: {error}");
+                Ok(())
             }
             Err(error) => Err(Box::new(error)),
         }
@@ -271,6 +352,52 @@ impl X11Connection {
             top_level,
             root,
         })
+    }
+
+    fn resolve_hierarchy_path(
+        &self,
+        source: Window,
+    ) -> Result<(WindowHierarchy, Vec<Window>, Window), Box<dyn Error>> {
+        let mut current = source;
+        let mut path = vec![source];
+        let mut visited = Vec::new();
+        let mut root = None;
+
+        loop {
+            if visited.contains(&current) {
+                return Err("window hierarchy contains a loop".into());
+            }
+            visited.push(current);
+
+            let tree = self.inner.query_tree(current)?.reply()?;
+            if let Some(expected_root) = root {
+                if tree.root != expected_root {
+                    return Err("window hierarchy changed roots during inspection".into());
+                }
+            } else {
+                root = Some(tree.root);
+            }
+
+            if current == tree.root {
+                return Err("requested window is the root and has no direct root child".into());
+            }
+            if tree.parent == x11rb::NONE || tree.parent == current {
+                return Err("window hierarchy has an invalid parent".into());
+            }
+            if tree.parent == tree.root {
+                path.push(tree.root);
+                let hierarchy = WindowHierarchy {
+                    source,
+                    parent: path.get(1).copied(),
+                    top_level: current,
+                    root: tree.root,
+                };
+                return Ok((hierarchy, path, current));
+            }
+
+            current = tree.parent;
+            path.push(current);
+        }
     }
 
     pub(crate) fn refresh_capture_hierarchy(&self) -> Result<(), Box<dyn Error>> {
@@ -400,6 +527,14 @@ impl X11Connection {
 
 fn is_bad_match(error: &ReplyError) -> bool {
     matches!(error, ReplyError::X11Error(error) if error.error_kind == ErrorKind::Match)
+}
+
+fn is_name_window_pixmap_observation_error(error: &ReplyError) -> bool {
+    matches!(
+        error,
+        ReplyError::X11Error(error)
+            if error.error_kind == ErrorKind::Match || error.error_kind == ErrorKind::Window
+    )
 }
 
 fn parse_wm_class(property: &GetPropertyReply) -> Option<String> {

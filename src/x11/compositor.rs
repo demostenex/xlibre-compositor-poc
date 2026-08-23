@@ -29,6 +29,11 @@ pub struct RedirectedWindow {
     pub mode: composite::Redirect,
     active: Cell<bool>,
 }
+pub struct RedirectedSubwindows {
+    pub root: Window,
+    pub mode: composite::Redirect,
+    active: Cell<bool>,
+}
 
 pub fn selection_name(screen_num: usize) -> String {
     format!("_NET_WM_CM_S{screen_num}")
@@ -302,13 +307,47 @@ impl RedirectedWindow {
     }
 }
 
+impl RedirectedSubwindows {
+    pub fn redirect(
+        connection: &X11Connection,
+        root: Window,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mode = composite::Redirect::AUTOMATIC;
+        connection
+            .inner
+            .composite_redirect_subwindows(root, mode)?
+            .check()?;
+        connection.inner.flush()?;
+        println!("CompositeRedirectSubwindows: AUTOMATIC");
+        Ok(Self {
+            root,
+            mode,
+            active: Cell::new(true),
+        })
+    }
+
+    pub fn unredirect(&self, connection: &X11Connection) -> Result<(), Box<dyn Error>> {
+        if !self.active.get() {
+            return Ok(());
+        }
+        connection
+            .inner
+            .composite_unredirect_subwindows(self.root, self.mode)?
+            .check()?;
+        connection.inner.flush()?;
+        self.active.set(false);
+        println!("CompositeUnredirectSubwindows: AUTOMATIC");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         can_redirect_role, owned_redirect_mode, redirect_target, selection_name,
         selection_clear_matches, should_refuse_takeover, CompositorOwnership,
     };
-    use super::RedirectedWindow;
+    use super::{RedirectedSubwindows, RedirectedWindow};
     use crate::x11::capture::WindowRole;
     use x11rb::protocol::composite::Redirect;
     use x11rb::protocol::xproto::SelectionClearEvent;
@@ -388,6 +427,7 @@ mod tests {
     #[test]
     fn redirection_abstraction_has_no_alternate_target() {
         let _ = std::mem::size_of::<RedirectedWindow>();
+        let _ = std::mem::size_of::<RedirectedSubwindows>();
         assert_eq!(redirect_target(42, WindowRole::Client), Some(42));
         assert_eq!(redirect_target(42, WindowRole::Root), None);
         assert_eq!(redirect_target(42, WindowRole::TopLevelOrWmFrame), None);
