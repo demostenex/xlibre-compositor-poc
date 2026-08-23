@@ -3,6 +3,8 @@ pub mod capture;
 pub mod compositor;
 pub mod tree;
 pub mod tree_watch;
+pub mod preflight;
+pub mod shutdown;
 
 use x11rb::protocol::xproto::MapState;
 

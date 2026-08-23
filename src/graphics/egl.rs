@@ -145,16 +145,9 @@ impl<'a> EglContext<'a> {
         })
     }
 
-    fn base(
+    fn base_display(
         connection: &X11Connection,
-    ) -> Result<
-        (
-            Arc<egl::DynamicInstance<egl::EGL1_5>>,
-            egl::Display,
-            egl::Config,
-        ),
-        Box<dyn Error>,
-    > {
+    ) -> Result<(Arc<egl::DynamicInstance<egl::EGL1_5>>, egl::Display), Box<dyn Error>> {
         let library = unsafe { Library::new("libEGL.so.1")? };
         let instance =
             Arc::new(unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required_from(library)? });
@@ -172,6 +165,20 @@ impl<'a> EglContext<'a> {
         };
         instance.initialize(display)?;
         instance.bind_api(egl::OPENGL_API)?;
+        Ok((instance, display))
+    }
+
+    fn base(
+        connection: &X11Connection,
+    ) -> Result<
+        (
+            Arc<egl::DynamicInstance<egl::EGL1_5>>,
+            egl::Display,
+            egl::Config,
+        ),
+        Box<dyn Error>,
+    > {
+        let (instance, display) = Self::base_display(connection)?;
 
         let config_attributes = [
             egl::SURFACE_TYPE,
@@ -192,6 +199,89 @@ impl<'a> EglContext<'a> {
             .choose_first_config(display, &config_attributes)?
             .ok_or("no suitable EGL config")?;
         Ok((instance, display, config))
+    }
+
+    pub(crate) fn config_preflight(
+        connection: &X11Connection,
+    ) -> Result<EglConfigReport, Box<dyn Error>> {
+        let (instance, display) = Self::base_display(connection)?;
+        let result = (|| -> Result<EglConfigReport, Box<dyn Error>> {
+            let screen = &connection.inner.setup().roots[connection.screen_num()];
+            let config_attributes = [
+                egl::SURFACE_TYPE,
+                egl::WINDOW_BIT,
+                egl::RENDERABLE_TYPE,
+                egl::OPENGL_BIT,
+                egl::RED_SIZE,
+                8,
+                egl::GREEN_SIZE,
+                8,
+                egl::BLUE_SIZE,
+                8,
+                egl::ALPHA_SIZE,
+                8,
+                egl::NONE,
+            ];
+            let count = instance.matching_config_count(display, &config_attributes)?;
+            let mut configs = Vec::with_capacity(count);
+            instance.choose_config(display, &config_attributes, &mut configs)?;
+            let config = configs.into_iter().find(|config| {
+                let visual = instance
+                    .get_config_attrib(display, *config, egl::NATIVE_VISUAL_ID)
+                    .ok()
+                    .map(|value| value as u32);
+                visual == Some(screen.root_visual)
+                    && connection.visual_depth(screen.root_visual) == Some(screen.root_depth)
+            }).ok_or("no EGL config matches the root visual and depth")?;
+            let visual = instance.get_config_attrib(display, config, egl::NATIVE_VISUAL_ID)? as u32;
+            let depth = connection
+                .visual_depth(visual)
+                .ok_or("EGL native visual is not present in X11 setup")?;
+            let required_extensions = [
+                "EGL_KHR_image",
+                "EGL_KHR_image_base",
+                "EGL_KHR_image_pixmap",
+            ];
+            let egl_extensions = instance
+                .query_string(Some(display), egl::EXTENSIONS)
+                .ok()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for extension in required_extensions {
+                if !egl_extensions.split_whitespace().any(|item| item == extension) {
+                    return Err(format!("required EGL extension is unavailable: {extension}").into());
+                }
+            }
+
+            let context_attributes = [
+                egl::CONTEXT_MAJOR_VERSION,
+                3,
+                egl::CONTEXT_MINOR_VERSION,
+                3,
+                egl::CONTEXT_OPENGL_PROFILE_MASK,
+                egl::CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                egl::NONE,
+            ];
+            let context = instance.create_context(display, config, None, &context_attributes)?;
+            let context_result = (|| -> Result<(), Box<dyn Error>> {
+                instance.make_current(display, None, None, Some(context))?;
+                renderer::load(|name| {
+                    instance
+                        .get_proc_address(name)
+                        .map_or(std::ptr::null(), |pointer| pointer as *const c_void)
+                });
+                if !renderer::has_extension("GL_OES_EGL_image") {
+                    return Err("required OpenGL extension is unavailable: GL_OES_EGL_image".into());
+                }
+                Ok(())
+            })();
+            let _ = instance.make_current(display, None, None, None);
+            let _ = instance.destroy_context(display, context);
+            context_result?;
+            Ok(EglConfigReport { visual, depth })
+        })();
+        let _ = instance.terminate(display);
+        result
     }
 
     pub fn print(&self) {
@@ -442,6 +532,11 @@ impl<'a> EglContext<'a> {
     pub fn capture_state(&self) -> Option<CaptureState> {
         self.capture_state
     }
+}
+
+pub(crate) struct EglConfigReport {
+    pub(crate) visual: u32,
+    pub(crate) depth: u8,
 }
 
 unsafe fn create_native_pixmap_image(

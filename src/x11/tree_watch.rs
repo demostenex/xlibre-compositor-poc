@@ -9,6 +9,7 @@ use x11rb::protocol::Event;
 
 use super::capture::{is_bad_window_error, WindowGeometry};
 use super::connection::X11Connection;
+use super::shutdown::{wait_for_event_or_shutdown, SignalWake, WaitResult};
 use super::tree::{BindingStatus, HierarchySnapshot};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,6 +108,7 @@ impl HierarchyRegistry {
 }
 
 pub(crate) fn run(connection: &X11Connection) -> Result<(), Box<dyn Error>> {
+    let mut signal = SignalWake::install()?;
     let root = connection.inner.setup().roots[connection.screen_num()].root;
     let mut registry = HierarchyRegistry::new(
         HierarchySnapshot {
@@ -115,7 +117,7 @@ pub(crate) fn run(connection: &X11Connection) -> Result<(), Box<dyn Error>> {
         },
         root,
     );
-    let result = run_loop(connection, &mut registry);
+    let result = run_loop(connection, &mut registry, &mut signal);
     if let Err(error) = result {
         if let Err(cleanup_error) = registry.cleanup(connection) {
             eprintln!("tree watch cleanup failed: {cleanup_error}");
@@ -128,6 +130,7 @@ pub(crate) fn run(connection: &X11Connection) -> Result<(), Box<dyn Error>> {
 fn run_loop(
     connection: &X11Connection,
     registry: &mut HierarchyRegistry,
+    signal: &mut SignalWake,
 ) -> Result<(), Box<dyn Error>> {
     select_substructure_notify(connection, registry.root)?;
     registry.root_selected = true;
@@ -146,7 +149,13 @@ fn run_loop(
     println!("waiting for structural events...");
 
     loop {
-        let first_event = connection.inner.wait_for_event()?;
+        let first_event = match wait_for_event_or_shutdown(connection, signal)? {
+            WaitResult::Event(event) => event,
+            WaitResult::Shutdown => {
+                println!("shutdown requested");
+                break Ok(());
+            }
+        };
         let mut reasons = Vec::new();
         if let Some(reason) = structural_event_reason(&first_event) {
             reasons.push(reason);
