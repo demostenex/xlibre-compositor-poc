@@ -2,6 +2,7 @@ pub mod connection;
 pub mod capture;
 pub mod compositor;
 pub mod tree;
+pub mod tree_watch;
 
 use x11rb::protocol::xproto::MapState;
 

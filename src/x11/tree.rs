@@ -9,7 +9,7 @@ use super::capture::{
 };
 use super::connection::X11Connection;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BindingStatus {
     NoClient,
     SingleClient(Window),
