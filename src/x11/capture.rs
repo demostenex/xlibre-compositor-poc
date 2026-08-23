@@ -129,7 +129,24 @@ pub fn parse_window_id(value: &str) -> Result<Window, Box<dyn Error>> {
 
 impl X11Connection {
     pub fn capture_window(&self, value: &str) -> Result<CapturedPixmap, Box<dyn Error>> {
+        let (window, width, height, _) = self.prepare_capture_window(value)?;
+        self.capture_pixmap(window, width, height)
+    }
+
+    pub fn prepare_capture_window(
+        &self,
+        value: &str,
+    ) -> Result<(Window, u16, u16, WindowRole), Box<dyn Error>> {
         let window = parse_window_id(value)?;
+        let version = self.inner.composite_query_version(0, 4)?.reply()?;
+        println!("\nComposite:");
+        println!(
+            "version: {}.{}",
+            version.major_version, version.minor_version
+        );
+        if (version.major_version, version.minor_version) < (0, 2) {
+            return Err("Composite 0.2 or newer is required".into());
+        }
         let hierarchy = self.query_source_hierarchy(window)?;
         let source = self.window_metadata(window, hierarchy)?;
         let top_level = self.window_metadata(hierarchy.top_level, hierarchy)?;
@@ -152,6 +169,7 @@ impl X11Connection {
         if source.map_state != MapState::VIEWABLE {
             return Err("capture target is not viewable".into());
         }
+        let role = source.role;
         self.inner
             .change_window_attributes(
                 window,
@@ -168,15 +186,15 @@ impl X11Connection {
             source,
             top_level,
         }));
-        let version = self.inner.composite_query_version(0, 4)?.reply()?;
-        println!("\nComposite:");
-        println!(
-            "version: {}.{}",
-            version.major_version, version.minor_version
-        );
-        if (version.major_version, version.minor_version) < (0, 2) {
-            return Err("Composite 0.2 or newer is required".into());
-        }
+        Ok((window, width, height, role))
+    }
+
+    pub fn capture_pixmap(
+        &self,
+        window: Window,
+        width: u16,
+        height: u16,
+    ) -> Result<CapturedPixmap, Box<dyn Error>> {
         let pixmap = self.inner.generate_id()?;
         if let Err(error) = self.name_window_pixmap(window, pixmap) {
             return Err(error);

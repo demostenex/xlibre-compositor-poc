@@ -14,6 +14,9 @@ use x11rb::xcb_ffi::XCBConnection;
 
 use crate::graphics::egl::{CaptureState, EglContext};
 use crate::x11::capture::CaptureInfo;
+use crate::x11::compositor::{
+    selection_clear_matches, CompositorOwnership, RedirectedWindow,
+};
 
 pub struct X11Connection {
     pub(crate) inner: XCBConnection,
@@ -134,7 +137,12 @@ impl X11Connection {
         Ok(window)
     }
 
-    pub fn run_event_loop(&self, graphics: &mut EglContext<'_>) -> Result<(), Box<dyn Error>> {
+    pub fn run_event_loop(
+        &self,
+        graphics: &mut EglContext<'_>,
+        ownership: Option<&CompositorOwnership>,
+        redirected: Option<&RedirectedWindow>,
+    ) -> Result<(), Box<dyn Error>> {
         loop {
             match self.inner.wait_for_event()? {
                 Event::ClientMessage(ClientMessageEvent {
@@ -146,6 +154,18 @@ impl X11Connection {
                     && type_ == self.wm_protocols
                     && data.as_data32()[0] == self.wm_delete_window =>
                 {
+                    if redirected.is_some() {
+                        self.cleanup_compositor_capture(graphics, ownership, redirected, true)?;
+                    }
+                    break;
+                }
+                Event::SelectionClear(event)
+                    if ownership.is_some_and(|ownership| {
+                        selection_clear_matches(&event, ownership)
+                    }) =>
+                {
+                    println!("compositor ownership lost");
+                    self.cleanup_compositor_capture(graphics, ownership, redirected, true)?;
                     break;
                 }
                 Event::Expose(event) if graphics.window() == Some(event.window) => {
@@ -232,6 +252,11 @@ impl X11Connection {
                 Event::DestroyNotify(event) => {
                     if self.source_window() == Some(event.window) {
                         graphics.destroy_capture();
+                        if let Some(ownership) = ownership {
+                            if let Err(error) = ownership.release(self) {
+                                eprintln!("compositor ownership cleanup failed: {error}");
+                            }
+                        }
                         break;
                     }
                 }
@@ -258,6 +283,35 @@ impl X11Connection {
                 }
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    fn cleanup_compositor_capture(
+        &self,
+        graphics: &mut EglContext<'_>,
+        ownership: Option<&CompositorOwnership>,
+        redirected: Option<&RedirectedWindow>,
+        unredirect: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        graphics.destroy_capture();
+        let mut cleanup_error = None;
+        if unredirect {
+            if let Some(redirected) = redirected {
+                if let Err(error) = redirected.unredirect(self) {
+                    cleanup_error = Some(error);
+                }
+            }
+        }
+        if let Some(ownership) = ownership {
+            if let Err(error) = ownership.release(self) {
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = cleanup_error {
+            return Err(error);
         }
         Ok(())
     }
