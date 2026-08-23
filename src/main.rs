@@ -19,6 +19,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut claim_compositor = false;
     let mut compositor_capture_window = None;
     let mut compositor_hierarchy_probe_window = None;
+    let mut compositor_tree_snapshot = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--diagnostics" => diagnostics_only = true,
@@ -34,6 +35,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .ok_or("--compositor-hierarchy-probe requires WINDOW_ID")?,
                 )
             }
+            "--compositor-tree-snapshot" => compositor_tree_snapshot = true,
             "--capture" => {
                 capture_window = Some(args.next().ok_or("--capture requires WINDOW_ID")?)
             }
@@ -41,6 +43,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     let connection = x11::connection::X11Connection::connect()?;
+
+    if compositor_tree_snapshot {
+        if compositor_probe
+            || claim_compositor
+            || diagnostics_only
+            || capture_window.is_some()
+            || compositor_capture_window.is_some()
+            || compositor_hierarchy_probe_window.is_some()
+        {
+            return Err("--compositor-tree-snapshot cannot be combined with another mode".into());
+        }
+        let snapshot = connection.snapshot_hierarchy()?;
+        x11::tree::print_snapshot(&snapshot);
+        return Ok(());
+    }
 
     if compositor_probe {
         if claim_compositor

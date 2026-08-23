@@ -431,7 +431,7 @@ impl X11Connection {
         Ok(())
     }
 
-    fn window_metadata(
+    pub(crate) fn window_metadata(
         &self,
         window: Window,
         hierarchy: WindowHierarchy,
@@ -525,6 +525,13 @@ impl X11Connection {
     }
 }
 
+pub(crate) fn is_bad_window_error(error: &(dyn Error + 'static)) -> bool {
+    matches!(
+        error.downcast_ref::<ReplyError>(),
+        Some(error) if matches!(error, ReplyError::X11Error(error) if error.error_kind == ErrorKind::Window)
+    )
+}
+
 fn is_bad_match(error: &ReplyError) -> bool {
     matches!(error, ReplyError::X11Error(error) if error.error_kind == ErrorKind::Match)
 }
@@ -550,7 +557,7 @@ fn parse_wm_class(property: &GetPropertyReply) -> Option<String> {
     (!values.is_empty()).then(|| values.join("/"))
 }
 
-fn print_metadata(label: &str, metadata: &WindowMetadata) {
+pub(crate) fn print_metadata(label: &str, metadata: &WindowMetadata) {
     println!("{label}:");
     println!("window: 0x{:08x}", metadata.window);
     println!(
