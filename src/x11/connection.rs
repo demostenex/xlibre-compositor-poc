@@ -25,6 +25,27 @@ pub struct X11Connection {
     pub wm_delete_window: Atom,
     pub(crate) capture_info: RefCell<Option<CaptureInfo>>,
 }
+enum EventLoopAction {
+    Continue,
+    Break,
+}
+
+fn log_damage_event(event: &damage::NotifyEvent) {
+    println!("DamageNotify:");
+    println!("damage={}", event.damage);
+    println!("drawable={}", event.drawable);
+    println!(
+        "area={}x{}+{}+{}",
+        event.area.width, event.area.height, event.area.x, event.area.y
+    );
+    println!(
+        "geometry={}x{}+{}+{}",
+        event.geometry.width,
+        event.geometry.height,
+        event.geometry.x,
+        event.geometry.y
+    );
+}
 
 impl X11Connection {
     pub fn connect() -> Result<Self, Box<dyn Error>> {
@@ -144,147 +165,230 @@ impl X11Connection {
         redirected: Option<&RedirectedWindow>,
     ) -> Result<(), Box<dyn Error>> {
         loop {
-            match self.inner.wait_for_event()? {
-                Event::ClientMessage(ClientMessageEvent {
-                    window,
-                    type_,
-                    data,
-                    ..
-                }) if graphics.window() == Some(window)
-                    && type_ == self.wm_protocols
-                    && data.as_data32()[0] == self.wm_delete_window =>
-                {
-                    if redirected.is_some() {
-                        self.cleanup_compositor_capture(graphics, ownership, redirected, true)?;
-                    }
-                    break;
-                }
-                Event::SelectionClear(event)
-                    if ownership.is_some_and(|ownership| {
-                        selection_clear_matches(&event, ownership)
-                    }) =>
-                {
-                    println!("compositor ownership lost");
-                    self.cleanup_compositor_capture(graphics, ownership, redirected, true)?;
-                    break;
-                }
-                Event::Expose(event) if graphics.window() == Some(event.window) => {
-                    graphics.render();
-                    graphics.swap_buffers()?;
-                }
-                Event::ConfigureNotify(event) => {
-                    if graphics.window() == Some(event.window) {
-                        graphics.resize(event.width as i32, event.height as i32);
-                        graphics.render();
-                        graphics.swap_buffers()?;
-                    } else if self.source_window() == Some(event.window) {
-                        let old_size = graphics
-                            .source_size()
-                            .unwrap_or((event.width, event.height));
-                        let size_changed = old_size != (event.width, event.height);
-                        println!("Source ConfigureNotify:");
-                        println!("old size: {}x{}", old_size.0, old_size.1);
-                        println!("new size: {}x{}", event.width, event.height);
-                        println!("size_changed: {}", if size_changed { "yes" } else { "no" });
-                        println!("x={}", event.x);
-                        println!("y={}", event.y);
-                        println!("width={}", event.width);
-                        println!("height={}", event.height);
-                        println!("border_width={}", event.border_width);
-                        if size_changed && graphics.capture_state() == Some(CaptureState::Active) {
-                            if let Err(error) = graphics.resize_capture(event.width, event.height) {
-                                eprintln!(
-                                    "capture resize failed; keeping previous resources: {error}"
-                                );
-                            } else {
-                                graphics.render();
-                                graphics.swap_buffers()?;
-                            }
-                        }
-                    }
-                }
-                Event::UnmapNotify(event) => {
-                    if self.source_root_is_top_level(event.event, event.window) {
-                        if let Some(state) = self.source_map_state(graphics) {
-                            if matches!(state, MapState::UNVIEWABLE | MapState::UNMAPPED) {
-                                println!("source top-level unmapped");
-                                println!("source map_state: {}", Self::map_state_name(state));
-                                graphics.suspend_capture();
-                                println!("capture suspended");
-                            }
-                        }
-                    }
-                }
-                Event::MapNotify(event) => {
-                    if self.source_root_is_top_level(event.event, event.window) {
-                        println!("source top-level mapped");
-                        if let Some(state) = self.source_map_state(graphics) {
-                            println!("source map_state: {}", Self::map_state_name(state));
-                            if state == MapState::VIEWABLE
-                                && graphics.capture_state() == Some(CaptureState::Suspended)
-                            {
-                                println!("recreating capture after remap");
-                                self.try_resume_capture(graphics)?;
-                            } else if state != MapState::VIEWABLE {
-                                println!("source mapped but not viewable yet");
-                            }
-                        }
-                    }
-                }
-                Event::VisibilityNotify(event) => {
-                    println!(
-                        "VisibilityNotify: state={}",
-                        Self::visibility_state_name(event.state)
-                    );
-                    if graphics.source_window() == Some(event.window) {
-                        if graphics.capture_state() == Some(CaptureState::Suspended) {
-                            self.try_resume_capture(graphics)?;
-                        }
-                    }
-                }
-                Event::ReparentNotify(event) => {
-                    if self.source_window() == Some(event.window) {
-                        if let Err(error) = self.refresh_capture_hierarchy() {
-                            eprintln!("source hierarchy refresh failed: {error}");
-                        }
-                    }
-                }
-                Event::DestroyNotify(event) => {
-                    if self.source_window() == Some(event.window) {
-                        graphics.destroy_capture();
-                        if let Some(ownership) = ownership {
-                            if let Err(error) = ownership.release(self) {
-                                eprintln!("compositor ownership cleanup failed: {error}");
-                            }
-                        }
-                        break;
-                    }
-                }
-                Event::DamageNotify(event) if graphics.damage() == Some(event.damage) => {
-                    self.subtract_damage(event.damage)?;
-                    if graphics.capture_state() == Some(CaptureState::Active) {
-                        println!("DamageNotify:");
-                        println!("damage={}", event.damage);
-                        println!("drawable={}", event.drawable);
-                        println!(
-                            "area={}x{}+{}+{}",
-                            event.area.width, event.area.height, event.area.x, event.area.y
-                        );
-                        println!(
-                            "geometry={}x{}+{}+{}",
-                            event.geometry.width,
-                            event.geometry.height,
-                            event.geometry.x,
-                            event.geometry.y
-                        );
-                        graphics.render();
-                        graphics.swap_buffers()?;
-                    }
-                }
-                _ => {}
+            let action = self.dispatch_event(
+                self.inner.wait_for_event()?,
+                graphics,
+                ownership,
+                redirected,
+            )?;
+            if matches!(action, EventLoopAction::Break) {
+                break;
             }
         }
         Ok(())
+    }
+
+    fn dispatch_event(
+        &self,
+        event: Event,
+        graphics: &mut EglContext<'_>,
+        ownership: Option<&CompositorOwnership>,
+        redirected: Option<&RedirectedWindow>,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        match event {
+            Event::ClientMessage(event) => {
+                self.handle_client_message(event, graphics, ownership, redirected)
+            }
+            Event::SelectionClear(event) => {
+                self.handle_selection_clear(event, graphics, ownership, redirected)
+            }
+            Event::Expose(event) => self.handle_expose(event.window, graphics),
+            Event::ConfigureNotify(event) => self.handle_configure_notify(event, graphics),
+            Event::UnmapNotify(event) => self.handle_unmap_notify(event, graphics),
+            Event::MapNotify(event) => self.handle_map_notify(event, graphics),
+            Event::VisibilityNotify(event) => self.handle_visibility_notify(event, graphics),
+            Event::ReparentNotify(event) => self.handle_reparent_notify(event),
+            Event::DestroyNotify(event) => {
+                self.handle_destroy_notify(event.window, graphics, ownership)
+            }
+            Event::DamageNotify(event) => self.handle_damage_notify(event, graphics),
+            _ => Ok(EventLoopAction::Continue),
+        }
+    }
+
+    fn handle_client_message(
+        &self,
+        event: ClientMessageEvent,
+        graphics: &mut EglContext<'_>,
+        ownership: Option<&CompositorOwnership>,
+        redirected: Option<&RedirectedWindow>,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        if graphics.window() == Some(event.window)
+            && event.type_ == self.wm_protocols
+            && event.data.as_data32()[0] == self.wm_delete_window
+        {
+            if redirected.is_some() {
+                self.cleanup_compositor_capture(graphics, ownership, redirected, true)?;
+            }
+            return Ok(EventLoopAction::Break);
+        }
+        Ok(EventLoopAction::Continue)
+    }
+
+    fn handle_selection_clear(
+        &self,
+        event: x11rb::protocol::xproto::SelectionClearEvent,
+        graphics: &mut EglContext<'_>,
+        ownership: Option<&CompositorOwnership>,
+        redirected: Option<&RedirectedWindow>,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        if ownership.is_some_and(|ownership| selection_clear_matches(&event, ownership)) {
+            println!("compositor ownership lost");
+            self.cleanup_compositor_capture(graphics, ownership, redirected, true)?;
+            return Ok(EventLoopAction::Break);
+        }
+        Ok(EventLoopAction::Continue)
+    }
+
+    fn handle_expose(
+        &self,
+        window: Window,
+        graphics: &mut EglContext<'_>,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        if graphics.window() == Some(window) {
+            graphics.render();
+            graphics.swap_buffers()?;
+        }
+        Ok(EventLoopAction::Continue)
+    }
+
+    fn handle_configure_notify(
+        &self,
+        event: xproto::ConfigureNotifyEvent,
+        graphics: &mut EglContext<'_>,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        if graphics.window() == Some(event.window) {
+            graphics.resize(event.width as i32, event.height as i32);
+            graphics.render();
+            graphics.swap_buffers()?;
+        } else if self.source_window() == Some(event.window) {
+            let old_size = graphics
+                .source_size()
+                .unwrap_or((event.width, event.height));
+            let size_changed = old_size != (event.width, event.height);
+            println!("Source ConfigureNotify:");
+            println!("old size: {}x{}", old_size.0, old_size.1);
+            println!("new size: {}x{}", event.width, event.height);
+            println!("size_changed: {}", if size_changed { "yes" } else { "no" });
+            println!("x={}", event.x);
+            println!("y={}", event.y);
+            println!("width={}", event.width);
+            println!("height={}", event.height);
+            println!("border_width={}", event.border_width);
+            if size_changed && graphics.capture_state() == Some(CaptureState::Active) {
+                if let Err(error) = graphics.resize_capture(event.width, event.height) {
+                    eprintln!("capture resize failed; keeping previous resources: {error}");
+                } else {
+                    graphics.render();
+                    graphics.swap_buffers()?;
+                }
+            }
+        }
+        Ok(EventLoopAction::Continue)
+    }
+
+    fn handle_unmap_notify(
+        &self,
+        event: xproto::UnmapNotifyEvent,
+        graphics: &mut EglContext<'_>,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        if self.source_root_is_top_level(event.event, event.window) {
+            if let Some(state) = self.source_map_state(graphics) {
+                if matches!(state, MapState::UNVIEWABLE | MapState::UNMAPPED) {
+                    println!("source top-level unmapped");
+                    println!("source map_state: {}", crate::x11::map_state_name(state));
+                    graphics.suspend_capture();
+                    println!("capture suspended");
+                }
+            }
+        }
+        Ok(EventLoopAction::Continue)
+    }
+
+    fn handle_map_notify(
+        &self,
+        event: xproto::MapNotifyEvent,
+        graphics: &mut EglContext<'_>,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        if self.source_root_is_top_level(event.event, event.window) {
+            println!("source top-level mapped");
+            if let Some(state) = self.source_map_state(graphics) {
+                println!("source map_state: {}", crate::x11::map_state_name(state));
+                if state == MapState::VIEWABLE
+                    && graphics.capture_state() == Some(CaptureState::Suspended)
+                {
+                    println!("recreating capture after remap");
+                    self.try_resume_capture(graphics)?;
+                } else if state != MapState::VIEWABLE {
+                    println!("source mapped but not viewable yet");
+                }
+            }
+        }
+        Ok(EventLoopAction::Continue)
+    }
+
+    fn handle_visibility_notify(
+        &self,
+        event: xproto::VisibilityNotifyEvent,
+        graphics: &mut EglContext<'_>,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        println!(
+            "VisibilityNotify: state={}",
+            Self::visibility_state_name(event.state)
+        );
+        if graphics.source_window() == Some(event.window)
+            && graphics.capture_state() == Some(CaptureState::Suspended)
+        {
+            self.try_resume_capture(graphics)?;
+        }
+        Ok(EventLoopAction::Continue)
+    }
+
+    fn handle_reparent_notify(
+        &self,
+        event: xproto::ReparentNotifyEvent,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        if self.source_window() == Some(event.window) {
+            if let Err(error) = self.refresh_capture_hierarchy() {
+                eprintln!("source hierarchy refresh failed: {error}");
+            }
+        }
+        Ok(EventLoopAction::Continue)
+    }
+
+    fn handle_destroy_notify(
+        &self,
+        window: Window,
+        graphics: &mut EglContext<'_>,
+        ownership: Option<&CompositorOwnership>,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        if self.source_window() == Some(window) {
+            graphics.destroy_capture();
+            if let Some(ownership) = ownership {
+                if let Err(error) = ownership.release(self) {
+                    eprintln!("compositor ownership cleanup failed: {error}");
+                }
+            }
+            return Ok(EventLoopAction::Break);
+        }
+        Ok(EventLoopAction::Continue)
+    }
+
+    fn handle_damage_notify(
+        &self,
+        event: damage::NotifyEvent,
+        graphics: &mut EglContext<'_>,
+    ) -> Result<EventLoopAction, Box<dyn Error>> {
+        if graphics.damage() != Some(event.damage) {
+            return Ok(EventLoopAction::Continue);
+        }
+        self.subtract_damage(event.damage)?;
+        if graphics.capture_state() == Some(CaptureState::Active) {
+            log_damage_event(&event);
+            graphics.render();
+            graphics.swap_buffers()?;
+        }
+        Ok(EventLoopAction::Continue)
     }
 
     fn cleanup_compositor_capture(
@@ -387,15 +491,6 @@ impl X11Connection {
             }
         }
         Ok(())
-    }
-
-    fn map_state_name(state: MapState) -> &'static str {
-        match state {
-            MapState::UNMAPPED => "UNMAPPED",
-            MapState::UNVIEWABLE => "UNVIEWABLE",
-            MapState::VIEWABLE => "VIEWABLE",
-            _ => "UNKNOWN",
-        }
     }
 
     fn visibility_state_name(state: xproto::Visibility) -> &'static str {

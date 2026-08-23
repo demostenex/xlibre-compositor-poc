@@ -11,6 +11,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::ErrorKind;
 
 use super::connection::X11Connection;
+use super::map_state_name;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WindowHierarchy {
@@ -19,7 +20,6 @@ pub struct WindowHierarchy {
     pub top_level: Window,
     pub root: Window,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowRole {
     Client,
@@ -450,15 +450,6 @@ fn print_metadata(label: &str, metadata: &WindowMetadata) {
         metadata.window_type.as_deref().unwrap_or("<absent>")
     );
     println!("role: {:?}", metadata.role);
-}
-
-fn map_state_name(state: MapState) -> &'static str {
-    match state {
-        MapState::UNMAPPED => "UNMAPPED",
-        MapState::UNVIEWABLE => "UNVIEWABLE",
-        MapState::VIEWABLE => "VIEWABLE",
-        _ => "UNKNOWN",
-    }
 }
 
 #[cfg(test)]

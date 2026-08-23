@@ -24,7 +24,6 @@ pub struct CompositorOwnership {
     pub root: Window,
     active: Cell<bool>,
 }
-
 pub struct RedirectedWindow {
     pub window: Window,
     pub mode: composite::Redirect,
@@ -78,11 +77,87 @@ pub fn probe(connection: &X11Connection) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn compositor_selection_atom(
+    connection: &X11Connection,
+    screen_num: usize,
+) -> Result<Atom, Box<dyn Error>> {
+    let name = selection_name(screen_num);
+    Ok(connection.inner.intern_atom(false, name.as_bytes())?.reply()?.atom)
+}
+
+fn current_selection_owner(
+    connection: &X11Connection,
+    selection: Atom,
+) -> Result<Window, Box<dyn Error>> {
+    Ok(connection.inner.get_selection_owner(selection)?.reply()?.owner)
+}
+
+fn create_owner_window(connection: &X11Connection) -> Result<Window, Box<dyn Error>> {
+    let screen = &connection.inner.setup().roots[connection.screen_num()];
+    let owner_window = connection.inner.generate_id()?;
+    connection
+        .inner
+        .create_window(
+            x11rb::COPY_FROM_PARENT as u8,
+            owner_window,
+            screen.root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &xproto::CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )?
+        .check()?;
+    connection.inner.flush()?;
+    Ok(owner_window)
+}
+
+fn acquire_selection(
+    connection: &X11Connection,
+    selection: Atom,
+    owner_window: Window,
+    timestamp: xproto::Timestamp,
+) -> Result<(), Box<dyn Error>> {
+    connection
+        .inner
+        .set_selection_owner(owner_window, selection, timestamp)?
+        .check()?;
+    connection.inner.flush()?;
+    Ok(())
+}
+
+fn announce_manager(
+    connection: &X11Connection,
+    root: Window,
+    manager_atom: Atom,
+    timestamp: xproto::Timestamp,
+    selection: Atom,
+    owner_window: Window,
+) -> Result<(), Box<dyn Error>> {
+    let event = ClientMessageEvent {
+        response_type: x11rb::protocol::xproto::CLIENT_MESSAGE_EVENT,
+        format: 32,
+        sequence: 0,
+        window: root,
+        type_: manager_atom,
+        data: ClientMessageData::from([timestamp, selection, owner_window, 0, 0]),
+    };
+    connection
+        .inner
+        .send_event(false, root, EventMask::STRUCTURE_NOTIFY, event)?
+        .check()?;
+    connection.inner.flush()?;
+    Ok(())
+}
+
 impl CompositorOwnership {
     pub fn claim(connection: &X11Connection) -> Result<Self, Box<dyn Error>> {
         let selection_name = selection_name(connection.screen_num());
-        let selection = connection.inner.intern_atom(false, selection_name.as_bytes())?.reply()?.atom;
-        let current_owner = connection.inner.get_selection_owner(selection)?.reply()?.owner;
+        let selection = compositor_selection_atom(connection, connection.screen_num())?;
+        let current_owner = current_selection_owner(connection, selection)?;
         if should_refuse_takeover((current_owner != x11rb::NONE).then_some(current_owner)) {
             return Err(format!(
                 "compositor already active\nselection: {selection_name}\ncurrent owner: 0x{current_owner:08x}"
@@ -90,41 +165,17 @@ impl CompositorOwnership {
             .into());
         }
 
-        let screen = &connection.inner.setup().roots[connection.screen_num()];
-        let owner_window = connection.inner.generate_id()?;
         let timestamp_property = connection
             .inner
             .intern_atom(false, TIMESTAMP_PROPERTY_NAME)?
             .reply()?
             .atom;
         let manager_atom = connection.inner.intern_atom(false, MANAGER_ATOM_NAME)?.reply()?.atom;
-
-        connection
-            .inner
-            .create_window(
-                x11rb::COPY_FROM_PARENT as u8,
-                owner_window,
-                screen.root,
-                0,
-                0,
-                1,
-                1,
-                0,
-                WindowClass::INPUT_OUTPUT,
-                x11rb::COPY_FROM_PARENT,
-                &xproto::CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-            )?
-            .check()?;
-        connection.inner.flush()?;
-
+        let owner_window = create_owner_window(connection)?;
         let timestamp = Self::server_timestamp(connection, owner_window, timestamp_property)?;
-        connection
-            .inner
-            .set_selection_owner(owner_window, selection, timestamp)?
-            .check()?;
-        connection.inner.flush()?;
+        acquire_selection(connection, selection, owner_window, timestamp)?;
 
-        let owner = connection.inner.get_selection_owner(selection)?.reply()?.owner;
+        let owner = current_selection_owner(connection, selection)?;
         if owner != owner_window {
             let _ = connection.inner.destroy_window(owner_window);
             let _ = connection.inner.flush();
@@ -139,19 +190,15 @@ impl CompositorOwnership {
             .into());
         }
 
-        let event = ClientMessageEvent {
-            response_type: x11rb::protocol::xproto::CLIENT_MESSAGE_EVENT,
-            format: 32,
-            sequence: 0,
-            window: screen.root,
-            type_: manager_atom,
-            data: ClientMessageData::from([timestamp, selection, owner_window, 0, 0]),
-        };
-        connection
-            .inner
-            .send_event(false, screen.root, EventMask::STRUCTURE_NOTIFY, event)?
-            .check()?;
-        connection.inner.flush()?;
+        let root = connection.inner.setup().roots[connection.screen_num()].root;
+        announce_manager(
+            connection,
+            root,
+            manager_atom,
+            timestamp,
+            selection,
+            owner_window,
+        )?;
 
         println!("compositor ownership acquired");
         println!("selection: {selection_name}");
@@ -163,7 +210,7 @@ impl CompositorOwnership {
             selection,
             owner_window,
             timestamp,
-            root: screen.root,
+            root,
             active: Cell::new(true),
         })
     }
