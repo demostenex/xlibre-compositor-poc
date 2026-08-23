@@ -40,9 +40,6 @@ pub struct EglContext<'a> {
     damage: Option<damage::Damage>,
     source_window: Option<u32>,
     source_size: Option<(u16, u16)>,
-    source_hierarchy: Option<Vec<u32>>,
-    source_root: Option<u32>,
-    source_top_level: Option<u32>,
     capture_state: Option<CaptureState>,
     width: i32,
     height: i32,
@@ -51,60 +48,176 @@ pub struct EglContext<'a> {
 impl<'a> EglContext<'a> {
     pub fn diagnostics(connection: &'a X11Connection) -> Result<EglContext<'a>, Box<dyn Error>> {
         let (instance, display, config) = Self::base(connection)?;
-        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::CONTEXT_MINOR_VERSION, 3, egl::CONTEXT_OPENGL_PROFILE_MASK, egl::CONTEXT_OPENGL_CORE_PROFILE_BIT, egl::NONE];
+        let context_attributes = [
+            egl::CONTEXT_MAJOR_VERSION,
+            3,
+            egl::CONTEXT_MINOR_VERSION,
+            3,
+            egl::CONTEXT_OPENGL_PROFILE_MASK,
+            egl::CONTEXT_OPENGL_CORE_PROFILE_BIT,
+            egl::NONE,
+        ];
         let context = instance.create_context(display, config, None, &context_attributes)?;
         instance.make_current(display, None, None, Some(context))?;
-        renderer::load(|name| instance.get_proc_address(name).map_or(std::ptr::null(), |pointer| pointer as *const c_void));
+        renderer::load(|name| {
+            instance
+                .get_proc_address(name)
+                .map_or(std::ptr::null(), |pointer| pointer as *const c_void)
+        });
 
-        Ok(Self { instance, display, context, surface: None, window: None, colormap: None, connection, _native_window: None, captured_image: None, captured_pixmap: None, capture_renderer: None, damage: None, source_window: None, source_size: None, source_hierarchy: None, source_root: None, source_top_level: None, capture_state: None, width: 1, height: 1 })
+        Ok(Self {
+            instance,
+            display,
+            context,
+            surface: None,
+            window: None,
+            colormap: None,
+            connection,
+            _native_window: None,
+            captured_image: None,
+            captured_pixmap: None,
+            capture_renderer: None,
+            damage: None,
+            source_window: None,
+            source_size: None,
+            capture_state: None,
+            width: 1,
+            height: 1,
+        })
     }
 
     pub fn create(connection: &'a X11Connection) -> Result<EglContext<'a>, Box<dyn Error>> {
         let (instance, display, config) = Self::base(connection)?;
         let visual_id = instance.get_config_attrib(display, config, egl::NATIVE_VISUAL_ID)? as u32;
-        let depth = connection.visual_depth(visual_id).ok_or("EGL visual is not present in X11 setup")?;
+        let depth = connection
+            .visual_depth(visual_id)
+            .ok_or("EGL visual is not present in X11 setup")?;
         let colormap = connection.create_colormap(visual_id)?;
         let window = connection.create_window(visual_id, depth, colormap)?;
         let mut native_window = Box::new(window);
 
         let surface = unsafe {
-            instance.create_platform_window_surface(display, config, (&mut *native_window as *mut u32).cast::<c_void>(), &[egl::ATTRIB_NONE])?
+            instance.create_platform_window_surface(
+                display,
+                config,
+                (&mut *native_window as *mut u32).cast::<c_void>(),
+                &[egl::ATTRIB_NONE],
+            )?
         };
 
-        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::CONTEXT_MINOR_VERSION, 3, egl::CONTEXT_OPENGL_PROFILE_MASK, egl::CONTEXT_OPENGL_CORE_PROFILE_BIT, egl::NONE];
+        let context_attributes = [
+            egl::CONTEXT_MAJOR_VERSION,
+            3,
+            egl::CONTEXT_MINOR_VERSION,
+            3,
+            egl::CONTEXT_OPENGL_PROFILE_MASK,
+            egl::CONTEXT_OPENGL_CORE_PROFILE_BIT,
+            egl::NONE,
+        ];
         let context = instance.create_context(display, config, None, &context_attributes)?;
         instance.make_current(display, Some(surface), Some(surface), Some(context))?;
         instance.swap_interval(display, 1)?;
-        renderer::load(|name| instance.get_proc_address(name).map_or(std::ptr::null(), |pointer| pointer as *const c_void));
+        renderer::load(|name| {
+            instance
+                .get_proc_address(name)
+                .map_or(std::ptr::null(), |pointer| pointer as *const c_void)
+        });
         renderer::resize(640, 360);
 
-        Ok(Self { instance, display, context, surface: Some(surface), window: Some(window), colormap: Some(colormap), connection, _native_window: Some(native_window), captured_image: None, captured_pixmap: None, capture_renderer: None, damage: None, source_window: None, source_size: None, source_hierarchy: None, source_root: None, source_top_level: None, capture_state: None, width: 640, height: 360 })
+        Ok(Self {
+            instance,
+            display,
+            context,
+            surface: Some(surface),
+            window: Some(window),
+            colormap: Some(colormap),
+            connection,
+            _native_window: Some(native_window),
+            captured_image: None,
+            captured_pixmap: None,
+            capture_renderer: None,
+            damage: None,
+            source_window: None,
+            source_size: None,
+            capture_state: None,
+            width: 640,
+            height: 360,
+        })
     }
 
-    fn base(connection: &X11Connection) -> Result<(Arc<egl::DynamicInstance<egl::EGL1_5>>, egl::Display, egl::Config), Box<dyn Error>> {
+    fn base(
+        connection: &X11Connection,
+    ) -> Result<
+        (
+            Arc<egl::DynamicInstance<egl::EGL1_5>>,
+            egl::Display,
+            egl::Config,
+        ),
+        Box<dyn Error>,
+    > {
         let library = unsafe { Library::new("libEGL.so.1")? };
-        let instance = Arc::new(unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required_from(library)? });
-        let display_attributes = [EGL_PLATFORM_XCB_SCREEN_EXT, connection.screen_num() as egl::Attrib, egl::ATTRIB_NONE];
-        let display = unsafe { instance.get_platform_display(EGL_PLATFORM_XCB_EXT, connection.inner.get_raw_xcb_connection().cast::<c_void>(), &display_attributes)? };
+        let instance =
+            Arc::new(unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required_from(library)? });
+        let display_attributes = [
+            EGL_PLATFORM_XCB_SCREEN_EXT,
+            connection.screen_num() as egl::Attrib,
+            egl::ATTRIB_NONE,
+        ];
+        let display = unsafe {
+            instance.get_platform_display(
+                EGL_PLATFORM_XCB_EXT,
+                connection.inner.get_raw_xcb_connection().cast::<c_void>(),
+                &display_attributes,
+            )?
+        };
         instance.initialize(display)?;
         instance.bind_api(egl::OPENGL_API)?;
 
-        let config_attributes = [egl::SURFACE_TYPE, egl::WINDOW_BIT, egl::RENDERABLE_TYPE, egl::OPENGL_BIT, egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8, egl::NONE];
-        let config = instance.choose_first_config(display, &config_attributes)?.ok_or("no suitable EGL config")?;
+        let config_attributes = [
+            egl::SURFACE_TYPE,
+            egl::WINDOW_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_BIT,
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
+            egl::NONE,
+        ];
+        let config = instance
+            .choose_first_config(display, &config_attributes)?
+            .ok_or("no suitable EGL config")?;
         Ok((instance, display, config))
     }
 
     pub fn print(&self) {
-        println!("\nEGL:\nversion: {}\nvendor: {}\n\nOpenGL:\nrenderer: {}\nversion: {}\nGLSL: {}", self.query(egl::VERSION), self.query(egl::VENDOR), renderer::string(gl::RENDERER), renderer::string(gl::VERSION), renderer::string(gl::SHADING_LANGUAGE_VERSION));
+        println!(
+            "\nEGL:\nversion: {}\nvendor: {}\n\nOpenGL:\nrenderer: {}\nversion: {}\nGLSL: {}",
+            self.query(egl::VERSION),
+            self.query(egl::VENDOR),
+            renderer::string(gl::RENDERER),
+            renderer::string(gl::VERSION),
+            renderer::string(gl::SHADING_LANGUAGE_VERSION)
+        );
     }
 
     fn query(&self, attribute: egl::Int) -> String {
-        self.instance.query_string(Some(self.display), attribute).ok().map(|value| value.to_string_lossy().into_owned()).unwrap_or_else(|| "unavailable".to_owned())
+        self.instance
+            .query_string(Some(self.display), attribute)
+            .ok()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unavailable".to_owned())
     }
 
     pub fn render(&self) {
         renderer::render();
-        if let Some(capture) = self.capture_renderer.as_ref() { capture.render(); }
+        if let Some(capture) = self.capture_renderer.as_ref() {
+            capture.render();
+        }
     }
 
     pub fn import_pixmap(&mut self, capture: CapturedPixmap) -> Result<(), Box<dyn Error>> {
@@ -112,9 +225,6 @@ impl<'a> EglContext<'a> {
         self.damage = Some(damage);
         self.source_window = Some(capture.window);
         self.source_size = Some((capture.width, capture.height));
-        self.source_hierarchy = Some(capture.hierarchy);
-        self.source_root = Some(capture.root);
-        self.source_top_level = Some(capture.top_level);
         println!("Damage: created (report level: NonEmpty)");
         self.check_import_capabilities()?;
         let (image, texture) = self.create_capture_resources(capture.pixmap)?;
@@ -139,11 +249,8 @@ impl<'a> EglContext<'a> {
     fn create_capture_resources(&self, pixmap: u32) -> Result<(egl::Image, u32), Box<dyn Error>> {
         const EGL_NATIVE_PIXMAP_KHR: egl::Enum = 0x30B0;
         let client_buffer = unsafe { egl::ClientBuffer::from_ptr(pixmap as usize as *mut c_void) };
-        let image_attributes: [egl::Int; 3] = [
-            egl::IMAGE_PRESERVED,
-            egl::TRUE as egl::Int,
-            egl::NONE,
-        ];
+        let image_attributes: [egl::Int; 3] =
+            [egl::IMAGE_PRESERVED, egl::TRUE as egl::Int, egl::NONE];
         let image = unsafe {
             create_native_pixmap_image(
                 &self.instance,
@@ -153,8 +260,12 @@ impl<'a> EglContext<'a> {
                 &image_attributes,
             )?
         };
-        let proc = self.instance.get_proc_address("glEGLImageTargetTexture2DOES").ok_or("glEGLImageTargetTexture2DOES is unavailable")?;
-        let image_target: unsafe extern "system" fn(u32, *const c_void) = unsafe { std::mem::transmute(proc) };
+        let proc = self
+            .instance
+            .get_proc_address("glEGLImageTargetTexture2DOES")
+            .ok_or("glEGLImageTargetTexture2DOES is unavailable")?;
+        let image_target: unsafe extern "system" fn(u32, *const c_void) =
+            unsafe { std::mem::transmute(proc) };
         let texture = match renderer::create_egl_texture(image_target, image.as_ptr().cast()) {
             Ok(texture) => texture,
             Err(error) => {
@@ -182,8 +293,14 @@ impl<'a> EglContext<'a> {
         if self.capture_state != Some(CaptureState::Suspended) {
             return Ok(false);
         }
-        let window = self.source_window.ok_or("capture source window is not available")?;
-        let attributes = self.connection.inner.get_window_attributes(window)?.reply()?;
+        let window = self
+            .source_window
+            .ok_or("capture source window is not available")?;
+        let attributes = self
+            .connection
+            .inner
+            .get_window_attributes(window)?
+            .reply()?;
         if attributes.map_state != x11rb::protocol::xproto::MapState::VIEWABLE {
             return Ok(false);
         }
@@ -218,10 +335,11 @@ impl<'a> EglContext<'a> {
     }
 
     fn recreate_capture(&mut self, width: u16, height: u16) -> Result<(), Box<dyn Error>> {
-        let window = self.source_window.ok_or("capture source window is not available")?;
+        let window = self
+            .source_window
+            .ok_or("capture source window is not available")?;
         let new_pixmap = self.connection.inner.generate_id()?;
         if let Err(error) = self.connection.name_window_pixmap(window, new_pixmap) {
-            let _ = self.connection.free_pixmap(new_pixmap);
             return Err(error);
         }
         println!("Recreating capture:");
@@ -251,7 +369,9 @@ impl<'a> EglContext<'a> {
         self.source_size = Some((width, height));
 
         renderer::delete_texture(old_texture);
-        if let Some(image) = old_image { let _ = self.instance.destroy_image(self.display, image); }
+        if let Some(image) = old_image {
+            let _ = self.instance.destroy_image(self.display, image);
+        }
         if let Some(pixmap) = old_pixmap {
             let _ = self.connection.free_pixmap(pixmap);
         }
@@ -265,22 +385,35 @@ impl<'a> EglContext<'a> {
             "EGL_KHR_image_base",
             "EGL_KHR_image_pixmap",
         ] {
-            let supported = self.instance.query_string(Some(self.display), egl::EXTENSIONS)
+            let supported = self
+                .instance
+                .query_string(Some(self.display), egl::EXTENSIONS)
                 .ok()
-                .map(|value| value.to_string_lossy().split_whitespace().any(|item| item == extension))
+                .map(|value| {
+                    value
+                        .to_string_lossy()
+                        .split_whitespace()
+                        .any(|item| item == extension)
+                })
                 .unwrap_or(false);
             println!("{extension}: {}", if supported { "yes" } else { "no" });
-            if !supported { return Err(format!("required EGL extension is unavailable: {extension}").into()); }
+            if !supported {
+                return Err(format!("required EGL extension is unavailable: {extension}").into());
+            }
         }
 
         let supported = renderer::has_extension("GL_OES_EGL_image");
         println!("GL_OES_EGL_image: {}", if supported { "yes" } else { "no" });
-        if !supported { return Err("required OpenGL extension is unavailable: GL_OES_EGL_image".into()); }
+        if !supported {
+            return Err("required OpenGL extension is unavailable: GL_OES_EGL_image".into());
+        }
         Ok(())
     }
 
     pub fn swap_buffers(&self) -> Result<(), Box<dyn Error>> {
-        if let Some(surface) = self.surface { self.instance.swap_buffers(self.display, surface)?; }
+        if let Some(surface) = self.surface {
+            self.instance.swap_buffers(self.display, surface)?;
+        }
         Ok(())
     }
 
@@ -290,29 +423,25 @@ impl<'a> EglContext<'a> {
         renderer::resize(self.width, self.height);
     }
 
-    pub fn window(&self) -> Option<u32> { self.window }
-
-    pub fn damage(&self) -> Option<damage::Damage> { self.damage }
-
-    pub fn source_window(&self) -> Option<u32> { self.source_window }
-
-    pub fn source_size(&self) -> Option<(u16, u16)> { self.source_size }
-
-    pub fn source_root(&self) -> Option<u32> { self.source_root }
-
-    pub fn source_top_level(&self) -> Option<u32> { self.source_top_level }
-
-    pub fn refresh_source_hierarchy(&mut self) -> Result<(), Box<dyn Error>> {
-        let source = self.source_window.ok_or("capture source window is not available")?;
-        let (hierarchy, root, top_level) = self.connection.query_source_hierarchy(source)?;
-        self.source_hierarchy = Some(hierarchy);
-        self.source_root = Some(root);
-        self.source_top_level = Some(top_level);
-        Ok(())
+    pub fn window(&self) -> Option<u32> {
+        self.window
     }
 
-    pub fn capture_state(&self) -> Option<CaptureState> { self.capture_state }
+    pub fn damage(&self) -> Option<damage::Damage> {
+        self.damage
+    }
 
+    pub fn source_window(&self) -> Option<u32> {
+        self.source_window
+    }
+
+    pub fn source_size(&self) -> Option<(u16, u16)> {
+        self.source_size
+    }
+
+    pub fn capture_state(&self) -> Option<CaptureState> {
+        self.capture_state
+    }
 }
 
 unsafe fn create_native_pixmap_image(
@@ -356,17 +485,27 @@ impl Drop for EglContext<'_> {
         self.capture_renderer.take();
         let _ = self.instance.make_current(self.display, None, None, None);
 
-        if let Some(surface) = self.surface { let _ = self.instance.destroy_surface(self.display, surface); }
+        if let Some(surface) = self.surface {
+            let _ = self.instance.destroy_surface(self.display, surface);
+        }
         let _ = self.instance.destroy_context(self.display, self.context);
 
         if let Some(image) = self.captured_image {
             let _ = self.instance.destroy_image(self.display, image);
         }
 
-        if let Some(damage) = self.damage { let _ = self.connection.destroy_damage(damage); }
-        if let Some(window) = self.window { let _ = self.connection.destroy_window(window); }
-        if let Some(colormap) = self.colormap { let _ = self.connection.free_colormap(colormap); }
-        if let Some(pixmap) = self.captured_pixmap { let _ = self.connection.free_pixmap(pixmap); }
+        if let Some(damage) = self.damage {
+            let _ = self.connection.destroy_damage(damage);
+        }
+        if let Some(window) = self.window {
+            let _ = self.connection.destroy_window(window);
+        }
+        if let Some(colormap) = self.colormap {
+            let _ = self.connection.free_colormap(colormap);
+        }
+        if let Some(pixmap) = self.captured_pixmap {
+            let _ = self.connection.free_pixmap(pixmap);
+        }
 
         let _ = self.instance.terminate(self.display);
     }

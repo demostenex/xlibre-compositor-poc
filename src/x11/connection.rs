@@ -1,20 +1,26 @@
+use std::cell::RefCell;
 use std::error::Error;
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{self, Atom, AtomEnum, ClientMessageEvent, Colormap, CreateWindowAux, EventMask, MapState, Window, WindowClass};
 use x11rb::protocol::Event;
 use x11rb::protocol::damage::{self, ConnectionExt as DamageConnectionExt};
 use x11rb::protocol::xproto::ConnectionExt;
+use x11rb::protocol::xproto::{
+    self, Atom, AtomEnum, ClientMessageEvent, Colormap, CreateWindowAux, EventMask, MapState,
+    Window, WindowClass,
+};
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::xcb_ffi::XCBConnection;
 
 use crate::graphics::egl::{CaptureState, EglContext};
+use crate::x11::capture::CaptureInfo;
 
 pub struct X11Connection {
     pub(crate) inner: XCBConnection,
     screen_num: usize,
     pub wm_protocols: Atom,
     pub wm_delete_window: Atom,
+    pub(crate) capture_info: RefCell<Option<CaptureInfo>>,
 }
 
 impl X11Connection {
@@ -23,20 +29,33 @@ impl X11Connection {
         let wm_protocols = inner.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
         let wm_delete_window = inner.intern_atom(false, b"WM_DELETE_WINDOW")?.reply()?.atom;
 
-        Ok(Self { inner, screen_num, wm_protocols, wm_delete_window })
+        Ok(Self {
+            inner,
+            screen_num,
+            wm_protocols,
+            wm_delete_window,
+            capture_info: RefCell::new(None),
+        })
     }
 
-    pub fn screen_num(&self) -> usize { self.screen_num }
+    pub fn screen_num(&self) -> usize {
+        self.screen_num
+    }
 
     pub fn create_damage(&self, drawable: Window) -> Result<damage::Damage, Box<dyn Error>> {
         let version = self.inner.damage_query_version(1, 1)?.reply()?;
-        println!("XDamage version: {}.{}", version.major_version, version.minor_version);
+        println!(
+            "XDamage version: {}.{}",
+            version.major_version, version.minor_version
+        );
         if version.major_version < 1 {
             return Err("XDamage 1.0 or newer is required".into());
         }
 
         let damage_id = self.inner.generate_id()?;
-        self.inner.damage_create(damage_id, drawable, damage::ReportLevel::NON_EMPTY)?.check()?;
+        self.inner
+            .damage_create(damage_id, drawable, damage::ReportLevel::NON_EMPTY)?
+            .check()?;
         Ok(damage_id)
     }
 
@@ -46,34 +65,70 @@ impl X11Connection {
     }
 
     pub fn subtract_damage(&self, damage_id: damage::Damage) -> Result<(), Box<dyn Error>> {
-        self.inner.damage_subtract(damage_id, x11rb::NONE, x11rb::NONE)?.check()?;
+        self.inner
+            .damage_subtract(damage_id, x11rb::NONE, x11rb::NONE)?
+            .check()?;
         Ok(())
     }
 
     pub fn visual_depth(&self, visual_id: u32) -> Option<u8> {
-        self.inner.setup().roots[self.screen_num].allowed_depths.iter()
-            .find(|depth| depth.visuals.iter().any(|visual| visual.visual_id == visual_id))
+        self.inner.setup().roots[self.screen_num]
+            .allowed_depths
+            .iter()
+            .find(|depth| {
+                depth
+                    .visuals
+                    .iter()
+                    .any(|visual| visual.visual_id == visual_id)
+            })
             .map(|depth| depth.depth)
     }
 
     pub fn create_colormap(&self, visual: u32) -> Result<Colormap, Box<dyn Error>> {
         let screen = &self.inner.setup().roots[self.screen_num];
         let colormap = self.inner.generate_id()?;
-        self.inner.create_colormap(xproto::ColormapAlloc::NONE, colormap, screen.root, visual)?.check()?;
+        self.inner
+            .create_colormap(xproto::ColormapAlloc::NONE, colormap, screen.root, visual)?
+            .check()?;
         Ok(colormap)
     }
 
-    pub fn create_window(&self, visual: u32, depth: u8, colormap: Colormap) -> Result<Window, Box<dyn Error>> {
+    pub fn create_window(
+        &self,
+        visual: u32,
+        depth: u8,
+        colormap: Colormap,
+    ) -> Result<Window, Box<dyn Error>> {
         let screen = &self.inner.setup().roots[self.screen_num];
         let window = self.inner.generate_id()?;
 
-        self.inner.create_window(
-            depth, window, screen.root, 100, 100, 640, 360, 0,
-            WindowClass::INPUT_OUTPUT, visual,
-            &CreateWindowAux::new().colormap(colormap).event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
-        )?.check()?;
+        self.inner
+            .create_window(
+                depth,
+                window,
+                screen.root,
+                100,
+                100,
+                640,
+                360,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                visual,
+                &CreateWindowAux::new()
+                    .colormap(colormap)
+                    .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
+            )?
+            .check()?;
 
-        self.inner.change_property32(xproto::PropMode::REPLACE, window, self.wm_protocols, AtomEnum::ATOM, &[self.wm_delete_window])?.check()?;
+        self.inner
+            .change_property32(
+                xproto::PropMode::REPLACE,
+                window,
+                self.wm_protocols,
+                AtomEnum::ATOM,
+                &[self.wm_delete_window],
+            )?
+            .check()?;
         self.inner.map_window(window)?.check()?;
         self.inner.flush()?;
         Ok(window)
@@ -82,7 +137,17 @@ impl X11Connection {
     pub fn run_event_loop(&self, graphics: &mut EglContext<'_>) -> Result<(), Box<dyn Error>> {
         loop {
             match self.inner.wait_for_event()? {
-                Event::ClientMessage(ClientMessageEvent { window, type_, data, .. }) if graphics.window() == Some(window) && type_ == self.wm_protocols && data.as_data32()[0] == self.wm_delete_window => break,
+                Event::ClientMessage(ClientMessageEvent {
+                    window,
+                    type_,
+                    data,
+                    ..
+                }) if graphics.window() == Some(window)
+                    && type_ == self.wm_protocols
+                    && data.as_data32()[0] == self.wm_delete_window =>
+                {
+                    break;
+                }
                 Event::Expose(event) if graphics.window() == Some(event.window) => {
                     graphics.render();
                     graphics.swap_buffers()?;
@@ -92,8 +157,10 @@ impl X11Connection {
                         graphics.resize(event.width as i32, event.height as i32);
                         graphics.render();
                         graphics.swap_buffers()?;
-                    } else if graphics.source_window() == Some(event.window) {
-                        let old_size = graphics.source_size().unwrap_or((event.width, event.height));
+                    } else if self.source_window() == Some(event.window) {
+                        let old_size = graphics
+                            .source_size()
+                            .unwrap_or((event.width, event.height));
                         let size_changed = old_size != (event.width, event.height);
                         println!("Source ConfigureNotify:");
                         println!("old size: {}x{}", old_size.0, old_size.1);
@@ -106,7 +173,9 @@ impl X11Connection {
                         println!("border_width={}", event.border_width);
                         if size_changed && graphics.capture_state() == Some(CaptureState::Active) {
                             if let Err(error) = graphics.resize_capture(event.width, event.height) {
-                                eprintln!("capture resize failed; keeping previous resources: {error}");
+                                eprintln!(
+                                    "capture resize failed; keeping previous resources: {error}"
+                                );
                             } else {
                                 graphics.render();
                                 graphics.swap_buffers()?;
@@ -115,7 +184,7 @@ impl X11Connection {
                     }
                 }
                 Event::UnmapNotify(event) => {
-                    if self.source_root_is_top_level(graphics, event.event, event.window) {
+                    if self.source_root_is_top_level(event.event, event.window) {
                         if let Some(state) = self.source_map_state(graphics) {
                             if matches!(state, MapState::UNVIEWABLE | MapState::UNMAPPED) {
                                 println!("source top-level unmapped");
@@ -127,11 +196,13 @@ impl X11Connection {
                     }
                 }
                 Event::MapNotify(event) => {
-                    if self.source_root_is_top_level(graphics, event.event, event.window) {
+                    if self.source_root_is_top_level(event.event, event.window) {
                         println!("source top-level mapped");
                         if let Some(state) = self.source_map_state(graphics) {
                             println!("source map_state: {}", Self::map_state_name(state));
-                            if state == MapState::VIEWABLE && graphics.capture_state() == Some(CaptureState::Suspended) {
+                            if state == MapState::VIEWABLE
+                                && graphics.capture_state() == Some(CaptureState::Suspended)
+                            {
                                 println!("recreating capture after remap");
                                 self.try_resume_capture(graphics)?;
                             } else if state != MapState::VIEWABLE {
@@ -141,7 +212,10 @@ impl X11Connection {
                     }
                 }
                 Event::VisibilityNotify(event) => {
-                    println!("VisibilityNotify: state={}", Self::visibility_state_name(event.state));
+                    println!(
+                        "VisibilityNotify: state={}",
+                        Self::visibility_state_name(event.state)
+                    );
                     if graphics.source_window() == Some(event.window) {
                         if graphics.capture_state() == Some(CaptureState::Suspended) {
                             self.try_resume_capture(graphics)?;
@@ -149,14 +223,14 @@ impl X11Connection {
                     }
                 }
                 Event::ReparentNotify(event) => {
-                    if graphics.source_window() == Some(event.window) {
-                        if let Err(error) = graphics.refresh_source_hierarchy() {
+                    if self.source_window() == Some(event.window) {
+                        if let Err(error) = self.refresh_capture_hierarchy() {
                             eprintln!("source hierarchy refresh failed: {error}");
                         }
                     }
                 }
                 Event::DestroyNotify(event) => {
-                    if graphics.source_window() == Some(event.window) {
+                    if self.source_window() == Some(event.window) {
                         graphics.destroy_capture();
                         break;
                     }
@@ -167,8 +241,17 @@ impl X11Connection {
                         println!("DamageNotify:");
                         println!("damage={}", event.damage);
                         println!("drawable={}", event.drawable);
-                        println!("area={}x{}+{}+{}", event.area.width, event.area.height, event.area.x, event.area.y);
-                        println!("geometry={}x{}+{}+{}", event.geometry.width, event.geometry.height, event.geometry.x, event.geometry.y);
+                        println!(
+                            "area={}x{}+{}+{}",
+                            event.area.width, event.area.height, event.area.x, event.area.y
+                        );
+                        println!(
+                            "geometry={}x{}+{}+{}",
+                            event.geometry.width,
+                            event.geometry.height,
+                            event.geometry.x,
+                            event.geometry.y
+                        );
                         graphics.render();
                         graphics.swap_buffers()?;
                     }
@@ -194,8 +277,27 @@ impl X11Connection {
         Ok(())
     }
 
-    fn source_root_is_top_level(&self, graphics: &EglContext<'_>, event_window: Window, affected_window: Window) -> bool {
-        graphics.source_root() == Some(event_window) && graphics.source_top_level() == Some(affected_window)
+    fn source_root_is_top_level(&self, event_window: Window, affected_window: Window) -> bool {
+        self.root() == Some(event_window) && self.top_level() == Some(affected_window)
+    }
+
+    fn source_window(&self) -> Option<Window> {
+        self.capture_info
+            .borrow()
+            .as_ref()
+            .map(|info| info.capture_window)
+    }
+    fn top_level(&self) -> Option<Window> {
+        self.capture_info
+            .borrow()
+            .as_ref()
+            .map(|info| info.lifecycle_window)
+    }
+    fn root(&self) -> Option<Window> {
+        self.capture_info
+            .borrow()
+            .as_ref()
+            .map(|info| info.hierarchy.root)
     }
 
     fn source_map_state(&self, graphics: &EglContext<'_>) -> Option<MapState> {
