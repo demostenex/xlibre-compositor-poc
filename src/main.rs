@@ -22,6 +22,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut compositor_tree_snapshot = false;
     let mut compositor_tree_watch = false;
     let mut compositor_takeover_preflight = false;
+    let mut compositor_overlay_probe = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--diagnostics" => diagnostics_only = true,
@@ -40,6 +41,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--compositor-tree-snapshot" => compositor_tree_snapshot = true,
             "--compositor-tree-watch" => compositor_tree_watch = true,
             "--compositor-takeover-preflight" => compositor_takeover_preflight = true,
+            "--compositor-overlay-probe" => {
+                compositor_overlay_probe = Some(
+                    args.next()
+                        .ok_or("--compositor-overlay-probe requires EXPECTED_ROOT_XID")?,
+                )
+            }
             "--capture" => {
                 capture_window = Some(args.next().ok_or("--capture requires WINDOW_ID")?)
             }
@@ -47,6 +54,25 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     let connection = x11::connection::X11Connection::connect()?;
+
+    if let Some(value) = compositor_overlay_probe {
+        if compositor_probe
+            || claim_compositor
+            || diagnostics_only
+            || capture_window.is_some()
+            || compositor_capture_window.is_some()
+            || compositor_hierarchy_probe_window.is_some()
+            || compositor_tree_snapshot
+            || compositor_tree_watch
+            || compositor_takeover_preflight
+        {
+            return Err(
+                "--compositor-overlay-probe cannot be combined with another mode".into(),
+            );
+        }
+        x11::overlay::run(&connection, &value)?;
+        return Ok(());
+    }
 
     if compositor_takeover_preflight {
         if compositor_probe

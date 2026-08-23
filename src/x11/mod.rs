@@ -5,6 +5,7 @@ pub mod tree;
 pub mod tree_watch;
 pub mod preflight;
 pub mod shutdown;
+pub mod overlay;
 
 use x11rb::protocol::xproto::MapState;
 
