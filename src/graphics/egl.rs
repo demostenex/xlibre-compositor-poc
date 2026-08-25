@@ -116,7 +116,13 @@ impl<'a> EglContext<'a> {
         ];
         let context = instance.create_context(display, config, None, &context_attributes)?;
         instance.make_current(display, Some(surface), Some(surface), Some(context))?;
-        instance.swap_interval(display, 1)?;
+        if let Err(error) = instance.swap_interval(display, 1) {
+            let _ = instance.make_current(display, None, None, None);
+            let _ = instance.destroy_context(display, context);
+            let _ = instance.destroy_surface(display, surface);
+            let _ = instance.terminate(display);
+            return Err(error.into());
+        }
         renderer::load(|name| {
             instance
                 .get_proc_address(name)
@@ -145,7 +151,7 @@ impl<'a> EglContext<'a> {
         })
     }
 
-    fn base_display(
+    pub(crate) fn base_display(
         connection: &X11Connection,
     ) -> Result<(Arc<egl::DynamicInstance<egl::EGL1_5>>, egl::Display), Box<dyn Error>> {
         let library = unsafe { Library::new("libEGL.so.1")? };
@@ -178,7 +184,25 @@ impl<'a> EglContext<'a> {
         ),
         Box<dyn Error>,
     > {
-        let (instance, display) = Self::base_display(connection)?;
+        let (instance, display) = EglContext::base_display(connection)?;
+        let extensions = instance
+            .query_string(Some(display), egl::EXTENSIONS)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for required in [
+            "EGL_KHR_image",
+            "EGL_KHR_image_base",
+            "EGL_KHR_image_pixmap",
+        ] {
+            if !extensions.split_whitespace().any(|item| item == required) {
+                let _ = instance.terminate(display);
+                return Err(format!("required EGL extension is unavailable: {required}").into());
+            }
+        }
+        if instance.get_proc_address("eglCreateImageKHR").is_none() {
+            let _ = instance.terminate(display);
+            return Err("eglCreateImageKHR is unavailable".into());
+        }
 
         let config_attributes = [
             egl::SURFACE_TYPE,
@@ -539,6 +563,307 @@ pub(crate) struct EglConfigReport {
     pub(crate) depth: u8,
 }
 
+pub struct EglImportedSurface {
+    instance: Arc<egl::DynamicInstance<egl::EGL1_5>>,
+    display: egl::Display,
+    image: egl::Image,
+    pub texture: u32,
+    pub(crate) pixel_semantics: crate::x11::scene::EglPixelSemantics,
+    released: bool,
+}
+
+fn claim_imported_surface_release(released: &mut bool) -> bool {
+    if *released {
+        false
+    } else {
+        *released = true;
+        true
+    }
+}
+
+impl EglImportedSurface {
+    pub fn destroy(
+        &mut self,
+        instance: &egl::DynamicInstance<egl::EGL1_5>,
+        display: egl::Display,
+    ) -> Result<(), Box<dyn Error>> {
+        if !claim_imported_surface_release(&mut self.released) {
+            return Ok(());
+        }
+        renderer::delete_texture(self.texture);
+        instance.destroy_image(display, self.image)?;
+        Ok(())
+    }
+
+    pub fn disarm(&mut self) {
+        self.released = true;
+    }
+}
+
+impl Drop for EglImportedSurface {
+    fn drop(&mut self) {
+        if claim_imported_surface_release(&mut self.released) {
+            renderer::delete_texture(self.texture);
+            let _ = self.instance.destroy_image(self.display, self.image);
+        }
+    }
+}
+
+pub struct EglSceneRenderer {
+    instance: Arc<egl::DynamicInstance<egl::EGL1_5>>,
+    display: egl::Display,
+    context: egl::Context,
+    surface: egl::Surface,
+    _native_window: Box<u32>,
+    scene_renderer: Option<renderer::SceneRenderer>,
+    width: u16,
+    height: u16,
+    disarmed: bool,
+}
+
+impl EglSceneRenderer {
+    pub fn create(
+        connection: &X11Connection,
+        overlay: u32,
+        visual: u32,
+        depth: u8,
+        width: u16,
+        height: u16,
+    ) -> Result<Self, Box<dyn Error>> {
+        let (instance, display) = EglContext::base_display(connection)?;
+        let egl_extensions = instance
+            .query_string(Some(display), egl::EXTENSIONS)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for required in [
+            "EGL_KHR_image",
+            "EGL_KHR_image_base",
+            "EGL_KHR_image_pixmap",
+        ] {
+            if !egl_extensions.split_whitespace().any(|item| item == required) {
+                let _ = instance.terminate(display);
+                return Err(format!("required EGL extension is unavailable: {required}").into());
+            }
+        }
+        if instance.get_proc_address("eglCreateImageKHR").is_none() {
+            let _ = instance.terminate(display);
+            return Err("eglCreateImageKHR is unavailable".into());
+        }
+        let config_attributes = [
+            egl::SURFACE_TYPE, egl::WINDOW_BIT,
+            egl::RENDERABLE_TYPE, egl::OPENGL_BIT,
+            egl::RED_SIZE, 8, egl::GREEN_SIZE, 8,
+            egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8, egl::NONE,
+        ];
+        let count = instance.matching_config_count(display, &config_attributes)?;
+        let mut configs = Vec::with_capacity(count);
+        instance.choose_config(display, &config_attributes, &mut configs)?;
+        let config = configs.into_iter().find(|config| {
+            instance.get_config_attrib(display, *config, egl::NATIVE_VISUAL_ID)
+                .ok().map(|value| value as u32) == Some(visual)
+                && connection.visual_depth(visual) == Some(depth)
+        }).ok_or("no EGL scene config matches overlay visual/depth")?;
+        let mut native_window = Box::new(overlay);
+        let surface = unsafe {
+            instance.create_platform_window_surface(
+                display,
+                config,
+                (&mut *native_window as *mut u32).cast::<c_void>(),
+                &[
+                    egl::RENDER_BUFFER as usize,
+                    egl::BACK_BUFFER as usize,
+                    egl::ATTRIB_NONE,
+                ],
+            )?
+        };
+        let context_attributes = [
+            egl::CONTEXT_MAJOR_VERSION, 3,
+            egl::CONTEXT_MINOR_VERSION, 3,
+            egl::CONTEXT_OPENGL_PROFILE_MASK,
+            egl::CONTEXT_OPENGL_CORE_PROFILE_BIT,
+            egl::NONE,
+        ];
+        let context = match instance.create_context(display, config, None, &context_attributes) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = instance.destroy_surface(display, surface);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = instance.make_current(display, Some(surface), Some(surface), Some(context)) {
+            let _ = instance.destroy_context(display, context);
+            let _ = instance.destroy_surface(display, surface);
+            return Err(error.into());
+        }
+        let render_buffer = match instance.query_context(display, context, egl::RENDER_BUFFER) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = instance.make_current(display, None, None, None);
+                let _ = instance.destroy_context(display, context);
+                let _ = instance.destroy_surface(display, surface);
+                let _ = instance.terminate(display);
+                return Err(error.into());
+            }
+        };
+        if !render_buffer_is_back_buffer(render_buffer) {
+            let _ = instance.make_current(display, None, None, None);
+            let _ = instance.destroy_context(display, context);
+            let _ = instance.destroy_surface(display, surface);
+            let _ = instance.terminate(display);
+            return Err(format!("EGL window surface is not double-buffered: 0x{render_buffer:04x}").into());
+        }
+        if let Err(error) = instance.swap_interval(display, 1) {
+            let _ = instance.make_current(display, None, None, None);
+            let _ = instance.destroy_context(display, context);
+            let _ = instance.destroy_surface(display, surface);
+            let _ = instance.terminate(display);
+            return Err(error.into());
+        }
+        renderer::load(|name| {
+            instance.get_proc_address(name)
+                .map_or(std::ptr::null(), |pointer| pointer as *const c_void)
+        });
+        if !renderer::has_extension("GL_OES_EGL_image") {
+            let _ = instance.make_current(display, None, None, None);
+            let _ = instance.destroy_context(display, context);
+            let _ = instance.destroy_surface(display, surface);
+            let _ = instance.terminate(display);
+            return Err("required OpenGL extension is unavailable: GL_OES_EGL_image".into());
+        }
+        if instance.get_proc_address("glEGLImageTargetTexture2DOES").is_none() {
+            let _ = instance.make_current(display, None, None, None);
+            let _ = instance.destroy_context(display, context);
+            let _ = instance.destroy_surface(display, surface);
+            let _ = instance.terminate(display);
+            return Err("glEGLImageTargetTexture2DOES is unavailable".into());
+        }
+        let scene_renderer = match renderer::SceneRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                let _ = instance.make_current(display, None, None, None);
+                let _ = instance.destroy_context(display, context);
+                let _ = instance.destroy_surface(display, surface);
+                let _ = instance.terminate(display);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            instance,
+            display,
+            context,
+            surface,
+            _native_window: native_window,
+            scene_renderer: Some(scene_renderer),
+            width,
+            height,
+            disarmed: false,
+        })
+    }
+
+    pub fn import_pixmap(
+        &self,
+        pixmap: u32,
+        pixel_semantics: crate::x11::scene::EglPixelSemantics,
+    ) -> Result<EglImportedSurface, Box<dyn Error>> {
+        let image = unsafe {
+            let client_buffer = egl::ClientBuffer::from_ptr(pixmap as usize as *mut c_void);
+            create_native_pixmap_image(
+                &self.instance,
+                self.display,
+                0x30B0,
+                client_buffer.as_ptr(),
+                &[egl::IMAGE_PRESERVED, egl::TRUE as egl::Int, egl::NONE],
+            )?
+        };
+        let proc = self.instance.get_proc_address("glEGLImageTargetTexture2DOES")
+            .ok_or("glEGLImageTargetTexture2DOES is unavailable")?;
+        let target: unsafe extern "system" fn(u32, *const c_void) = unsafe { std::mem::transmute(proc) };
+        let texture = match renderer::create_egl_texture(target, image.as_ptr().cast()) {
+            Ok(texture) => texture,
+            Err(error) => {
+                let _ = self.instance.destroy_image(self.display, image);
+                return Err(error);
+            }
+        };
+        Ok(EglImportedSurface {
+            instance: Arc::clone(&self.instance),
+            display: self.display,
+            image,
+            texture,
+            pixel_semantics,
+            released: false,
+        })
+    }
+
+    pub fn clear(&self) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer.as_ref().ok_or("EGL scene renderer is unavailable")?.clear();
+        Ok(())
+    }
+
+    pub fn render_surface(
+        &self,
+        texture: u32,
+        plan: crate::x11::scene::RenderQuadPlan,
+        pixel_semantics: crate::x11::scene::EglPixelSemantics,
+    ) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer
+            .as_ref()
+            .ok_or("EGL scene renderer is unavailable")?
+            .render_surface(texture, plan, pixel_semantics, self.width as i32, self.height as i32)?;
+        Ok(())
+    }
+
+    pub fn swap(&self) -> Result<(), Box<dyn Error>> {
+        self.instance.swap_buffers(self.display, self.surface)?;
+        Ok(())
+    }
+
+    pub fn make_current(&self) -> Result<(), Box<dyn Error>> {
+        self.instance.make_current(
+            self.display,
+            Some(self.surface),
+            Some(self.surface),
+            Some(self.context),
+        )?;
+        Ok(())
+    }
+
+    pub fn destroy_import(&self, surface: &mut EglImportedSurface) -> Result<(), Box<dyn Error>> {
+        surface.destroy(&self.instance, self.display)
+    }
+
+    pub fn destroy(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.disarmed { return Ok(()); }
+        let _ = self.instance.make_current(self.display, Some(self.surface), Some(self.surface), Some(self.context))?;
+        self.scene_renderer.take();
+        let _ = self.instance.make_current(self.display, None, None, None)?;
+        self.instance.destroy_surface(self.display, self.surface)?;
+        self.instance.destroy_context(self.display, self.context)?;
+        self.instance.terminate(self.display)?;
+        self.disarmed = true;
+        Ok(())
+    }
+
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
+        if let Some(renderer) = self.scene_renderer.take() {
+            std::mem::forget(renderer);
+        }
+    }
+}
+
+impl Drop for EglSceneRenderer {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.disarm();
+        }
+    }
+}
+
+pub(crate) fn render_buffer_is_back_buffer(value: egl::Int) -> bool {
+    value == egl::BACK_BUFFER
+}
+
 unsafe fn create_native_pixmap_image(
     instance: &egl::DynamicInstance<egl::EGL1_5>,
     display: egl::Display,
@@ -603,5 +928,26 @@ impl Drop for EglContext<'_> {
         }
 
         let _ = self.instance.terminate(self.display);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{claim_imported_surface_release, render_buffer_is_back_buffer};
+    use khronos_egl as egl;
+
+    #[test]
+    fn only_egl_back_buffer_is_accepted() {
+        assert!(render_buffer_is_back_buffer(egl::BACK_BUFFER));
+        assert!(!render_buffer_is_back_buffer(egl::SINGLE_BUFFER));
+        assert!(!render_buffer_is_back_buffer(0));
+        assert!(!render_buffer_is_back_buffer(egl::UNKNOWN));
+    }
+
+    #[test]
+    fn imported_surface_release_is_at_most_once() {
+        let mut released = false;
+        assert!(claim_imported_surface_release(&mut released));
+        assert!(!claim_imported_surface_release(&mut released));
     }
 }

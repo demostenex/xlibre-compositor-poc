@@ -1,16 +1,21 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::fmt;
 
 use x11rb::connection::Connection;
+use x11rb::errors::ReplyError;
 use x11rb::protocol::composite::ConnectionExt as CompositeConnectionExt;
 use x11rb::protocol::damage::{self, ConnectionExt as DamageConnectionExt};
+use x11rb::protocol::render::{self, ConnectionExt as RenderConnectionExt};
+use x11rb::protocol::ErrorKind;
 use x11rb::protocol::xproto::{
-    self, ChangeWindowAttributesAux, ConnectionExt as XprotoConnectionExt, CreateGCAux,
-    EventMask, Rectangle, Window, WindowClass,
+    self, ChangeWindowAttributesAux, ConnectionExt as XprotoConnectionExt,
+    EventMask, Window, WindowClass,
 };
 use x11rb::protocol::Event;
 
+use crate::graphics::egl::{EglImportedSurface, EglSceneRenderer};
 use super::capture::{WindowGeometry, WindowMetadata};
 use super::compositor::{selection_clear_matches, CompositorOwnership};
 use super::connection::X11Connection;
@@ -50,8 +55,100 @@ enum BackendCompatibility {
     BackendUnsupported,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EglPixelSemantics {
+    Opaque,
+    PremultipliedAlpha,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VisualFormatInfo {
+    pub(crate) visual: u32,
+    pub(crate) depth: u8,
+    pub(crate) pict_format: render::Pictformat,
+    pub(crate) pict_type: render::PictType,
+    pub(crate) red_shift: u16,
+    pub(crate) red_mask: u16,
+    pub(crate) green_shift: u16,
+    pub(crate) green_mask: u16,
+    pub(crate) blue_shift: u16,
+    pub(crate) blue_mask: u16,
+    pub(crate) alpha_shift: u16,
+    pub(crate) alpha_mask: u16,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VisualFormatCache {
+    by_visual: HashMap<u32, VisualFormatInfo>,
+}
+
+impl VisualFormatCache {
+    fn acquire(connection: &X11Connection) -> Result<Self, Box<dyn Error>> {
+        let version = connection
+            .inner
+            .render_query_version(RENDER_CLIENT_MAJOR, RENDER_CLIENT_MINOR)?
+            .reply()?;
+        if !render_version_compatible(version.major_version, version.minor_version) {
+            return Err(format!(
+                "Render version {}.{} is incompatible",
+                version.major_version, version.minor_version
+            ).into());
+        }
+        let reply = connection.inner.render_query_pict_formats()?.reply()?;
+        Self::from_reply(&reply)
+    }
+
+    fn from_reply(reply: &render::QueryPictFormatsReply) -> Result<Self, Box<dyn Error>> {
+        let formats = build_pict_format_index(&reply.formats)?;
+        let mut by_visual = HashMap::new();
+        for depth in reply.screens.iter().flat_map(|screen| screen.depths.iter()) {
+            for visual in &depth.visuals {
+                let format = formats.get(&visual.format).ok_or_else(|| {
+                    format!(
+                        "Render Visual 0x{:08x} references unknown PictFormat 0x{:08x}",
+                        visual.visual, visual.format
+                    )
+                })?;
+                if depth.depth != format.depth {
+                    return Err(format!(
+                        "Render Visual 0x{:08x} has Pictdepth {} but PictFormat {}",
+                        visual.visual, depth.depth, format.depth
+                    ).into());
+                }
+                let info = VisualFormatInfo {
+                    visual: visual.visual,
+                    depth: depth.depth,
+                    pict_format: format.id,
+                    pict_type: format.type_,
+                    red_shift: format.direct.red_shift,
+                    red_mask: format.direct.red_mask,
+                    green_shift: format.direct.green_shift,
+                    green_mask: format.direct.green_mask,
+                    blue_shift: format.direct.blue_shift,
+                    blue_mask: format.direct.blue_mask,
+                    alpha_shift: format.direct.alpha_shift,
+                    alpha_mask: format.direct.alpha_mask,
+                };
+                insert_visual_format(&mut by_visual, info)?;
+            }
+        }
+        Ok(Self { by_visual })
+    }
+
+    fn semantics(&self, visual: u32, depth: u8) -> EglPixelSemantics {
+        self.by_visual
+            .get(&visual)
+            .map_or(EglPixelSemantics::Unsupported, |info| {
+                classify_scene_visual_format(info, depth)
+            })
+    }
+}
+
 const MAX_EVENTS_PER_BATCH: usize = 64;
 const MAX_CANDIDATE_RETRIES: usize = 1;
+const RENDER_CLIENT_MAJOR: u32 = 0;
+const RENDER_CLIENT_MINOR: u32 = 11;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SceneSnapshot {
@@ -60,9 +157,23 @@ struct SceneSnapshot {
     entries: Vec<SurfaceEntry>,
 }
 
+#[derive(Debug)]
+enum CandidateBuildError {
+    Stale(SceneInvalidation),
+}
+
+impl fmt::Display for CandidateBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stale(invalidation) => write!(formatter, "candidate stale: {invalidation:?}"),
+        }
+    }
+}
+
+impl Error for CandidateBuildError {}
+
 impl SceneSnapshot {
     fn from_hierarchy(
-        connection: &X11Connection,
         hierarchy: HierarchySnapshot,
         root_geometry: RootGeometry,
         overlay: Window,
@@ -80,18 +191,11 @@ impl SceneSnapshot {
             let metadata = match binding.surface_candidate.as_ref() {
                 Some(metadata) => metadata,
                 None => {
-                    return Err(format!(
-                        "scene snapshot stale root child 0x{surface_xid:08x}"
-                    )
-                    .into())
+                    return Err(Box::new(CandidateBuildError::Stale(SceneInvalidation::Hierarchy)))
                 }
             };
             if metadata.window != surface_xid {
-                return Err(format!(
-                    "scene snapshot surface mismatch: root child 0x{surface_xid:08x}, metadata 0x{:08x}",
-                    metadata.window
-                )
-                .into());
+                return Err(Box::new(CandidateBuildError::Stale(SceneInvalidation::Hierarchy)));
             }
             let semantic_client_xid = match &binding.semantic_client {
                 BindingStatus::SingleClient(client) => Some(*client),
@@ -114,7 +218,6 @@ impl SceneSnapshot {
             hierarchy.children.len(),
             entries.len()
         );
-        let _ = connection;
         Ok(Self {
             root: hierarchy.root,
             root_geometry,
@@ -217,7 +320,20 @@ enum DamageState {
     Active,
     DestroyAttempted,
     Released,
+    AlreadyGone,
     Disarmed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DamageReleaseOutcome {
+    Released,
+    AlreadyGone,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DamageDestroyClassification {
+    BadDamage,
+    OtherError,
 }
 
 struct DamageLease<'a> {
@@ -260,9 +376,9 @@ impl<'a> DamageLease<'a> {
         Ok(())
     }
 
-    fn destroy(&self) -> Result<(), Box<dyn Error>> {
+    fn destroy(&self) -> Result<DamageReleaseOutcome, Box<dyn Error>> {
         if self.state.get() != DamageState::Active {
-            return Ok(());
+            return Ok(DamageReleaseOutcome::Released);
         }
         self.state.set(DamageState::DestroyAttempted);
         self.connection
@@ -274,7 +390,11 @@ impl<'a> DamageLease<'a> {
             "DamageLease released: damage=0x{:08x} surface=0x{:08x}",
             self.damage_xid, self.surface_xid
         );
-        Ok(())
+        Ok(DamageReleaseOutcome::Released)
+    }
+
+    fn mark_already_gone(&self) {
+        self.state.set(DamageState::AlreadyGone);
     }
 
     fn disarm_cleanup(&self) {
@@ -296,6 +416,54 @@ impl Drop for DamageLease<'_> {
     }
 }
 
+fn classify_damage_destroy_error(error: &(dyn Error + 'static)) -> DamageDestroyClassification {
+    match error.downcast_ref::<ReplyError>() {
+        Some(ReplyError::X11Error(error))
+            if error.error_kind == ErrorKind::DamageBadDamage =>
+        {
+            DamageDestroyClassification::BadDamage
+        }
+        Some(_) | None => DamageDestroyClassification::OtherError,
+    }
+}
+
+fn classify_retired_damage_destroy(
+    surface_removed: bool,
+    result: Result<(), DamageDestroyClassification>,
+) -> Result<DamageReleaseOutcome, DamageDestroyClassification> {
+    match result {
+        Ok(()) => Ok(DamageReleaseOutcome::Released),
+        Err(DamageDestroyClassification::BadDamage) if surface_removed => {
+            Ok(DamageReleaseOutcome::AlreadyGone)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn retire_damage_lease(
+    damage: &DamageLease<'_>,
+    surface_removed: bool,
+) -> Result<(), Box<dyn Error>> {
+    match damage.destroy() {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let classification = classify_damage_destroy_error(&*error);
+            match classify_retired_damage_destroy(surface_removed, Err(classification)) {
+                Ok(DamageReleaseOutcome::AlreadyGone) => {
+                    damage.mark_already_gone();
+                    println!(
+                        "retired Damage already gone: surface=0x{:08x} damage=0x{:08x}",
+                        damage.surface_xid, damage.damage_xid
+                    );
+                    Ok(())
+                }
+                Ok(DamageReleaseOutcome::Released) | Err(_) => Err(error),
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
 struct NamedSurfacePixmap<'a> {
     connection: &'a X11Connection,
     surface_xid: Window,
@@ -409,6 +577,7 @@ impl<'a> NamedSurfacePixmap<'a> {
         self.state.set(PixmapState::FreeAttempted);
     }
 
+    #[allow(dead_code)]
     fn copy_plan(&self, root: RootGeometry) -> Option<CopyPlan> {
         build_copy_plan(self.window_geometry, self.geometry, root)
     }
@@ -428,6 +597,7 @@ impl Drop for NamedSurfacePixmap<'_> {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CopyPlan {
     src_x: i16,
@@ -438,6 +608,73 @@ struct CopyPlan {
     height: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RenderQuadPlan {
+    pub(crate) dst_x: i32,
+    pub(crate) dst_y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) src_x: i32,
+    pub(crate) src_y: i32,
+    pub(crate) src_width: i32,
+    pub(crate) src_height: i32,
+    pub(crate) u0: f32,
+    pub(crate) v0: f32,
+    pub(crate) u1: f32,
+    pub(crate) v1: f32,
+}
+
+fn build_render_quad_plan(
+    window: WindowGeometry,
+    pixmap: PixmapGeometry,
+    root: RootGeometry,
+) -> Option<RenderQuadPlan> {
+    if pixmap.root == x11rb::NONE || pixmap.width == 0 || pixmap.height == 0 {
+        return None;
+    }
+    let border = i32::from(window.border_width);
+    let mut dst_x = i32::from(window.x) - border;
+    let mut dst_y = i32::from(window.y) - border;
+    let mut src_x = 0_i32;
+    let mut src_y = 0_i32;
+    let mut width = i32::from(pixmap.width);
+    let mut height = i32::from(pixmap.height);
+    if dst_x < 0 {
+        let clipped = -dst_x;
+        src_x += clipped;
+        width -= clipped;
+        dst_x = 0;
+    }
+    if dst_y < 0 {
+        let clipped = -dst_y;
+        src_y += clipped;
+        height -= clipped;
+        dst_y = 0;
+    }
+    width = width.min(i32::from(root.width) - dst_x);
+    height = height.min(i32::from(root.height) - dst_y);
+    if width <= 0 || height <= 0 || src_x + width > i32::from(pixmap.width)
+        || src_y + height > i32::from(pixmap.height)
+    {
+        return None;
+    }
+    Some(RenderQuadPlan {
+        dst_x,
+        dst_y,
+        width,
+        height,
+        src_x,
+        src_y,
+        src_width: width,
+        src_height: height,
+        u0: src_x as f32 / f32::from(pixmap.width),
+        v0: src_y as f32 / f32::from(pixmap.height),
+        u1: (src_x + width) as f32 / f32::from(pixmap.width),
+        v1: (src_y + height) as f32 / f32::from(pixmap.height),
+    })
+}
+
+#[allow(dead_code)]
 fn build_copy_plan(
     window: WindowGeometry,
     pixmap: PixmapGeometry,
@@ -487,195 +724,6 @@ fn build_copy_plan(
         width: width as u16,
         height: height as u16,
     })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResourceState {
-    Inactive,
-    Active,
-    FreeAttempted,
-    Released,
-}
-
-struct SceneScratchPixmap<'a> {
-    connection: &'a X11Connection,
-    root: Window,
-    pixmap: u32,
-    width: u16,
-    height: u16,
-    depth: u8,
-    state: Cell<ResourceState>,
-}
-
-impl<'a> SceneScratchPixmap<'a> {
-    fn create(
-        connection: &'a X11Connection,
-        root: Window,
-        geometry: RootGeometry,
-    ) -> Result<Self, Box<dyn Error>> {
-        let pixmap = connection.inner.generate_id()?;
-        connection
-            .inner
-            .create_pixmap(geometry.depth, pixmap, root, geometry.width, geometry.height)?
-            .check()?;
-        let state = Cell::new(ResourceState::Inactive);
-        state.set(ResourceState::Active);
-        Ok(Self {
-            connection,
-            root,
-            pixmap,
-            width: geometry.width,
-            height: geometry.height,
-            depth: geometry.depth,
-            state,
-        })
-    }
-
-    fn clear(&self, gc: u32) -> Result<(), Box<dyn Error>> {
-        self.connection
-            .inner
-            .poly_fill_rectangle(
-                self.pixmap,
-                gc,
-                &[Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: self.width,
-                    height: self.height,
-                }],
-            )?
-            .check()?;
-        Ok(())
-    }
-
-    fn free(&self) -> Result<(), Box<dyn Error>> {
-        if self.state.get() != ResourceState::Active {
-            return Ok(());
-        }
-        self.state.set(ResourceState::FreeAttempted);
-        self.connection.inner.free_pixmap(self.pixmap)?.check()?;
-        self.state.set(ResourceState::Released);
-        Ok(())
-    }
-
-    fn disarm_cleanup(&self) {
-        self.state.set(ResourceState::FreeAttempted);
-    }
-}
-
-impl Drop for SceneScratchPixmap<'_> {
-    fn drop(&mut self) {
-        if self.state.get() != ResourceState::Active {
-            return;
-        }
-        self.state.set(ResourceState::FreeAttempted);
-        if let Ok(cookie) = self.connection.inner.free_pixmap(self.pixmap) {
-            if cookie.check().is_ok() {
-                self.state.set(ResourceState::Released);
-            }
-        }
-    }
-}
-
-struct SceneGc<'a> {
-    connection: &'a X11Connection,
-    gc: u32,
-    state: Cell<ResourceState>,
-}
-
-impl<'a> SceneGc<'a> {
-    fn create(connection: &'a X11Connection, root: Window, black: u32) -> Result<Self, Box<dyn Error>> {
-        let gc = connection.inner.generate_id()?;
-        connection
-            .inner
-            .create_gc(
-                gc,
-                root,
-                &CreateGCAux::new()
-                    .foreground(black)
-                    .background(black)
-                    .function(xproto::GX::COPY)
-                    .graphics_exposures(0_u32),
-            )?
-            .check()?;
-        let state = Cell::new(ResourceState::Inactive);
-        state.set(ResourceState::Active);
-        Ok(Self {
-            connection,
-            gc,
-            state,
-        })
-    }
-
-    fn clear_overlay(&self, overlay: Window, geometry: RootGeometry) -> Result<(), Box<dyn Error>> {
-        self.connection
-            .inner
-            .poly_fill_rectangle(
-                overlay,
-                self.gc,
-                &[Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: geometry.width,
-                    height: geometry.height,
-                }],
-            )?
-            .check()?;
-        self.connection.inner.flush()?;
-        self.connection.inner.get_input_focus()?.reply()?;
-        Ok(())
-    }
-
-    fn copy(
-        &self,
-        source: u32,
-        destination: Window,
-        plan: CopyPlan,
-    ) -> Result<(), Box<dyn Error>> {
-        self.connection
-            .inner
-            .copy_area(
-                source,
-                destination,
-                self.gc,
-                plan.src_x,
-                plan.src_y,
-                plan.dst_x,
-                plan.dst_y,
-                plan.width,
-                plan.height,
-            )?
-            .check()?;
-        Ok(())
-    }
-
-    fn free(&self) -> Result<(), Box<dyn Error>> {
-        if self.state.get() != ResourceState::Active {
-            return Ok(());
-        }
-        self.state.set(ResourceState::FreeAttempted);
-        self.connection.inner.free_gc(self.gc)?.check()?;
-        self.state.set(ResourceState::Released);
-        Ok(())
-    }
-
-    fn disarm_cleanup(&self) {
-        self.state.set(ResourceState::FreeAttempted);
-    }
-}
-
-impl Drop for SceneGc<'_> {
-    fn drop(&mut self) {
-        if self.state.get() != ResourceState::Active {
-            return;
-        }
-        self.state.set(ResourceState::FreeAttempted);
-        if let Ok(cookie) = self.connection.inner.free_gc(self.gc) {
-            if cookie.check().is_ok() {
-                self.state.set(ResourceState::Released);
-            }
-        }
-    }
 }
 
 struct SceneRootWatch<'a> {
@@ -826,23 +874,29 @@ struct SceneSession<'a> {
     overlay: Option<OverlayLease<'a>>,
     root_watch: Option<SceneRootWatch<'a>>,
     structure_watches: SceneStructureWatches<'a>,
+    visual_formats: VisualFormatCache,
     manual: Option<ManualSubwindowsRedirect<'a>>,
-    gc: Option<SceneGc<'a>>,
-    scratch: Option<SceneScratchPixmap<'a>>,
+    egl: Option<EglSceneRenderer>,
     pixmaps: Vec<NamedSurfacePixmap<'a>>,
     damage_leases: Vec<DamageLease<'a>>,
     damage_registry: HashMap<damage::Damage, Window>,
     pending_damage: HashSet<damage::Damage>,
+    structural_generation: u64,
+    attempted_structural_generation: u64,
     snapshot: Option<SceneSnapshot>,
+    egl_surfaces: HashMap<Window, EglImportedSurface>,
     signal: SignalWake,
     state: SceneState,
 }
 
 struct SceneCandidate<'a> {
     snapshot: SceneSnapshot,
-    scratch: SceneScratchPixmap<'a>,
-    pixmaps: Vec<NamedSurfacePixmap<'a>>,
+    generation: u64,
+    // Declaration order is cleanup order: imported EGL resources must drop
+    // before their source pixmaps, with Damage leases released in between.
+    egl_surfaces: HashMap<Window, EglImportedSurface>,
     damage_leases: Vec<DamageLease<'a>>,
+    pixmaps: Vec<NamedSurfacePixmap<'a>>,
     damage_registry: HashMap<damage::Damage, Window>,
     watch_ids: HashSet<Window>,
     watch_additions: Vec<Window>,
@@ -998,6 +1052,7 @@ impl<'a> SceneSession<'a> {
         check_capabilities(connection)?;
         check_selection_available(connection)?;
         ensure_damage_version(connection)?;
+        let visual_formats = VisualFormatCache::acquire(connection)?;
         let signal = SignalWake::install()?;
         let ownership = CompositorOwnership::claim(connection)?;
         let mut overlay = OverlayLease::acquire(connection, root)?;
@@ -1009,8 +1064,28 @@ impl<'a> SceneSession<'a> {
         if root_geometry.depth != screen.root_depth || root_geometry.visual != screen.root_visual {
             return Err("scene root geometry does not match screen metadata".into());
         }
-        let gc = SceneGc::create(connection, root, screen.black_pixel)?;
-        gc.clear_overlay(overlay.overlay, root_geometry)?;
+        let egl = match EglSceneRenderer::create(
+            connection,
+            overlay.overlay,
+            screen.root_visual,
+            screen.root_depth,
+            root_geometry.width,
+            root_geometry.height,
+        ) {
+            Ok(egl) => egl,
+            Err(error) => {
+                if let Err(cleanup_error) = overlay.restore_input_shape() {
+                    eprintln!("EGL preflight input cleanup failed: {cleanup_error}");
+                }
+                if let Err(cleanup_error) = overlay.release_overlay() {
+                    eprintln!("EGL preflight overlay cleanup failed: {cleanup_error}");
+                }
+                if let Err(cleanup_error) = ownership.release(connection) {
+                    eprintln!("EGL preflight ownership cleanup failed: {cleanup_error}");
+                }
+                return Err(error);
+            }
+        };
         println!("state: PlaceholderReady");
         let manual = ManualSubwindowsRedirect::acquire(connection, root)?;
         println!("state: ManualActive");
@@ -1021,14 +1096,19 @@ impl<'a> SceneSession<'a> {
             overlay: Some(overlay),
             root_watch: Some(root_watch),
             structure_watches: SceneStructureWatches::new(connection),
+            visual_formats,
             manual: Some(manual),
-            gc: Some(gc),
-            scratch: None,
+            egl: Some(egl),
             pixmaps: Vec::new(),
             damage_leases: Vec::new(),
             damage_registry: HashMap::new(),
             pending_damage: HashSet::new(),
+            // Generation 1 is the initial scene build.  A generation is
+            // ready exactly when it is newer than the last attempted one.
+            structural_generation: 1,
+            attempted_structural_generation: 0,
             snapshot: None,
+            egl_surfaces: HashMap::new(),
             signal,
             state: SceneState::PlaceholderReady,
         };
@@ -1059,6 +1139,7 @@ impl<'a> SceneSession<'a> {
     }
 
     fn build_candidate(&mut self) -> Result<SceneCandidate<'a>, Box<dyn Error>> {
+        let generation = self.structural_generation;
         let root_geometry = read_root_geometry(self.connection, self.root)?;
         let hierarchy = self.connection.snapshot_hierarchy()?;
         let watch_ids = snapshot_watch_ids(&hierarchy);
@@ -1069,24 +1150,21 @@ impl<'a> SceneSession<'a> {
             .ok_or("ownership is unavailable")?
             .owner_window;
         let snapshot = SceneSnapshot::from_hierarchy(
-            self.connection,
             hierarchy,
             root_geometry,
             overlay,
             owner,
         )?;
         self.state = SceneState::SceneSnapshotReady;
-        let scratch = SceneScratchPixmap::create(self.connection, self.root, root_geometry)?;
-        if scratch.root != self.root || scratch.depth != root_geometry.depth {
-            return Err("scratch pixmap root/depth is incompatible with scene".into());
-        }
-        let gc = self.gc.as_ref().ok_or("scene GC is unavailable")?;
-        scratch.clear(gc.gc)?;
         let mut pixmaps = Vec::new();
         let mut damage_leases = Vec::new();
         let mut damage_registry = HashMap::new();
+        let mut egl_surfaces = HashMap::new();
+        let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
         for entry in &snapshot.entries {
-            if damage_monitoring_enabled(entry) {
+            let semantics = self.visual_formats.semantics(entry.visual, entry.depth);
+            let importable = semantics != EglPixelSemantics::Unsupported;
+            if importable {
                 let damage = DamageLease::acquire(self.connection, entry.surface_xid)?;
                 damage.subtract()?;
                 damage_registry.insert(damage.damage_xid, entry.surface_xid);
@@ -1098,39 +1176,40 @@ impl<'a> SceneSession<'a> {
                 self.root,
                 root_geometry,
             )?;
-            if entry.backend == BackendCompatibility::BackendUnsupported {
+            if !importable {
                 println!(
-                    "CopyArea backend unsupported: canonical surface=0x{:08x} depth={} visual=0x{:08x}",
+                    "EGL import unsupported by capability policy: canonical surface=0x{:08x} depth={} visual=0x{:08x}",
                     entry.surface_xid, entry.depth, entry.visual
                 );
                 pixmaps.push(pixmap);
                 continue;
             }
+            let egl_surface = egl.import_pixmap(pixmap.pixmap_xid, semantics)?;
+            egl_surfaces.insert(entry.surface_xid, egl_surface);
             pixmaps.push(pixmap);
         }
         self.connection.inner.get_input_focus()?.reply()?;
-        for (entry, pixmap) in snapshot.entries.iter().zip(pixmaps.iter()) {
-            if entry.backend == BackendCompatibility::BackendUnsupported {
-                continue;
+        for entry in &snapshot.entries {
+            let semantics = self.visual_formats.semantics(entry.visual, entry.depth);
+            let damage_active = damage_registry.values().any(|surface| *surface == entry.surface_xid);
+            if !candidate_render_allowed(semantics, damage_active) {
+                return Err(format!("candidate DamageLease is not active before EGL render for surface 0x{:08x}", entry.surface_xid).into());
             }
-            let plan = pixmap.copy_plan(root_geometry).ok_or_else(|| {
-                format!(
-                    "surface 0x{:08x} has no visible copy intersection or valid coordinates",
-                    entry.surface_xid
-                )
-            })?;
-            let scratch_drawable = scratch.pixmap;
-            gc.copy(pixmap.pixmap_xid, scratch_drawable, plan)?;
         }
+        if !egl_scene_is_renderable(snapshot.entries.len(), egl_surfaces.len()) {
+            return Err("scene has canonical surfaces but no EGL-renderable surfaces".into());
+        }
+        self.render_egl_scene(&snapshot, &egl_surfaces, &pixmaps)?;
         self.state = SceneState::NamedPixmapsReady;
-        println!("state: NamedPixmapsReady surfaces={}", pixmaps.len());
+        println!("state: EGLImported surfaces={}", egl_surfaces.len());
         let watch_additions = self.structure_watches.ensure_candidate(&watch_ids)?;
         Ok(SceneCandidate {
             snapshot,
-            scratch,
+            generation,
             pixmaps,
             damage_leases,
             damage_registry,
+            egl_surfaces,
             watch_ids,
             watch_additions,
         })
@@ -1138,7 +1217,27 @@ impl<'a> SceneSession<'a> {
 
     fn rebuild_and_present(&mut self) -> Result<(), Box<dyn Error>> {
         for attempt in 0..=MAX_CANDIDATE_RETRIES {
-            let candidate = self.build_candidate()?;
+            let generation = self.structural_generation;
+            self.attempted_structural_generation = generation;
+            let candidate = match self.build_candidate() {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    let stale = error
+                        .downcast_ref::<CandidateBuildError>()
+                        .map(|stale| match stale { CandidateBuildError::Stale(invalidation) => *invalidation });
+                    let Some(invalidation) = stale else {
+                        return Err(error);
+                    };
+                    if retry_allowed(attempt) {
+                        println!("candidate stale; bounded retry: {invalidation:?}");
+                        continue;
+                    } else {
+                        println!("candidate stale; deferred rebuild: {invalidation:?}");
+                        return Ok(());
+                    }
+                }
+            };
+            debug_assert_eq!(candidate.generation, generation);
             let (gate, deferred_damage) = match self.pre_commit_gate(&candidate) {
                 Ok(gate) => gate,
                 Err(error) => {
@@ -1149,8 +1248,7 @@ impl<'a> SceneSession<'a> {
             match gate {
                 GateDecision::Accept => {
                     self.commit_candidate(candidate)?;
-                    self.pending_damage.extend(deferred_damage);
-                    self.retain_current_pending();
+                    self.merge_deferred_damage(deferred_damage);
                     return Ok(());
                 }
                 GateDecision::Shutdown(reason) => {
@@ -1158,25 +1256,21 @@ impl<'a> SceneSession<'a> {
                     return Err(format!("candidate aborted by shutdown: {reason:?}").into());
                 }
                 GateDecision::Retry(invalidation) if retry_allowed(attempt) => {
-                    self.pending_damage.extend(deferred_damage);
-                    self.retain_current_pending();
+                    self.merge_deferred_damage(deferred_damage);
                     self.structure_watches.rollback(&candidate.watch_additions)?;
                     println!("candidate stale; bounded retry: {invalidation:?}");
                 }
                 GateDecision::Retry(invalidation) => {
-                    self.pending_damage.extend(deferred_damage);
-                    self.retain_current_pending();
+                    self.merge_deferred_damage(deferred_damage);
                     self.structure_watches.rollback(&candidate.watch_additions)?;
-                    if old_scene_safe(invalidation) {
-                        return Err(format!(
-                            "candidate stale after bounded retry; old scene retained: {invalidation:?}"
-                        )
-                        .into());
+                    if retry_allowed(attempt) {
+                        println!("candidate stale; bounded retry: {invalidation:?}");
+                        continue;
+                    } else {
+                        drop(candidate);
+                        println!("candidate stale; deferred rebuild: {invalidation:?}");
+                        return Ok(());
                     }
-                    return Err(format!(
-                        "candidate stale after bounded retry; coordinated shutdown: {invalidation:?}"
-                    )
-                    .into());
                 }
             }
         }
@@ -1195,14 +1289,16 @@ impl<'a> SceneSession<'a> {
                 break;
             };
             drained += 1;
-            batch.push(classify_event_with_registries(
+            let invalidation = classify_event_with_registries(
                 event,
                 self.root,
                 &candidate.snapshot,
                 self.ownership.as_ref(),
                 &self.damage_registry,
                 &candidate.damage_registry,
-            ));
+            );
+            self.observe_invalidation(invalidation);
+            batch.push(invalidation);
         }
         let batch_decision = batch.decision();
         let deferred_damage = batch.pixel_damage().clone();
@@ -1240,48 +1336,66 @@ impl<'a> SceneSession<'a> {
         &mut self,
         candidate: SceneCandidate<'a>,
     ) -> Result<(), Box<dyn Error>> {
-        let overlay = self.overlay.as_ref().ok_or("overlay is unavailable")?.overlay;
-        if candidate.snapshot.root_geometry.depth != self.overlay_depth()? {
-            return Err("scratch and overlay depths differ".into());
-        }
-        let gc = self.gc.as_ref().ok_or("scene GC is unavailable")?;
-        gc.copy(
-            candidate.scratch.pixmap,
-            overlay,
-            CopyPlan {
-                src_x: 0,
-                src_y: 0,
-                dst_x: 0,
-                dst_y: 0,
-                width: candidate.snapshot.root_geometry.width,
-                height: candidate.snapshot.root_geometry.height,
-            },
-        )?;
-        self.connection.inner.flush()?;
-        self.connection.inner.get_input_focus()?.reply()?;
+        let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
+        egl.swap()?;
         self.state = SceneState::ScenePresented;
+        let old_surfaces = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .entries
+                    .iter()
+                    .map(|entry| entry.surface_xid)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let new_surfaces = candidate
+            .snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.surface_xid)
+            .collect::<HashSet<_>>();
+        let removed_surfaces = old_surfaces
+            .difference(&new_surfaces)
+            .copied()
+            .collect::<HashSet<_>>();
         let snapshot = candidate.snapshot;
-        let old_scratch = self.scratch.replace(candidate.scratch);
         let old_pixmaps = std::mem::replace(&mut self.pixmaps, candidate.pixmaps);
         let old_damage_leases = std::mem::replace(&mut self.damage_leases, candidate.damage_leases);
+        let mut old_egl_surfaces = std::mem::replace(&mut self.egl_surfaces, candidate.egl_surfaces);
         self.damage_registry = candidate.damage_registry;
         self.snapshot = Some(snapshot);
         self.structure_watches.reconcile(&candidate.watch_ids)?;
         for damage in &old_damage_leases {
-            damage.destroy()?;
+            retire_damage_lease(damage, removed_surfaces.contains(&damage.surface_xid))?;
+        }
+        egl.make_current()?;
+        for surface in old_egl_surfaces.values_mut() {
+            egl.destroy_import(surface)?;
         }
         drop(old_pixmaps);
-        drop(old_scratch);
         self.retain_current_pending();
         self.state = SceneState::RunningLivePixel;
-        println!("state: ScenePresented (MANUAL active, X11 CopyArea instrument)");
+        println!("state: ScenePresented (MANUAL active, EGL scene renderer)");
         println!("state: RunningLivePixel");
         Ok(())
     }
 
     fn retain_current_pending(&mut self) {
-        self.pending_damage
-            .retain(|damage_id| self.damage_registry.contains_key(damage_id));
+        retain_pending_for_registry(&mut self.pending_damage, &self.damage_registry);
+    }
+
+    fn merge_deferred_damage(&mut self, deferred: HashSet<damage::Damage>) {
+        merge_deferred_damage_for_registry(
+            &mut self.pending_damage,
+            deferred,
+            &self.damage_registry,
+        );
+    }
+
+    fn observe_invalidation(&mut self, invalidation: SceneInvalidation) {
+        observe_structural_generation(&mut self.structural_generation, invalidation);
     }
 
     fn wait_live_pixel(&mut self) -> Result<(), Box<dyn Error>> {
@@ -1289,6 +1403,15 @@ impl<'a> SceneSession<'a> {
             let mut batch = InvalidationBatch::default();
             let pending = std::mem::take(&mut self.pending_damage);
             let had_pending_work = pending_work_requires_iteration(&pending);
+            if matches!(
+                structural_generation_state(
+                    self.structural_generation,
+                    self.attempted_structural_generation,
+                ),
+                StructuralGenerationState::Ready(_)
+            ) {
+                batch.push(SceneInvalidation::Hierarchy);
+            }
             for damage_id in pending {
                 if self.damage_registry.contains_key(&damage_id) {
                     batch.push(SceneInvalidation::PixelDamage(damage_id));
@@ -1302,26 +1425,30 @@ impl<'a> SceneSession<'a> {
                         return Ok(());
                     }
                 };
-                batch.push(classify_event_with_registries(
+                let invalidation = classify_event_with_registries(
                     first,
                     self.root,
                     self.current_snapshot(),
                     self.ownership.as_ref(),
                     &self.damage_registry,
                     &self.damage_registry,
-                ));
+                );
+                self.observe_invalidation(invalidation);
+                batch.push(invalidation);
                 for _ in 1..MAX_EVENTS_PER_BATCH {
                     let Some(event) = self.connection.inner.poll_for_event()? else {
                         break;
                     };
-                    batch.push(classify_event_with_registries(
+                    let invalidation = classify_event_with_registries(
                         event,
                         self.root,
                         self.current_snapshot(),
                         self.ownership.as_ref(),
                         &self.damage_registry,
                         &self.damage_registry,
-                    ));
+                    );
+                    self.observe_invalidation(invalidation);
+                    batch.push(invalidation);
                 }
             }
             if self.signal.poll_shutdown_pending()? {
@@ -1387,7 +1514,11 @@ impl<'a> SceneSession<'a> {
             return Ok(());
         }
         if pixel_gate_allows_presentation(final_gate.decision(), ownership_ok, false) {
-            return self.present_current_scratch();
+            return self
+                .egl
+                .as_ref()
+                .ok_or("EGL scene renderer is unavailable")?
+                .swap();
         }
         match final_gate.decision() {
             SceneInvalidation::Shutdown(reason) => {
@@ -1402,20 +1533,22 @@ impl<'a> SceneSession<'a> {
         }
     }
 
-    fn drain_current_events(&self) -> Result<InvalidationBatch, Box<dyn Error>> {
+    fn drain_current_events(&mut self) -> Result<InvalidationBatch, Box<dyn Error>> {
         let mut batch = InvalidationBatch::default();
         for _ in 0..MAX_EVENTS_PER_BATCH {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
             };
-            batch.push(classify_event_with_registries(
+            let invalidation = classify_event_with_registries(
                 event,
                 self.root,
                 self.current_snapshot(),
                 self.ownership.as_ref(),
                 &self.damage_registry,
                 &self.damage_registry,
-            ));
+            );
+            self.observe_invalidation(invalidation);
+            batch.push(invalidation);
         }
         Ok(batch)
     }
@@ -1431,48 +1564,33 @@ impl<'a> SceneSession<'a> {
     }
 
     fn full_recompose_current(&self) -> Result<(), Box<dyn Error>> {
-        let scratch = self.scratch.as_ref().ok_or("scratch is unavailable")?;
-        let gc = self.gc.as_ref().ok_or("scene GC is unavailable")?;
-        scratch.clear(gc.gc)?;
-        for (entry, pixmap) in self
-            .current_snapshot()
-            .entries
-            .iter()
-            .zip(self.pixmaps.iter())
-        {
-            if entry.backend == BackendCompatibility::BackendUnsupported {
-                continue;
-            }
-            let plan = pixmap.copy_plan(self.current_snapshot().root_geometry).ok_or_else(|| {
-                format!(
-                    "surface 0x{:08x} has no visible copy intersection or valid coordinates",
-                    entry.surface_xid
-                )
-            })?;
-            gc.copy(pixmap.pixmap_xid, scratch.pixmap, plan)?;
-        }
-        Ok(())
+        self.render_egl_scene(self.current_snapshot(), &self.egl_surfaces, &self.pixmaps)
     }
 
-    fn present_current_scratch(&self) -> Result<(), Box<dyn Error>> {
-        let overlay = self.overlay.as_ref().ok_or("overlay is unavailable")?.overlay;
-        let scratch = self.scratch.as_ref().ok_or("scratch is unavailable")?;
-        let gc = self.gc.as_ref().ok_or("scene GC is unavailable")?;
-        let geometry = self.current_snapshot().root_geometry;
-        gc.copy(
-            scratch.pixmap,
-            overlay,
-            CopyPlan {
-                src_x: 0,
-                src_y: 0,
-                dst_x: 0,
-                dst_y: 0,
-                width: geometry.width,
-                height: geometry.height,
-            },
-        )?;
-        self.connection.inner.flush()?;
-        self.connection.inner.get_input_focus()?.reply()?;
+    fn render_egl_scene(
+        &self,
+        snapshot: &SceneSnapshot,
+        surfaces: &HashMap<Window, EglImportedSurface>,
+        pixmaps: &[NamedSurfacePixmap<'a>],
+    ) -> Result<(), Box<dyn Error>> {
+        let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
+        egl.clear()?;
+        for entry in &snapshot.entries {
+            let Some(surface) = surfaces.get(&entry.surface_xid) else {
+                continue;
+            };
+            let pixmap = pixmaps
+                .iter()
+                .find(|pixmap| pixmap.surface_xid == entry.surface_xid)
+                .ok_or_else(|| format!("missing pixmap for EGL surface 0x{:08x}", entry.surface_xid))?;
+            let plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
+                .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
+            egl.render_surface(
+                surface.texture,
+                plan,
+                surface.pixel_semantics,
+            )?;
+        }
         Ok(())
     }
 
@@ -1482,6 +1600,7 @@ impl<'a> SceneSession<'a> {
             .expect("published scene snapshot must exist while live")
     }
 
+    #[allow(dead_code)]
     fn overlay_depth(&self) -> Result<u8, Box<dyn Error>> {
         let overlay = self.overlay.as_ref().ok_or("overlay is unavailable")?.overlay;
         Ok(self.connection.inner.get_geometry(overlay)?.reply()?.depth)
@@ -1532,20 +1651,42 @@ impl<'a> SceneSession<'a> {
         self.damage_leases.clear();
         self.damage_registry.clear();
         self.pending_damage.clear();
+        let egl_current = match self.egl.as_ref() {
+            Some(egl) => match egl.make_current() {
+                Ok(()) => true,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    false
+                }
+            },
+            None => false,
+        };
+        if egl_current {
+            let egl = self.egl.as_ref().expect("EGL renderer exists when current");
+            for surface in self.egl_surfaces.values_mut() {
+                if let Err(error) = egl.destroy_import(surface) {
+                    first_error.get_or_insert(error);
+                }
+            }
+        } else {
+            for surface in self.egl_surfaces.values_mut() {
+                surface.disarm();
+            }
+        }
+        self.egl_surfaces.clear();
         for pixmap in &self.pixmaps {
             if let Err(error) = pixmap.free() {
                 first_error.get_or_insert(error);
             }
         }
         self.pixmaps.clear();
-        if let Some(scratch) = self.scratch.take() {
-            if let Err(error) = scratch.free() {
-                first_error.get_or_insert(error);
-            }
-        }
-        if let Some(gc) = self.gc.take() {
-            if let Err(error) = gc.free() {
-                first_error.get_or_insert(error);
+        if let Some(mut egl) = self.egl.take() {
+            if egl_current {
+                if let Err(error) = egl.destroy() {
+                    first_error.get_or_insert(error);
+                }
+            } else {
+                egl.disarm();
             }
         }
         if let Err(error) = self.structure_watches.cleanup() {
@@ -1577,22 +1718,23 @@ impl<'a> SceneSession<'a> {
             let mut manual = manual;
             manual.disarm_cleanup();
         }
-        if let Some(scratch) = self.scratch.take() {
-            scratch.disarm_cleanup();
-        }
         for pixmap in &self.pixmaps {
             pixmap.disarm_cleanup();
         }
         self.pixmaps.clear();
-        if let Some(gc) = self.gc.take() {
-            gc.disarm_cleanup();
-        }
         for damage in &self.damage_leases {
             damage.disarm_cleanup();
         }
         self.damage_leases.clear();
         self.damage_registry.clear();
         self.pending_damage.clear();
+        for surface in self.egl_surfaces.values_mut() {
+            surface.disarm();
+        }
+        self.egl_surfaces.clear();
+        if let Some(mut egl) = self.egl.take() {
+            egl.disarm();
+        }
         self.structure_watches.disarm_cleanup();
         if let Some(mut watch) = self.root_watch.take() {
             watch.disarm_cleanup();
@@ -1604,6 +1746,26 @@ impl<'a> SceneSession<'a> {
             ownership.disarm_cleanup();
         }
     }
+}
+
+fn egl_scene_is_renderable(entry_count: usize, egl_surface_count: usize) -> bool {
+    entry_count == 0 || egl_surface_count > 0
+}
+
+fn retain_pending_for_registry(
+    pending: &mut HashSet<damage::Damage>,
+    registry: &HashMap<damage::Damage, Window>,
+) {
+    pending.retain(|damage_id| registry.contains_key(damage_id));
+}
+
+fn merge_deferred_damage_for_registry(
+    pending: &mut HashSet<damage::Damage>,
+    deferred: HashSet<damage::Damage>,
+    registry: &HashMap<damage::Damage, Window>,
+) {
+    pending.extend(deferred);
+    retain_pending_for_registry(pending, registry);
 }
 
 fn root_guard(expected: Window, actual: Window) -> Result<(), Box<dyn Error>> {
@@ -1628,10 +1790,114 @@ fn ensure_damage_version(connection: &X11Connection) -> Result<(), Box<dyn Error
     Ok(())
 }
 
+fn render_version_compatible(major: u32, minor: u32) -> bool {
+    let _ = minor;
+    major == 0
+}
+
+fn pict_format_semantically_equal(
+    left: &render::Pictforminfo,
+    right: &render::Pictforminfo,
+) -> bool {
+    left.type_ == right.type_
+        && left.depth == right.depth
+        && left.direct.red_shift == right.direct.red_shift
+        && left.direct.red_mask == right.direct.red_mask
+        && left.direct.green_shift == right.direct.green_shift
+        && left.direct.green_mask == right.direct.green_mask
+        && left.direct.blue_shift == right.direct.blue_shift
+        && left.direct.blue_mask == right.direct.blue_mask
+        && left.direct.alpha_shift == right.direct.alpha_shift
+        && left.direct.alpha_mask == right.direct.alpha_mask
+        && left.colormap == right.colormap
+}
+
+fn insert_pict_format(
+    by_id: &mut HashMap<render::Pictformat, render::Pictforminfo>,
+    info: render::Pictforminfo,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(previous) = by_id.get(&info.id) {
+        if !pict_format_semantically_equal(previous, &info) {
+            return Err(format!(
+                "Render PictFormat 0x{:08x} has conflicting definitions",
+                info.id
+            ).into());
+        }
+    } else {
+        by_id.insert(info.id, info);
+    }
+    Ok(())
+}
+
+fn build_pict_format_index(
+    formats: &[render::Pictforminfo],
+) -> Result<HashMap<render::Pictformat, render::Pictforminfo>, Box<dyn Error>> {
+    let mut by_id = HashMap::new();
+    for info in formats {
+        insert_pict_format(&mut by_id, *info)?;
+    }
+    Ok(by_id)
+}
+
+fn insert_visual_format(
+    by_visual: &mut HashMap<u32, VisualFormatInfo>,
+    info: VisualFormatInfo,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(previous) = by_visual.get(&info.visual) {
+        if previous != &info {
+            return Err(format!(
+                "Render Visual 0x{:08x} maps to conflicting PictFormats",
+                info.visual
+            ).into());
+        }
+    } else {
+        by_visual.insert(info.visual, info);
+    }
+    Ok(())
+}
+
+fn classify_visual_format(info: &VisualFormatInfo) -> EglPixelSemantics {
+    if info.pict_type != render::PictType::DIRECT {
+        return EglPixelSemantics::Unsupported;
+    }
+    let rgb888 = info.depth == 24
+        && info.red_shift == 16 && info.red_mask == 0xff
+        && info.green_shift == 8 && info.green_mask == 0xff
+        && info.blue_shift == 0 && info.blue_mask == 0xff
+        && info.alpha_mask == 0;
+    if rgb888 {
+        return EglPixelSemantics::Opaque;
+    }
+    let argb8888 = info.depth == 32
+        && info.red_shift == 16 && info.red_mask == 0xff
+        && info.green_shift == 8 && info.green_mask == 0xff
+        && info.blue_shift == 0 && info.blue_mask == 0xff
+        && info.alpha_shift == 24 && info.alpha_mask == 0xff;
+    if argb8888 {
+        return EglPixelSemantics::PremultipliedAlpha;
+    }
+    EglPixelSemantics::Unsupported
+}
+
+fn classify_scene_visual_format(
+    info: &VisualFormatInfo,
+    scene_depth: u8,
+) -> EglPixelSemantics {
+    if info.depth != scene_depth {
+        return EglPixelSemantics::Unsupported;
+    }
+    classify_visual_format(info)
+}
+
 fn damage_version_compatible(major: u32, _minor: u32) -> bool {
     major >= 1
 }
 
+fn candidate_render_allowed(semantics: EglPixelSemantics, damage_active: bool) -> bool {
+    semantics == EglPixelSemantics::Unsupported || damage_active
+}
+
+#[allow(dead_code)]
 fn damage_monitoring_enabled(entry: &SurfaceEntry) -> bool {
     entry.backend == BackendCompatibility::Renderable
 }
@@ -1732,14 +1998,26 @@ fn classify_event_with_registries(
     }
 }
 
-fn old_scene_safe(invalidation: SceneInvalidation) -> bool {
-    match invalidation {
-        // A structural or geometry event is evidence that the published
-        // pixels may no longer describe current X11 state.
-        SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => true,
-        SceneInvalidation::Geometry(_)
-        | SceneInvalidation::Hierarchy
-        | SceneInvalidation::Shutdown(_) => false,
+fn observe_structural_generation(generation: &mut u64, invalidation: SceneInvalidation) {
+    if matches!(invalidation, SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy) {
+        *generation = generation.wrapping_add(1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StructuralGenerationState {
+    Ready(u64),
+    AwaitExternalChange(u64),
+}
+
+fn structural_generation_state(
+    generation: u64,
+    attempted_generation: u64,
+) -> StructuralGenerationState {
+    if generation > attempted_generation {
+        StructuralGenerationState::Ready(generation)
+    } else {
+        StructuralGenerationState::AwaitExternalChange(generation)
     }
 }
 
@@ -1843,19 +2121,30 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::{
-        build_copy_plan, classify_event, coordinator_requires_cleanup, eligible_surface,
-        is_internal_xid, old_scene_safe, root_guard, BackendCompatibility, CopyPlan,
+        build_copy_plan,
+        classify_event, coordinator_requires_cleanup, eligible_surface,
+        is_internal_xid, root_guard, BackendCompatibility, CandidateBuildError, CopyPlan,
         PixmapGeometry, RootGeometry,
-        bounded_batch_requires_retry, candidate_gate_decision, damage_monitoring_enabled,
-        damage_version_compatible, gate_decision_after_batch, guards_allow_retry, GateDecision,
+        bounded_batch_requires_retry, candidate_gate_decision, candidate_render_allowed,
+        damage_monitoring_enabled, damage_version_compatible, classify_visual_format, insert_visual_format,
+        render_version_compatible, gate_decision_after_batch, guards_allow_retry, GateDecision,
         pending_work_requires_iteration, pixel_gate_allows_presentation,
-        retry_allowed, subtract_plan, watch_plan, InvalidationBatch, SceneInvalidation, SceneSnapshot,
+        retry_allowed, subtract_plan, watch_plan, build_render_quad_plan,
+        egl_scene_is_renderable, merge_deferred_damage_for_registry, EglPixelSemantics,
+        VisualFormatCache, VisualFormatInfo, InvalidationBatch, SceneInvalidation, SceneSnapshot,
+        build_pict_format_index, classify_scene_visual_format,
+        RENDER_CLIENT_MAJOR, RENDER_CLIENT_MINOR,
         root_live_event_mask, canonical_live_event_mask, snapshot_watch_ids, SceneState,
         ShutdownReason, SurfaceEntry, MAX_CANDIDATE_RETRIES, MAX_EVENTS_PER_BATCH,
+        observe_structural_generation,
+        structural_generation_state, StructuralGenerationState,
+        classify_retired_damage_destroy, DamageDestroyClassification, DamageReleaseOutcome,
+        DamageState,
     };
     use crate::x11::capture::WindowGeometry;
     use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
     use x11rb::protocol::damage::ReportLevel;
+    use x11rb::protocol::render;
     use x11rb::protocol::xproto::{EventMask, MapState, Rectangle, WindowClass};
     use x11rb::protocol::Event;
 
@@ -1878,6 +2167,10 @@ mod tests {
             border_width: 0,
             depth: 24,
         }
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}");
     }
 
     fn window(x: i16, y: i16, width: u16, height: u16, border_width: u16) -> WindowGeometry {
@@ -1903,6 +2196,79 @@ mod tests {
             wm_class: None,
             window_type: None,
             role: crate::x11::capture::WindowRole::Unknown,
+        }
+    }
+
+    fn visual_info(
+        visual: u32,
+        depth: u8,
+        pict_type: render::PictType,
+        red_shift: u16,
+        red_mask: u16,
+        green_shift: u16,
+        green_mask: u16,
+        blue_shift: u16,
+        blue_mask: u16,
+        alpha_shift: u16,
+        alpha_mask: u16,
+    ) -> VisualFormatInfo {
+        VisualFormatInfo {
+            visual,
+            depth,
+            pict_format: 42_u32.into(),
+            pict_type,
+            red_shift,
+            red_mask,
+            green_shift,
+            green_mask,
+            blue_shift,
+            blue_mask,
+            alpha_shift,
+            alpha_mask,
+        }
+    }
+
+    fn rgb888_info() -> VisualFormatInfo {
+        visual_info(0x21, 24, render::PictType::DIRECT, 16, 0xff, 8, 0xff, 0, 0xff, 0, 0)
+    }
+
+    fn argb8888_info() -> VisualFormatInfo {
+        visual_info(0x42, 32, render::PictType::DIRECT, 16, 0xff, 8, 0xff, 0, 0xff, 24, 0xff)
+    }
+
+    fn pict_format_info(
+        id: u32,
+        depth: u8,
+        pict_type: render::PictType,
+        direct: render::Directformat,
+    ) -> render::Pictforminfo {
+        render::Pictforminfo {
+            id: id.into(),
+            type_: pict_type,
+            depth,
+            direct,
+            colormap: 0,
+        }
+    }
+
+    fn pict_reply(
+        format: render::Pictforminfo,
+        pict_depth: u8,
+        visual: u32,
+    ) -> render::QueryPictFormatsReply {
+        render::QueryPictFormatsReply {
+            formats: vec![format],
+            screens: vec![render::Pictscreen {
+                fallback: 0,
+                depths: vec![render::Pictdepth {
+                    depth: pict_depth,
+                    visuals: vec![render::Pictvisual {
+                        visual,
+                        format: 42,
+                    }],
+                }],
+            }],
+            ..Default::default()
         }
     }
 
@@ -2245,6 +2611,176 @@ mod tests {
     }
 
     #[test]
+    fn active_retired_damage_destroy_success_is_released() {
+        assert_eq!(
+            classify_retired_damage_destroy(
+                true,
+                Ok(()),
+            ),
+            Ok(DamageReleaseOutcome::Released)
+        );
+    }
+
+    #[test]
+    fn removed_retired_damage_bad_damage_is_already_gone() {
+        assert_eq!(
+            classify_retired_damage_destroy(
+                true,
+                Err(DamageDestroyClassification::BadDamage),
+            ),
+            Ok(DamageReleaseOutcome::AlreadyGone)
+        );
+    }
+
+    #[test]
+    fn survivor_retired_damage_bad_damage_is_fatal() {
+        assert_eq!(
+            classify_retired_damage_destroy(
+                false,
+                Err(DamageDestroyClassification::BadDamage),
+            ),
+            Err(DamageDestroyClassification::BadDamage)
+        );
+    }
+
+    #[test]
+    fn removed_retired_damage_other_error_is_fatal() {
+        assert_eq!(
+            classify_retired_damage_destroy(
+                true,
+                Err(DamageDestroyClassification::OtherError),
+            ),
+            Err(DamageDestroyClassification::OtherError)
+        );
+    }
+
+    #[test]
+    fn already_gone_damage_state_is_terminal_for_drop() {
+        assert_ne!(DamageState::AlreadyGone, DamageState::Active);
+        assert_ne!(DamageState::Released, DamageState::Active);
+        assert_ne!(DamageState::Disarmed, DamageState::Active);
+    }
+
+    #[test]
+    fn render_query_version_requests_011_and_accepts_base_and_newer_minor() {
+        assert_eq!((RENDER_CLIENT_MAJOR, RENDER_CLIENT_MINOR), (0, 11));
+        assert!(render_version_compatible(0, 0));
+        assert!(render_version_compatible(0, 11));
+        assert!(render_version_compatible(0, 12));
+        assert!(!render_version_compatible(1, 0));
+    }
+
+    #[test]
+    fn identical_visual_mapping_is_deduplicated_but_conflict_is_rejected() {
+        let info = rgb888_info();
+        let mut cache = HashMap::new();
+        insert_visual_format(&mut cache, info).unwrap();
+        insert_visual_format(&mut cache, info).unwrap();
+        let mut conflict = info;
+        conflict.pict_format = 43_u32.into();
+        assert!(insert_visual_format(&mut cache, conflict).is_err());
+    }
+
+    #[test]
+    fn exact_rgb888_is_opaque_and_exact_argb8888_is_premultiplied() {
+        assert_eq!(classify_visual_format(&rgb888_info()), EglPixelSemantics::Opaque);
+        assert_eq!(classify_visual_format(&argb8888_info()), EglPixelSemantics::PremultipliedAlpha);
+    }
+
+    #[test]
+    fn depth_alone_does_not_imply_argb() {
+        let mut info = argb8888_info();
+        info.alpha_mask = 0;
+        assert_eq!(classify_visual_format(&info), EglPixelSemantics::Unsupported);
+    }
+
+    #[test]
+    fn unsupported_depth32_layouts_are_rejected() {
+        let mut abgr = argb8888_info();
+        abgr.red_shift = 0;
+        abgr.blue_shift = 16;
+        assert_eq!(classify_visual_format(&abgr), EglPixelSemantics::Unsupported);
+
+        let mut ten_bit = argb8888_info();
+        ten_bit.red_mask = 0x3ff;
+        assert_eq!(classify_visual_format(&ten_bit), EglPixelSemantics::Unsupported);
+
+        let mut indexed = argb8888_info();
+        indexed.pict_type = render::PictType::INDEXED;
+        assert_eq!(classify_visual_format(&indexed), EglPixelSemantics::Unsupported);
+    }
+
+    #[test]
+    fn source_visual_and_output_visual_are_independent() {
+        let info = argb8888_info();
+        assert_ne!(info.visual, root().visual);
+        assert_eq!(classify_visual_format(&info), EglPixelSemantics::PremultipliedAlpha);
+    }
+
+    #[test]
+    fn pict_format_index_deduplicates_identical_and_rejects_conflicting_ids() {
+        let direct = render::Directformat {
+            red_shift: 16, red_mask: 0xff,
+            green_shift: 8, green_mask: 0xff,
+            blue_shift: 0, blue_mask: 0xff,
+            alpha_shift: 0, alpha_mask: 0,
+        };
+        let format = pict_format_info(42, 24, render::PictType::DIRECT, direct);
+        assert_eq!(build_pict_format_index(&[format, format]).unwrap().len(), 1);
+        let conflicting = pict_format_info(42, 32, render::PictType::DIRECT, direct);
+        assert!(build_pict_format_index(&[format, conflicting]).is_err());
+    }
+
+    #[test]
+    fn pict_visual_format_resolution_validates_missing_id_and_depth() {
+        let direct = render::Directformat {
+            red_shift: 16, red_mask: 0xff,
+            green_shift: 8, green_mask: 0xff,
+            blue_shift: 0, blue_mask: 0xff,
+            alpha_shift: 0, alpha_mask: 0,
+        };
+        let format = pict_format_info(42, 24, render::PictType::DIRECT, direct);
+        assert!(VisualFormatCache::from_reply(&pict_reply(format, 24, 7)).is_ok());
+        assert!(VisualFormatCache::from_reply(&pict_reply(format, 32, 7)).is_err());
+
+        let mut missing = pict_reply(format, 24, 7);
+        missing.screens[0].depths[0].visuals[0].format = 99;
+        assert!(VisualFormatCache::from_reply(&missing).is_err());
+    }
+
+    #[test]
+    fn scene_entry_depth_mismatch_is_unsupported_before_import() {
+        let info = argb8888_info();
+        assert_eq!(
+            classify_scene_visual_format(&info, 24),
+            EglPixelSemantics::Unsupported
+        );
+        assert_eq!(
+            classify_scene_visual_format(&info, 32),
+            EglPixelSemantics::PremultipliedAlpha
+        );
+    }
+
+    #[test]
+    fn egl_import_policy_is_decided_from_source_format_before_import() {
+        assert_eq!(classify_visual_format(&rgb888_info()), EglPixelSemantics::Opaque);
+        assert_eq!(classify_visual_format(&argb8888_info()), EglPixelSemantics::PremultipliedAlpha);
+        assert_eq!(classify_visual_format(&visual_info(
+            0x21, 24, render::PictType::DIRECT, 0, 0, 0, 0, 0, 0, 0, 0
+        )), EglPixelSemantics::Unsupported);
+    }
+
+    #[test]
+    fn egl_capability_does_not_depend_on_copyarea_backend_classification() {
+        let info = rgb888_info();
+        assert_eq!(classify_visual_format(&info), EglPixelSemantics::Opaque);
+        let mut entry = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        entry.backend = BackendCompatibility::BackendUnsupported;
+        assert_eq!(entry.backend, BackendCompatibility::BackendUnsupported);
+        assert_eq!(classify_visual_format(&info), EglPixelSemantics::Opaque);
+    }
+
+    #[test]
     fn backend_unsupported_has_no_pixel_monitoring_subscription() {
         let mut unsupported = metadata();
         unsupported.depth = 32;
@@ -2252,6 +2788,22 @@ mod tests {
         assert!(!damage_monitoring_enabled(&entry));
         let renderable = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
         assert!(damage_monitoring_enabled(&renderable));
+    }
+
+    #[test]
+    fn candidate_damage_is_active_before_first_render() {
+        assert!(candidate_render_allowed(
+            EglPixelSemantics::PremultipliedAlpha,
+            true
+        ));
+        assert!(!candidate_render_allowed(
+            EglPixelSemantics::PremultipliedAlpha,
+            false
+        ));
+        assert!(candidate_render_allowed(
+            EglPixelSemantics::Unsupported,
+            false
+        ));
     }
 
     #[test]
@@ -2263,9 +2815,123 @@ mod tests {
     }
 
     #[test]
-    fn bounded_retry_does_not_treat_structural_old_scene_as_safe() {
-        assert!(!old_scene_safe(SceneInvalidation::Hierarchy));
-        assert!(!old_scene_safe(SceneInvalidation::Geometry(10)));
+    fn ready_generation_is_processed_before_blocking() {
+        assert!(matches!(
+            structural_generation_state(10, 9),
+            StructuralGenerationState::Ready(10)
+        ));
+    }
+
+    #[test]
+    fn same_generation_enters_await_without_immediate_spin() {
+        assert!(matches!(
+            structural_generation_state(10, 10),
+            StructuralGenerationState::AwaitExternalChange(10)
+        ));
+    }
+
+    #[test]
+    fn newer_generation_becomes_ready_after_structural_event() {
+        assert!(matches!(
+            structural_generation_state(11, 10),
+            StructuralGenerationState::Ready(11)
+        ));
+    }
+
+    #[test]
+    fn structural_event_advances_generation() {
+        let mut generation = 10;
+        observe_structural_generation(&mut generation, SceneInvalidation::Hierarchy);
+        assert_eq!(generation, 11);
+    }
+
+    #[test]
+    fn geometry_event_advances_generation() {
+        let mut generation = 10;
+        observe_structural_generation(&mut generation, SceneInvalidation::Geometry(7));
+        assert_eq!(generation, 11);
+    }
+
+    #[test]
+    fn pixel_event_does_not_create_structural_work() {
+        let mut generation = 10;
+        observe_structural_generation(&mut generation, SceneInvalidation::PixelDamage(7));
+        assert_eq!(generation, 10);
+    }
+
+    #[test]
+    fn deferred_attempt_is_not_ready_again_without_new_generation() {
+        let generation = 10;
+        let attempted = generation;
+        assert!(matches!(
+            structural_generation_state(generation, attempted),
+            StructuralGenerationState::AwaitExternalChange(10)
+        ));
+        assert!(matches!(
+            structural_generation_state(generation + 1, attempted),
+            StructuralGenerationState::Ready(11)
+        ));
+    }
+
+    #[test]
+    fn two_structural_generations_provide_two_bounded_opportunities() {
+        let mut generation = 10;
+        let mut attempted = 9;
+        assert!(matches!(
+            structural_generation_state(generation, attempted),
+            StructuralGenerationState::Ready(10)
+        ));
+        attempted = generation;
+        assert!(matches!(
+            structural_generation_state(generation, attempted),
+            StructuralGenerationState::AwaitExternalChange(10)
+        ));
+        observe_structural_generation(&mut generation, SceneInvalidation::Hierarchy);
+        assert!(matches!(
+            structural_generation_state(generation, attempted),
+            StructuralGenerationState::Ready(11)
+        ));
+    }
+
+    #[test]
+    fn generation_state_models_ready_and_await_transitions() {
+        assert_eq!(
+            structural_generation_state(10, 9),
+            StructuralGenerationState::Ready(10)
+        );
+        assert_eq!(
+            structural_generation_state(10, 10),
+            StructuralGenerationState::AwaitExternalChange(10)
+        );
+        assert_eq!(
+            structural_generation_state(11, 10),
+            StructuralGenerationState::Ready(11)
+        );
+    }
+
+    #[test]
+    fn stale_root_child_is_typed_transient() {
+        let binding = HierarchyBinding {
+            root_child_xid: 10,
+            semantic_client_xids: Vec::new(),
+            semantic_client: BindingStatus::NoClient,
+            lifecycle_candidate_xid: 10,
+            surface_candidate: None,
+            descendants: Vec::new(),
+            stale: true,
+        };
+        let hierarchy = HierarchySnapshot { root: 1, children: vec![binding] };
+        let error = SceneSnapshot::from_hierarchy(
+            hierarchy,
+            root(),
+            99,
+            100,
+        )
+        .expect_err("missing surface metadata must be stale");
+        assert!(matches!(
+            error.downcast_ref::<CandidateBuildError>(),
+            Some(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
+        ));
     }
 
     #[test]
@@ -2365,5 +3031,104 @@ mod tests {
     #[test]
     fn scene_entry_shape_is_stable() {
         let _ = std::mem::size_of::<SurfaceEntry>();
+    }
+
+    #[test]
+    fn render_plan_inside_border_zero_maps_full_texture() {
+        let plan = build_render_quad_plan(window(10, 12, 20, 15, 0), pixmap(20, 15), root()).unwrap();
+        assert_eq!((plan.dst_x, plan.dst_y, plan.width, plan.height), (10, 12, 20, 15));
+        assert_eq!((plan.src_x, plan.src_y, plan.src_width, plan.src_height), (0, 0, 20, 15));
+        assert_close(plan.u0, 0.0);
+        assert_close(plan.v0, 0.0);
+        assert_close(plan.u1, 1.0);
+        assert_close(plan.v1, 1.0);
+    }
+
+    #[test]
+    fn render_plan_border_maps_named_pixmap_without_stretching() {
+        let mut large_root = root();
+        large_root.width = 1000;
+        large_root.height = 800;
+        let plan = build_render_quad_plan(
+            window(300, 250, 500, 350, 1),
+            pixmap(502, 352),
+            large_root,
+        ).unwrap();
+        assert_eq!((plan.dst_x, plan.dst_y, plan.width, plan.height), (299, 249, 502, 352));
+        assert_eq!((plan.src_x, plan.src_y, plan.src_width, plan.src_height), (0, 0, 502, 352));
+        assert_close(plan.u1, 1.0);
+        assert_close(plan.v1, 1.0);
+    }
+
+    #[test]
+    fn render_plan_clips_left_and_adjusts_uv() {
+        let plan = build_render_quad_plan(window(-20, 10, 50, 20, 0), pixmap(50, 20), root()).unwrap();
+        assert_eq!((plan.dst_x, plan.width, plan.src_x, plan.src_width), (0, 30, 20, 30));
+        assert_close(plan.u0, 0.4);
+        assert_close(plan.u1, 1.0);
+    }
+
+    #[test]
+    fn render_plan_clips_top_right_bottom_and_corner() {
+        let top = build_render_quad_plan(window(10, -5, 20, 15, 0), pixmap(20, 15), root()).unwrap();
+        assert_eq!((top.dst_y, top.height, top.src_y, top.src_height), (0, 10, 5, 10));
+        assert_close(top.v0, 5.0 / 15.0);
+
+        let right = build_render_quad_plan(window(90, 10, 20, 15, 0), pixmap(20, 15), root()).unwrap();
+        assert_eq!((right.dst_x, right.width, right.src_width), (90, 10, 10));
+        assert_close(right.u1, 0.5);
+
+        let bottom = build_render_quad_plan(window(10, 70, 20, 15, 0), pixmap(20, 15), root()).unwrap();
+        assert_eq!((bottom.dst_y, bottom.height, bottom.src_height), (70, 10, 10));
+        assert_close(bottom.v1, 10.0 / 15.0);
+
+        let corner = build_render_quad_plan(window(-5, -5, 20, 15, 0), pixmap(20, 15), root()).unwrap();
+        assert_eq!((corner.src_x, corner.src_y, corner.width, corner.height), (5, 5, 15, 10));
+        assert_close(corner.u0, 0.25);
+        assert_close(corner.v0, 5.0 / 15.0);
+    }
+
+    #[test]
+    fn render_plan_fully_outside_has_no_draw() {
+        assert!(build_render_quad_plan(window(-30, 0, 10, 10, 0), pixmap(10, 10), root()).is_none());
+    }
+
+    #[test]
+    fn render_plan_keeps_single_y_flip_policy() {
+        let plan = build_render_quad_plan(window(10, 10, 20, 15, 0), pixmap(20, 15), root()).unwrap();
+        assert_close(plan.v0, 0.0);
+        assert_close(plan.v1, 1.0);
+    }
+
+    #[test]
+    fn empty_scene_is_valid_but_nonempty_without_egl_surfaces_is_not() {
+        assert!(egl_scene_is_renderable(0, 0));
+        assert!(!egl_scene_is_renderable(2, 0));
+        assert!(egl_scene_is_renderable(3, 2));
+    }
+
+    #[test]
+    fn candidate_pending_damage_transfers_only_on_commit() {
+        let mut pending = HashSet::new();
+        let candidate_registry = HashMap::from([(77_u32, 10_u32)]);
+        merge_deferred_damage_for_registry(&mut pending, HashSet::from([77]), &candidate_registry);
+        assert!(pending.contains(&77));
+
+        let old_registry = HashMap::new();
+        merge_deferred_damage_for_registry(&mut pending, HashSet::from([77]), &old_registry);
+        assert!(!pending.contains(&77));
+    }
+
+    #[test]
+    fn gate_decisions_allow_swap_only_for_clean_or_pixel_batches() {
+        assert!(pixel_gate_allows_presentation(SceneInvalidation::Ignore, true, false));
+        assert!(pixel_gate_allows_presentation(SceneInvalidation::PixelDamage(1), true, false));
+        assert!(!pixel_gate_allows_presentation(SceneInvalidation::Hierarchy, true, false));
+        assert!(!pixel_gate_allows_presentation(SceneInvalidation::Geometry(1), true, false));
+        assert!(!pixel_gate_allows_presentation(
+            SceneInvalidation::Shutdown(ShutdownReason::Signal), true, false
+        ));
+        assert!(!pixel_gate_allows_presentation(SceneInvalidation::Ignore, false, false));
+        assert!(!pixel_gate_allows_presentation(SceneInvalidation::Ignore, true, true));
     }
 }
