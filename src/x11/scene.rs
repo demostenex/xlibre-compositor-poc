@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 
 use x11rb::connection::Connection;
@@ -39,7 +40,17 @@ struct SurfaceEntry {
     map_state: xproto::MapState,
     override_redirect: bool,
     stacking_index: usize,
+    backend: BackendCompatibility,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendCompatibility {
+    Renderable,
+    BackendUnsupported,
+}
+
+const MAX_EVENTS_PER_BATCH: usize = 64;
+const MAX_CANDIDATE_RETRIES: usize = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SceneSnapshot {
@@ -96,9 +107,6 @@ impl SceneSnapshot {
                 entries.push(entry);
             }
         }
-        if entries.is_empty() {
-            return Err("scene snapshot contains no eligible root-child surfaces".into());
-        }
         println!(
             "SceneSnapshot: root=0x{:08x} children={} eligible={}",
             hierarchy.root,
@@ -136,20 +144,20 @@ fn eligible_surface(
         println!("scene surface skip 0x{surface_xid:08x}: zero-sized");
         return None;
     }
-    if metadata.depth != root_geometry.depth {
+    let backend = if metadata.depth == root_geometry.depth
+        && metadata.visual == root_geometry.visual
+    {
+        BackendCompatibility::Renderable
+    } else {
         println!(
-            "scene surface skip 0x{surface_xid:08x}: depth {} != root depth {}",
-            metadata.depth, root_geometry.depth
+            "scene surface backend unsupported 0x{surface_xid:08x}: depth={} visual=0x{:08x} root_depth={} root_visual=0x{:08x}",
+            metadata.depth,
+            metadata.visual,
+            root_geometry.depth,
+            root_geometry.visual
         );
-        return None;
-    }
-    if metadata.visual != root_geometry.visual {
-        println!(
-            "scene surface skip 0x{surface_xid:08x}: visual 0x{:08x} != root visual 0x{:08x}",
-            metadata.visual, root_geometry.visual
-        );
-        return None;
-    }
+        BackendCompatibility::BackendUnsupported
+    };
     Some(SurfaceEntry {
         surface_xid,
         semantic_client_xid,
@@ -161,6 +169,7 @@ fn eligible_surface(
         map_state: metadata.map_state,
         override_redirect: metadata.override_redirect,
         stacking_index,
+        backend,
     })
 }
 
@@ -216,7 +225,7 @@ impl<'a> NamedSurfacePixmap<'a> {
         connection: &'a X11Connection,
         entry: &SurfaceEntry,
         root_window: Window,
-        root: RootGeometry,
+        _root: RootGeometry,
     ) -> Result<Self, Box<dyn Error>> {
         let pixmap_xid = connection.inner.generate_id()?;
         connection
@@ -237,7 +246,7 @@ impl<'a> NamedSurfacePixmap<'a> {
             .checked_add(u32::from(entry.geometry.border_width) * 2)
             .ok_or("expected named pixmap height overflow")?;
         if geometry.root != root_window
-            || geometry.depth != root.depth
+            || geometry.depth != entry.depth
             || geometry.width == 0
             || geometry.height == 0
             || u32::from(geometry.width) != expected_width
@@ -262,7 +271,7 @@ impl<'a> NamedSurfacePixmap<'a> {
                 expected_width,
                 expected_height,
                 root_window,
-                root.depth,
+                entry.depth,
             )
             .into());
         }
@@ -600,7 +609,7 @@ impl<'a> SceneRootWatch<'a> {
             .change_window_attributes(
                 root,
                 &ChangeWindowAttributesAux::new().event_mask(
-                    previous_mask | EventMask::STRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_NOTIFY,
+                    root_live_event_mask(previous_mask),
                 ),
             )?
             .check()?;
@@ -645,35 +654,68 @@ enum SceneState {
     ManualActive,
     SceneSnapshotReady,
     NamedPixmapsReady,
-    ScratchSceneReady,
     ScenePresented,
-    RunningStatic,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SceneEventAction {
-    Continue,
-    Shutdown(ShutdownReason),
+    RunningLiveStructural,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShutdownReason {
     RootConfigure,
-    Structural,
     SelectionLost,
+    OwnershipLost,
+    Signal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PresentationDecision {
-    Present,
-    Shutdown,
+enum SceneInvalidation {
+    Ignore,
+    Geometry(Window),
+    Hierarchy,
+    Shutdown(ShutdownReason),
 }
 
-fn presentation_decision(shutdown_pending: bool) -> PresentationDecision {
-    if shutdown_pending {
-        PresentationDecision::Shutdown
-    } else {
-        PresentationDecision::Present
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GateDecision {
+    Accept,
+    Retry(SceneInvalidation),
+    Shutdown(ShutdownReason),
+}
+
+#[derive(Default)]
+struct InvalidationBatch {
+    hierarchy: bool,
+    geometry: Option<Window>,
+    shutdown: Option<ShutdownReason>,
+}
+
+impl InvalidationBatch {
+    fn push(&mut self, invalidation: SceneInvalidation) {
+        match invalidation {
+            SceneInvalidation::Ignore => {}
+            SceneInvalidation::Geometry(window) if !self.hierarchy => {
+                self.geometry = Some(window);
+            }
+            SceneInvalidation::Geometry(_) => {}
+            SceneInvalidation::Hierarchy => {
+                self.hierarchy = true;
+                self.geometry = None;
+            }
+            SceneInvalidation::Shutdown(reason) => {
+                self.shutdown = Some(reason);
+            }
+        }
+    }
+
+    fn decision(&self) -> SceneInvalidation {
+        if let Some(reason) = self.shutdown {
+            SceneInvalidation::Shutdown(reason)
+        } else if self.hierarchy {
+            SceneInvalidation::Hierarchy
+        } else if let Some(window) = self.geometry {
+            SceneInvalidation::Geometry(window)
+        } else {
+            SceneInvalidation::Ignore
+        }
     }
 }
 
@@ -687,12 +729,165 @@ struct SceneSession<'a> {
     ownership: Option<CompositorOwnership>,
     overlay: Option<OverlayLease<'a>>,
     root_watch: Option<SceneRootWatch<'a>>,
+    structure_watches: SceneStructureWatches<'a>,
     manual: Option<ManualSubwindowsRedirect<'a>>,
     gc: Option<SceneGc<'a>>,
     scratch: Option<SceneScratchPixmap<'a>>,
     pixmaps: Vec<NamedSurfacePixmap<'a>>,
+    snapshot: Option<SceneSnapshot>,
     signal: SignalWake,
     state: SceneState,
+}
+
+struct SceneCandidate<'a> {
+    snapshot: SceneSnapshot,
+    scratch: SceneScratchPixmap<'a>,
+    pixmaps: Vec<NamedSurfacePixmap<'a>>,
+    watch_ids: HashSet<Window>,
+    watch_additions: Vec<Window>,
+}
+
+struct SceneStructureWatches<'a> {
+    connection: &'a X11Connection,
+    previous_masks: HashMap<Window, EventMask>,
+    disarmed: bool,
+}
+
+impl<'a> SceneStructureWatches<'a> {
+    fn new(connection: &'a X11Connection) -> Self {
+        Self {
+            connection,
+            previous_masks: HashMap::new(),
+            disarmed: false,
+        }
+    }
+
+    fn ensure_candidate(
+        &mut self,
+        windows: &HashSet<Window>,
+    ) -> Result<Vec<Window>, Box<dyn Error>> {
+        let mut additions = Vec::new();
+        let existing = self.previous_masks.keys().copied().collect::<HashSet<_>>();
+        let (candidate_additions, _) = watch_plan(&existing, windows);
+        for window in candidate_additions {
+            let attributes = match self.connection.inner.get_window_attributes(window) {
+                Ok(cookie) => match cookie.reply() {
+                    Ok(attributes) => attributes,
+                    Err(error) if super::capture::is_bad_window_error(&error) => continue,
+                    Err(error) => {
+                        self.rollback(&additions)?;
+                        return Err(error.into());
+                    }
+                },
+                Err(error) => {
+                    self.rollback(&additions)?;
+                    return Err(error.into());
+                }
+            };
+            let previous = attributes.your_event_mask;
+            let cookie = match self.connection
+                .inner
+                .change_window_attributes(
+                    window,
+                    &ChangeWindowAttributesAux::new()
+                        .event_mask(canonical_live_event_mask(previous)),
+                ) {
+                Ok(cookie) => cookie,
+                Err(error) => {
+                    self.rollback(&additions)?;
+                    return Err(error.into());
+                }
+            };
+            let result = cookie.check();
+            if let Err(error) = result {
+                self.rollback(&additions)?;
+                return Err(error.into());
+            }
+            self.previous_masks.insert(window, previous);
+            additions.push(window);
+        }
+        if let Err(error) = self.connection.inner.flush() {
+            self.rollback(&additions)?;
+            return Err(error.into());
+        }
+        Ok(additions)
+    }
+
+    fn rollback(&mut self, additions: &[Window]) -> Result<(), Box<dyn Error>> {
+        let mut first_error = None;
+        for window in additions.iter().rev() {
+            let Some(previous) = self.previous_masks.remove(window) else {
+                continue;
+            };
+            match self
+                .connection
+                .inner
+                .change_window_attributes(
+                    *window,
+                    &ChangeWindowAttributesAux::new().event_mask(previous),
+                ) {
+                Ok(cookie) => {
+                    if let Err(error) = cookie.check() {
+                        if !super::capture::is_bad_window_error(&error)
+                            && first_error.is_none()
+                        {
+                            first_error = Some(error.into());
+                        }
+                    }
+                }
+                Err(error) => {
+                    if !super::capture::is_bad_window_error(&error)
+                        && first_error.is_none()
+                    {
+                        first_error = Some(error.into());
+                    }
+                }
+            }
+        }
+        if let Err(error) = self.connection.inner.flush() {
+            if first_error.is_none() {
+                first_error = Some(error.into());
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn reconcile(&mut self, desired: &HashSet<Window>) -> Result<(), Box<dyn Error>> {
+        let existing = self.previous_masks.keys().copied().collect::<HashSet<_>>();
+        let (_, obsolete_set) = watch_plan(&existing, desired);
+        let obsolete = obsolete_set.into_iter().collect::<Vec<_>>();
+        for window in obsolete {
+            if let Some(previous) = self.previous_masks.remove(&window) {
+                let result = self
+                    .connection
+                    .inner
+                    .change_window_attributes(
+                        window,
+                        &ChangeWindowAttributesAux::new().event_mask(previous),
+                    )?
+                    .check();
+                if let Err(error) = result {
+                    if !super::capture::is_bad_window_error(&error) {
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+        self.connection.inner.flush()?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.disarmed {
+            return Ok(());
+        }
+        self.reconcile(&HashSet::new())
+    }
+
+    fn disarm_cleanup(&mut self) {
+        self.previous_masks.clear();
+        self.disarmed = true;
+    }
 }
 
 impl<'a> SceneSession<'a> {
@@ -723,10 +918,12 @@ impl<'a> SceneSession<'a> {
             ownership: Some(ownership),
             overlay: Some(overlay),
             root_watch: Some(root_watch),
+            structure_watches: SceneStructureWatches::new(connection),
             manual: Some(manual),
             gc: Some(gc),
             scratch: None,
             pixmaps: Vec::new(),
+            snapshot: None,
             signal,
             state: SceneState::PlaceholderReady,
         };
@@ -736,7 +933,9 @@ impl<'a> SceneSession<'a> {
 
     fn run(connection: &'a X11Connection, expected_root: Window) -> Result<(), Box<dyn Error>> {
         let mut session = Self::acquire(connection, expected_root)?;
-        let operation = session.prepare_scene().and_then(|_| session.wait_static());
+        let operation = session
+            .prepare_scene()
+            .and_then(|_| session.wait_live_structural());
         debug_assert!(coordinator_requires_cleanup(session.state));
         let cleanup = session.cleanup();
         match (operation, cleanup) {
@@ -751,8 +950,13 @@ impl<'a> SceneSession<'a> {
     }
 
     fn prepare_scene(&mut self) -> Result<(), Box<dyn Error>> {
+        self.rebuild_and_present()
+    }
+
+    fn build_candidate(&mut self) -> Result<SceneCandidate<'a>, Box<dyn Error>> {
         let root_geometry = read_root_geometry(self.connection, self.root)?;
         let hierarchy = self.connection.snapshot_hierarchy()?;
+        let watch_ids = snapshot_watch_ids(&hierarchy);
         let overlay = self.overlay.as_ref().ok_or("overlay is unavailable")?.overlay;
         let owner = self
             .ownership
@@ -767,22 +971,27 @@ impl<'a> SceneSession<'a> {
             owner,
         )?;
         self.state = SceneState::SceneSnapshotReady;
-        println!("state: SceneSnapshotReady");
         let scratch = SceneScratchPixmap::create(self.connection, self.root, root_geometry)?;
         if scratch.root != self.root || scratch.depth != root_geometry.depth {
             return Err("scratch pixmap root/depth is incompatible with scene".into());
         }
         let gc = self.gc.as_ref().ok_or("scene GC is unavailable")?;
         scratch.clear(gc.gc)?;
-        self.scratch = Some(scratch);
+        let mut pixmaps = Vec::new();
         for entry in &snapshot.entries {
-            let pixmap = NamedSurfacePixmap::acquire(self.connection, entry, self.root, root_geometry)?;
-            if pixmap.geometry.root != self.root || pixmap.geometry.depth != root_geometry.depth {
-                return Err(format!(
-                    "CopyArea compatibility failed for surface 0x{:08x}",
-                    entry.surface_xid
-                )
-                .into());
+            let pixmap = NamedSurfacePixmap::acquire(
+                self.connection,
+                entry,
+                self.root,
+                root_geometry,
+            )?;
+            if entry.backend == BackendCompatibility::BackendUnsupported {
+                println!(
+                    "CopyArea backend unsupported: canonical surface=0x{:08x} depth={} visual=0x{:08x}",
+                    entry.surface_xid, entry.depth, entry.visual
+                );
+                pixmaps.push(pixmap);
+                continue;
             }
             let plan = pixmap.copy_plan(root_geometry).ok_or_else(|| {
                 format!(
@@ -790,69 +999,202 @@ impl<'a> SceneSession<'a> {
                     entry.surface_xid
                 )
             })?;
-            println!(
-                "copy plan surface=0x{:08x} src=({}, {}) dst=({}, {}) size={}x{}",
-                entry.surface_xid,
-                plan.src_x,
-                plan.src_y,
-                plan.dst_x,
-                plan.dst_y,
-                plan.width,
-                plan.height
-            );
-            let scratch_drawable = self.scratch.as_ref().ok_or("scratch is unavailable")?.pixmap;
+            let scratch_drawable = scratch.pixmap;
             gc.copy(pixmap.pixmap_xid, scratch_drawable, plan)?;
-            self.pixmaps.push(pixmap);
-        }
-        if self.pixmaps.is_empty() {
-            return Err("no named surface pixmaps were acquired".into());
+            pixmaps.push(pixmap);
         }
         self.state = SceneState::NamedPixmapsReady;
-        println!("state: NamedPixmapsReady surfaces={}", self.pixmaps.len());
-        let scratch_drawable = self.scratch.as_ref().ok_or("scratch is unavailable")?.pixmap;
-        let final_plan = CopyPlan {
-            src_x: 0,
-            src_y: 0,
-            dst_x: 0,
-            dst_y: 0,
-            width: root_geometry.width,
-            height: root_geometry.height,
-        };
-        if root_geometry.depth != self.overlay_depth()? {
+        println!("state: NamedPixmapsReady surfaces={}", pixmaps.len());
+        let watch_additions = self.structure_watches.ensure_candidate(&watch_ids)?;
+        Ok(SceneCandidate {
+            snapshot,
+            scratch,
+            pixmaps,
+            watch_ids,
+            watch_additions,
+        })
+    }
+
+    fn rebuild_and_present(&mut self) -> Result<(), Box<dyn Error>> {
+        for attempt in 0..=MAX_CANDIDATE_RETRIES {
+            let candidate = self.build_candidate()?;
+            let gate = match self.pre_commit_gate(&candidate) {
+                Ok(gate) => gate,
+                Err(error) => {
+                    self.structure_watches.rollback(&candidate.watch_additions)?;
+                    return Err(error);
+                }
+            };
+            match gate {
+                GateDecision::Accept => {
+                    self.commit_candidate(candidate)?;
+                    return Ok(());
+                }
+                GateDecision::Shutdown(reason) => {
+                    self.structure_watches.rollback(&candidate.watch_additions)?;
+                    return Err(format!("candidate aborted by shutdown: {reason:?}").into());
+                }
+                GateDecision::Retry(invalidation) if retry_allowed(attempt) => {
+                    self.structure_watches.rollback(&candidate.watch_additions)?;
+                    println!("candidate stale; bounded retry: {invalidation:?}");
+                }
+                GateDecision::Retry(invalidation) => {
+                    self.structure_watches.rollback(&candidate.watch_additions)?;
+                    if old_scene_safe(invalidation) {
+                        return Err(format!(
+                            "candidate stale after bounded retry; old scene retained: {invalidation:?}"
+                        )
+                        .into());
+                    }
+                    return Err(format!(
+                        "candidate stale after bounded retry; coordinated shutdown: {invalidation:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        unreachable!("bounded candidate retry must return");
+    }
+
+    fn pre_commit_gate(
+        &mut self,
+        candidate: &SceneCandidate<'_>,
+    ) -> Result<GateDecision, Box<dyn Error>> {
+        self.connection.inner.get_input_focus()?.reply()?;
+        let mut batch = InvalidationBatch::default();
+        let mut drained = 0;
+        for _ in 0..MAX_EVENTS_PER_BATCH {
+            let Some(event) = self.connection.inner.poll_for_event()? else {
+                break;
+            };
+            drained += 1;
+            batch.push(classify_event(
+                event,
+                self.root,
+                &candidate.snapshot,
+                self.ownership.as_ref(),
+            ));
+        }
+        let batch_decision = batch.decision();
+        let ownership_verified = self.verify_ownership().is_ok();
+        if !ownership_verified {
+            return Ok(gate_decision_after_batch(
+                batch_decision,
+                bounded_batch_requires_retry(drained),
+                false,
+                false,
+            ));
+        }
+        let signal_pending = self.signal.poll_shutdown_pending()?;
+        Ok(gate_decision_after_batch(
+            batch_decision,
+            bounded_batch_requires_retry(drained),
+            guards_allow_retry(true, signal_pending),
+            signal_pending,
+        ))
+    }
+
+    fn commit_candidate(&mut self, candidate: SceneCandidate<'a>) -> Result<(), Box<dyn Error>> {
+        let additions = candidate.watch_additions.clone();
+        let result = self.commit_candidate_inner(candidate);
+        if result.is_err() {
+            if let Err(error) = self.structure_watches.rollback(&additions) {
+                eprintln!("candidate watch rollback failed: {error}");
+            }
+        }
+        result
+    }
+
+    fn commit_candidate_inner(
+        &mut self,
+        candidate: SceneCandidate<'a>,
+    ) -> Result<(), Box<dyn Error>> {
+        let overlay = self.overlay.as_ref().ok_or("overlay is unavailable")?.overlay;
+        if candidate.snapshot.root_geometry.depth != self.overlay_depth()? {
             return Err("scratch and overlay depths differ".into());
         }
-        gc.copy(scratch_drawable, overlay, final_plan)?;
+        let gc = self.gc.as_ref().ok_or("scene GC is unavailable")?;
+        gc.copy(
+            candidate.scratch.pixmap,
+            overlay,
+            CopyPlan {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 0,
+                dst_y: 0,
+                width: candidate.snapshot.root_geometry.width,
+                height: candidate.snapshot.root_geometry.height,
+            },
+        )?;
         self.connection.inner.flush()?;
         self.connection.inner.get_input_focus()?.reply()?;
-        self.state = SceneState::ScratchSceneReady;
-        println!("state: ScratchSceneReady");
-        self.reject_pending_invalidations()?;
-        self.verify_ownership()?;
-        if presentation_decision(self.signal.poll_shutdown_pending()?)
-            == PresentationDecision::Shutdown
-        {
-            return Err("scene invalidated before presentation: Signal".into());
-        }
         self.state = SceneState::ScenePresented;
+        let snapshot = candidate.snapshot;
+        let old_scratch = self.scratch.replace(candidate.scratch);
+        let old_pixmaps = std::mem::replace(&mut self.pixmaps, candidate.pixmaps);
+        self.snapshot = Some(snapshot);
+        self.structure_watches.reconcile(&candidate.watch_ids)?;
+        drop(old_scratch);
+        drop(old_pixmaps);
+        self.state = SceneState::RunningLiveStructural;
         println!("state: ScenePresented (MANUAL active, X11 CopyArea instrument)");
-        self.state = SceneState::RunningStatic;
-        println!("state: RunningStatic");
-        println!("static scene: pixel updates are intentionally not tracked");
+        println!("state: RunningLiveStructural");
         Ok(())
+    }
+
+    fn wait_live_structural(&mut self) -> Result<(), Box<dyn Error>> {
+        loop {
+            let first = match wait_for_event_or_shutdown(self.connection, &mut self.signal)? {
+                WaitResult::Event(event) => event,
+                WaitResult::Shutdown => {
+                    println!("scene shutdown: Signal");
+                    return Ok(());
+                }
+            };
+            let mut batch = InvalidationBatch::default();
+            batch.push(classify_event(
+                first,
+                self.root,
+                self.current_snapshot(),
+                self.ownership.as_ref(),
+            ));
+            for _ in 1..MAX_EVENTS_PER_BATCH {
+                let Some(event) = self.connection.inner.poll_for_event()? else {
+                    break;
+                };
+                batch.push(classify_event(
+                    event,
+                    self.root,
+                    self.current_snapshot(),
+                    self.ownership.as_ref(),
+                ));
+            }
+            if self.signal.poll_shutdown_pending()? {
+                println!("scene shutdown: Signal");
+                return Ok(());
+            }
+            match batch.decision() {
+                SceneInvalidation::Ignore => {}
+                SceneInvalidation::Shutdown(reason) => {
+                    println!("scene shutdown: {reason:?}");
+                    return Ok(());
+                }
+                SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy => {
+                    self.rebuild_and_present()?;
+                }
+            }
+        }
+    }
+
+    fn current_snapshot(&self) -> &SceneSnapshot {
+        self.snapshot
+            .as_ref()
+            .expect("published scene snapshot must exist while live")
     }
 
     fn overlay_depth(&self) -> Result<u8, Box<dyn Error>> {
         let overlay = self.overlay.as_ref().ok_or("overlay is unavailable")?.overlay;
         Ok(self.connection.inner.get_geometry(overlay)?.reply()?.depth)
-    }
-
-    fn reject_pending_invalidations(&self) -> Result<(), Box<dyn Error>> {
-        while let Some(event) = self.connection.inner.poll_for_event()? {
-            if let SceneEventAction::Shutdown(reason) = self.event_action(event) {
-                return Err(format!("scene invalidated before presentation: {reason:?}").into());
-            }
-        }
-        Ok(())
     }
 
     fn verify_ownership(&self) -> Result<(), Box<dyn Error>> {
@@ -873,32 +1215,6 @@ impl<'a> SceneSession<'a> {
             .into());
         }
         Ok(())
-    }
-
-    fn wait_static(&mut self) -> Result<(), Box<dyn Error>> {
-        loop {
-            match wait_for_event_or_shutdown(self.connection, &mut self.signal)? {
-                WaitResult::Shutdown => {
-                    println!("scene shutdown: Signal");
-                    return Ok(());
-                }
-                WaitResult::Event(event) => match self.event_action(event) {
-                    SceneEventAction::Continue => {}
-                    SceneEventAction::Shutdown(reason) => {
-                        println!("scene shutdown: {reason:?}");
-                        return Ok(());
-                    }
-                },
-            }
-        }
-    }
-
-    fn event_action(&self, event: Event) -> SceneEventAction {
-        scene_event_action(
-            event,
-            self.root,
-            self.ownership.as_ref(),
-        )
     }
 
     fn cleanup(&mut self) -> Result<(), Box<dyn Error>> {
@@ -933,6 +1249,9 @@ impl<'a> SceneSession<'a> {
             if let Err(error) = gc.free() {
                 first_error.get_or_insert(error);
             }
+        }
+        if let Err(error) = self.structure_watches.cleanup() {
+            first_error.get_or_insert(error);
         }
         if let Some(mut watch) = self.root_watch.take() {
             if let Err(error) = watch.restore() {
@@ -970,6 +1289,7 @@ impl<'a> SceneSession<'a> {
         if let Some(gc) = self.gc.take() {
             gc.disarm_cleanup();
         }
+        self.structure_watches.disarm_cleanup();
         if let Some(mut watch) = self.root_watch.take() {
             watch.disarm_cleanup();
         }
@@ -1010,43 +1330,115 @@ fn read_root_geometry(
     })
 }
 
-fn scene_event_action(
+fn snapshot_watch_ids(snapshot: &HierarchySnapshot) -> HashSet<Window> {
+    // 3A3c5b1 watches canonical root-child topology only; descendants are
+    // snapshot metadata and are not recursively watched.
+    snapshot
+        .children
+        .iter()
+        .map(|binding| binding.root_child_xid)
+        .collect()
+}
+
+fn root_live_event_mask(previous: EventMask) -> EventMask {
+    previous | EventMask::STRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_NOTIFY
+}
+
+fn canonical_live_event_mask(previous: EventMask) -> EventMask {
+    previous | EventMask::STRUCTURE_NOTIFY
+}
+
+fn classify_event(
     event: Event,
     root: Window,
+    snapshot: &SceneSnapshot,
     ownership: Option<&CompositorOwnership>,
-) -> SceneEventAction {
+) -> SceneInvalidation {
     match event {
         Event::SelectionClear(event)
             if ownership.is_some_and(|ownership| selection_clear_matches(&event, ownership)) =>
         {
-            SceneEventAction::Shutdown(ShutdownReason::SelectionLost)
+            SceneInvalidation::Shutdown(ShutdownReason::SelectionLost)
         }
         Event::ConfigureNotify(event) if event.window == root => {
-            SceneEventAction::Shutdown(ShutdownReason::RootConfigure)
+            SceneInvalidation::Shutdown(ShutdownReason::RootConfigure)
         }
-        Event::CreateNotify(event) if event.parent == root => {
-            SceneEventAction::Shutdown(ShutdownReason::Structural)
+        Event::ConfigureNotify(event)
+            if snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.surface_xid == event.window) =>
+        {
+            SceneInvalidation::Geometry(event.window)
         }
-        Event::MapNotify(event) if event.event == root => {
-            SceneEventAction::Shutdown(ShutdownReason::Structural)
-        }
-        Event::UnmapNotify(event) if event.event == root => {
-            SceneEventAction::Shutdown(ShutdownReason::Structural)
-        }
-        Event::DestroyNotify(event) if event.event == root => {
-            SceneEventAction::Shutdown(ShutdownReason::Structural)
-        }
-        Event::ReparentNotify(event) if event.parent == root || event.event == root => {
-            SceneEventAction::Shutdown(ShutdownReason::Structural)
-        }
-        Event::ConfigureNotify(event) if event.event == root => {
-            SceneEventAction::Shutdown(ShutdownReason::Structural)
-        }
-        Event::CirculateNotify(event) if event.event == root => {
-            SceneEventAction::Shutdown(ShutdownReason::Structural)
-        }
-        _ => SceneEventAction::Continue,
+        Event::ConfigureNotify(_) => SceneInvalidation::Hierarchy,
+        Event::CreateNotify(_)
+        | Event::MapNotify(_)
+        | Event::UnmapNotify(_)
+        | Event::DestroyNotify(_)
+        | Event::ReparentNotify(_)
+        | Event::CirculateNotify(_) => SceneInvalidation::Hierarchy,
+        Event::SelectionClear(_) => SceneInvalidation::Ignore,
+        _ => SceneInvalidation::Ignore,
     }
+}
+
+fn old_scene_safe(invalidation: SceneInvalidation) -> bool {
+    match invalidation {
+        // A structural or geometry event is evidence that the published
+        // pixels may no longer describe current X11 state.
+        SceneInvalidation::Ignore => true,
+        SceneInvalidation::Geometry(_)
+        | SceneInvalidation::Hierarchy
+        | SceneInvalidation::Shutdown(_) => false,
+    }
+}
+
+fn bounded_batch_requires_retry(drained: usize) -> bool {
+    drained == MAX_EVENTS_PER_BATCH
+}
+
+fn retry_allowed(attempt: usize) -> bool {
+    attempt < MAX_CANDIDATE_RETRIES
+}
+
+fn guards_allow_retry(ownership_verified: bool, signal_pending: bool) -> bool {
+    ownership_verified && !signal_pending
+}
+
+fn gate_decision_after_batch(
+    batch: SceneInvalidation,
+    overflow: bool,
+    ownership_verified: bool,
+    signal_pending: bool,
+) -> GateDecision {
+    if let SceneInvalidation::Shutdown(reason) = batch {
+        return GateDecision::Shutdown(reason);
+    }
+    if !ownership_verified {
+        return GateDecision::Shutdown(ShutdownReason::OwnershipLost);
+    }
+    if signal_pending {
+        return GateDecision::Shutdown(ShutdownReason::Signal);
+    }
+    if batch != SceneInvalidation::Ignore || overflow {
+        return GateDecision::Retry(if batch == SceneInvalidation::Ignore {
+            SceneInvalidation::Hierarchy
+        } else {
+            batch
+        });
+    }
+    GateDecision::Accept
+}
+
+fn watch_plan(
+    existing: &HashSet<Window>,
+    desired: &HashSet<Window>,
+) -> (HashSet<Window>, HashSet<Window>) {
+    (
+        desired.difference(existing).copied().collect(),
+        existing.difference(desired).copied().collect(),
+    )
 }
 
 pub(crate) fn run(
@@ -1058,14 +1450,20 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{
-        build_copy_plan, coordinator_requires_cleanup, eligible_surface, is_internal_xid,
-        presentation_decision, root_guard, scene_event_action, CopyPlan, PixmapGeometry,
-        PresentationDecision, RootGeometry, SceneEventAction, SceneState,
-        ShutdownReason, SurfaceEntry,
+        build_copy_plan, classify_event, coordinator_requires_cleanup, eligible_surface,
+        is_internal_xid, old_scene_safe, root_guard, BackendCompatibility, CopyPlan,
+        PixmapGeometry, RootGeometry,
+        bounded_batch_requires_retry, gate_decision_after_batch, guards_allow_retry, GateDecision,
+        retry_allowed, watch_plan, InvalidationBatch, SceneInvalidation, SceneSnapshot,
+        root_live_event_mask, canonical_live_event_mask, snapshot_watch_ids, SceneState,
+        ShutdownReason, SurfaceEntry, MAX_CANDIDATE_RETRIES, MAX_EVENTS_PER_BATCH,
     };
     use crate::x11::capture::WindowGeometry;
-    use x11rb::protocol::xproto::{MapState, WindowClass};
+    use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
+    use x11rb::protocol::xproto::{EventMask, MapState, WindowClass};
     use x11rb::protocol::Event;
 
     fn root() -> RootGeometry {
@@ -1210,7 +1608,55 @@ mod tests {
 
         let mut unsupported_depth = metadata();
         unsupported_depth.depth = 32;
-        assert!(eligible_surface(&unsupported_depth, None, root(), 10, 0).is_none());
+        let unsupported = eligible_surface(&unsupported_depth, None, root(), 10, 0).unwrap();
+        assert_eq!(unsupported.backend, BackendCompatibility::BackendUnsupported);
+    }
+
+    #[test]
+    fn empty_scene_snapshot_is_valid() {
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: root(),
+            entries: Vec::new(),
+        };
+        assert!(snapshot.entries.is_empty());
+    }
+
+    #[test]
+    fn backend_unsupported_only_scene_remains_canonical() {
+        let mut unsupported = metadata();
+        unsupported.depth = 32;
+        let entry = eligible_surface(&unsupported, None, root(), 10, 0).unwrap();
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: root(),
+            entries: vec![entry],
+        };
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].surface_xid, 10);
+        assert_eq!(snapshot.entries[0].backend, BackendCompatibility::BackendUnsupported);
+    }
+
+    #[test]
+    fn empty_scene_has_no_source_copy_operations() {
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: root(),
+            entries: Vec::new(),
+        };
+        let source_copy_count = snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.backend == BackendCompatibility::Renderable)
+            .count();
+        assert_eq!(source_copy_count, 0);
+    }
+
+    #[test]
+    fn empty_scene_keeps_structural_guards_in_force() {
+        assert!(guards_allow_retry(true, false));
+        assert!(!guards_allow_retry(false, false));
+        assert!(!guards_allow_retry(true, true));
     }
 
     #[test]
@@ -1236,27 +1682,143 @@ mod tests {
             border_width: 0,
             override_redirect: false,
         };
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: root(),
+            entries: Vec::new(),
+        };
         assert_eq!(
-            scene_event_action(Event::ConfigureNotify(configure), 1, None),
-            SceneEventAction::Shutdown(ShutdownReason::RootConfigure)
+            classify_event(Event::ConfigureNotify(configure), 1, &snapshot, None),
+            SceneInvalidation::Shutdown(ShutdownReason::RootConfigure)
         );
         assert_eq!(
-            scene_event_action(Event::ConfigureNotify(configure), 2, None),
-            SceneEventAction::Continue
+            classify_event(Event::ConfigureNotify(configure), 2, &snapshot, None),
+            SceneInvalidation::Hierarchy
         );
 
     }
 
     #[test]
-    fn shutdown_pending_before_scene_presented_blocks_presentation() {
+    fn structural_events_are_hierarchy_invalidations() {
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: root(),
+            entries: Vec::new(),
+        };
+        let events = [
+            Event::CreateNotify(x11rb::protocol::xproto::CreateNotifyEvent {
+                response_type: 0, sequence: 0, parent: 1, window: 2,
+                x: 0, y: 0, width: 1, height: 1, border_width: 0,
+                override_redirect: false,
+            }),
+        ];
+        for event in events {
+            assert_eq!(
+                classify_event(event, 1, &snapshot, None),
+                SceneInvalidation::Hierarchy
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_dominates_batch_and_hierarchy_dominates_geometry() {
+        let mut batch = InvalidationBatch::default();
+        batch.push(SceneInvalidation::Geometry(10));
+        batch.push(SceneInvalidation::Hierarchy);
+        assert_eq!(batch.decision(), SceneInvalidation::Hierarchy);
+        batch.push(SceneInvalidation::Shutdown(ShutdownReason::RootConfigure));
         assert_eq!(
-            presentation_decision(true),
-            PresentationDecision::Shutdown
+            batch.decision(),
+            SceneInvalidation::Shutdown(ShutdownReason::RootConfigure)
+        );
+    }
+
+    #[test]
+    fn bounded_retry_does_not_treat_structural_old_scene_as_safe() {
+        assert!(!old_scene_safe(SceneInvalidation::Hierarchy));
+        assert!(!old_scene_safe(SceneInvalidation::Geometry(10)));
+    }
+
+    #[test]
+    fn bounded_batch_marks_retry_without_consuming_overflow() {
+        assert!(!bounded_batch_requires_retry(MAX_EVENTS_PER_BATCH - 1));
+        assert!(bounded_batch_requires_retry(MAX_EVENTS_PER_BATCH));
+    }
+
+    #[test]
+    fn gate_shutdown_and_guards_prevent_retry() {
+        assert_eq!(
+            gate_decision_after_batch(
+                SceneInvalidation::Shutdown(ShutdownReason::SelectionLost),
+                false,
+                true,
+                false,
+            ),
+            GateDecision::Shutdown(ShutdownReason::SelectionLost)
         );
         assert_eq!(
-            presentation_decision(false),
-            PresentationDecision::Present
+            gate_decision_after_batch(SceneInvalidation::Hierarchy, false, true, true),
+            GateDecision::Shutdown(ShutdownReason::Signal)
         );
+        assert_eq!(
+            gate_decision_after_batch(SceneInvalidation::Geometry(10), false, false, false),
+            GateDecision::Shutdown(ShutdownReason::OwnershipLost)
+        );
+    }
+
+    #[test]
+    fn retry_policy_is_bounded_and_stale_never_accepts() {
+        assert_eq!(MAX_CANDIDATE_RETRIES, 1);
+        assert!(retry_allowed(0));
+        assert!(!retry_allowed(1));
+        assert_ne!(
+            gate_decision_after_batch(SceneInvalidation::Hierarchy, false, true, false),
+            GateDecision::Accept
+        );
+    }
+
+    #[test]
+    fn candidate_watch_plan_has_additions_and_obsolete_sets() {
+        let existing = HashSet::from([1, 2]);
+        let desired = HashSet::from([2, 3]);
+        let (additions, obsolete) = watch_plan(&existing, &desired);
+        assert_eq!(additions, HashSet::from([3]));
+        assert_eq!(obsolete, HashSet::from([1]));
+    }
+
+    #[test]
+    fn guards_require_ownership_and_no_pending_signal() {
+        assert!(guards_allow_retry(true, false));
+        assert!(!guards_allow_retry(false, false));
+        assert!(!guards_allow_retry(true, true));
+    }
+
+    #[test]
+    fn live_masks_cover_root_and_canonical_surface_only() {
+        let root_mask = root_live_event_mask(EventMask::NO_EVENT);
+        assert!(root_mask.contains(EventMask::STRUCTURE_NOTIFY));
+        assert!(root_mask.contains(EventMask::SUBSTRUCTURE_NOTIFY));
+        let canonical_mask = canonical_live_event_mask(EventMask::NO_EVENT);
+        assert!(canonical_mask.contains(EventMask::STRUCTURE_NOTIFY));
+        assert!(!canonical_mask.contains(EventMask::SUBSTRUCTURE_NOTIFY));
+    }
+
+    #[test]
+    fn live_watch_plan_excludes_snapshot_descendants() {
+        let binding = HierarchyBinding {
+            root_child_xid: 10,
+            semantic_client_xids: vec![30],
+            semantic_client: BindingStatus::SingleClient(30),
+            lifecycle_candidate_xid: 10,
+            surface_candidate: Some(metadata()),
+            descendants: vec![metadata()],
+            stale: false,
+        };
+        let snapshot = HierarchySnapshot {
+            root: 1,
+            children: vec![binding],
+        };
+        assert_eq!(snapshot_watch_ids(&snapshot), HashSet::from([10]));
     }
 
     #[test]
