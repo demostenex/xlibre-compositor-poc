@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
@@ -823,6 +824,169 @@ struct InvalidationBatch {
     pixel_damage: HashSet<damage::Damage>,
 }
 
+#[derive(Debug)]
+struct MetricsWindow {
+    started: Instant,
+    damage_events: u64,
+    pixel_batches: u64,
+    damaged_surface_total: u64,
+    damaged_surface_max: u64,
+    renders: u64,
+    swaps: u64,
+    total_swap_us: u128,
+    max_swap_us: u128,
+    damage_to_present_count: u64,
+    total_damage_to_present_us: u128,
+    max_damage_to_present_us: u128,
+    total_render_to_swap_us: u128,
+    max_render_to_swap_us: u128,
+    structural_rebuilds: u64,
+    egl_imports: u64,
+    stale_retry: u64,
+    stale_deferred: u64,
+    first_damage_at: Option<Instant>,
+}
+
+impl MetricsWindow {
+    fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(started: Instant) -> Self {
+        Self {
+            started,
+            damage_events: 0,
+            pixel_batches: 0,
+            damaged_surface_total: 0,
+            damaged_surface_max: 0,
+            renders: 0,
+            swaps: 0,
+            total_swap_us: 0,
+            max_swap_us: 0,
+            damage_to_present_count: 0,
+            total_damage_to_present_us: 0,
+            max_damage_to_present_us: 0,
+            total_render_to_swap_us: 0,
+            max_render_to_swap_us: 0,
+            structural_rebuilds: 0,
+            egl_imports: 0,
+            stale_retry: 0,
+            stale_deferred: 0,
+            first_damage_at: None,
+        }
+    }
+
+    fn record_damage_event(&mut self) {
+        self.damage_events += 1;
+    }
+
+    fn record_first_damage(&mut self, at: Instant) {
+        if self.first_damage_at.is_none() {
+            self.first_damage_at = Some(at);
+        }
+    }
+
+    fn record_pixel_batch(&mut self, damaged_surfaces: usize) {
+        self.pixel_batches += 1;
+        self.damaged_surface_total += damaged_surfaces as u64;
+        self.damaged_surface_max = self.damaged_surface_max.max(damaged_surfaces as u64);
+    }
+
+    fn record_render(&mut self) {
+        self.renders += 1;
+    }
+
+    fn record_import(&mut self) {
+        self.egl_imports += 1;
+    }
+
+    fn record_structural_rebuild(&mut self) {
+        self.structural_rebuilds += 1;
+    }
+
+    fn record_stale_retry(&mut self) {
+        self.stale_retry += 1;
+    }
+
+    fn record_stale_deferred(&mut self) {
+        self.stale_deferred += 1;
+    }
+
+    fn clear_pending_damage(&mut self) {
+        self.first_damage_at = None;
+    }
+
+    fn record_swap(
+        &mut self,
+        swap_duration: Duration,
+        render_to_swap: Duration,
+        presented_at: Instant,
+        pixel_frame: bool,
+        succeeded: bool,
+    ) {
+        let swap_us = swap_duration.as_micros();
+        let render_to_swap_us = render_to_swap.as_micros();
+        self.swaps += 1;
+        self.total_swap_us += swap_us;
+        self.max_swap_us = self.max_swap_us.max(swap_us);
+        self.total_render_to_swap_us += render_to_swap_us;
+        self.max_render_to_swap_us = self.max_render_to_swap_us.max(render_to_swap_us);
+        if pixel_frame && succeeded {
+            if let Some(first_damage_at) = self.first_damage_at.take() {
+                let latency_us = presented_at
+                    .saturating_duration_since(first_damage_at)
+                    .as_micros();
+                self.damage_to_present_count += 1;
+                self.total_damage_to_present_us += latency_us;
+                self.max_damage_to_present_us = self.max_damage_to_present_us.max(latency_us);
+            }
+        }
+    }
+
+    fn report_if_due(&mut self, now: Instant) -> Option<String> {
+        let interval = now.saturating_duration_since(self.started);
+        if interval < Duration::from_secs(1) {
+            return None;
+        }
+        let interval_ms = interval.as_millis();
+        let damaged_surface_avg = if self.pixel_batches == 0 {
+            0.0
+        } else {
+            self.damaged_surface_total as f64 / self.pixel_batches as f64
+        };
+        let swap_avg = average(self.total_swap_us, self.swaps);
+        let damage_to_present_avg =
+            average(self.total_damage_to_present_us, self.damage_to_present_count);
+        let render_to_swap_avg = average(self.total_render_to_swap_us, self.swaps);
+        let line = format!(
+            "XOMPOSITE_METRICS interval_ms={interval_ms} damage_events={} pixel_batches={} damaged_surfaces_avg={damaged_surface_avg:.2} damaged_surfaces_max={} renders={} swaps={} swap_total_us={} swap_avg_us={swap_avg} swap_max_us={} damage_to_present_avg_us={damage_to_present_avg} damage_to_present_max_us={} render_to_swap_avg_us={render_to_swap_avg} render_to_swap_max_us={} structural_rebuilds={} egl_imports={} stale_retry={} stale_deferred={}",
+            self.damage_events,
+            self.pixel_batches,
+            self.damaged_surface_max,
+            self.renders,
+            self.swaps,
+            self.total_swap_us,
+            self.max_swap_us,
+            self.max_damage_to_present_us,
+            self.max_render_to_swap_us,
+            self.structural_rebuilds,
+            self.egl_imports,
+            self.stale_retry,
+            self.stale_deferred,
+        );
+        *self = Self::new_at(now);
+        Some(line)
+    }
+}
+
+fn average(total: u128, count: u64) -> u128 {
+    if count == 0 {
+        0
+    } else {
+        total / u128::from(count)
+    }
+}
+
 impl InvalidationBatch {
     fn push(&mut self, invalidation: SceneInvalidation) {
         match invalidation {
@@ -887,11 +1051,13 @@ struct SceneSession<'a> {
     egl_surfaces: HashMap<Window, EglImportedSurface>,
     signal: SignalWake,
     state: SceneState,
+    metrics: MetricsWindow,
 }
 
 struct SceneCandidate<'a> {
     snapshot: SceneSnapshot,
     generation: u64,
+    render_started: Instant,
     // Declaration order is cleanup order: imported EGL resources must drop
     // before their source pixmaps, with Damage leases released in between.
     egl_surfaces: HashMap<Window, EglImportedSurface>,
@@ -1111,6 +1277,7 @@ impl<'a> SceneSession<'a> {
             egl_surfaces: HashMap::new(),
             signal,
             state: SceneState::PlaceholderReady,
+            metrics: MetricsWindow::new(),
         };
         session.state = SceneState::ManualActive;
         Ok(session)
@@ -1160,7 +1327,6 @@ impl<'a> SceneSession<'a> {
         let mut damage_leases = Vec::new();
         let mut damage_registry = HashMap::new();
         let mut egl_surfaces = HashMap::new();
-        let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
         for entry in &snapshot.entries {
             let semantics = self.visual_formats.semantics(entry.visual, entry.depth);
             let importable = semantics != EglPixelSemantics::Unsupported;
@@ -1184,7 +1350,12 @@ impl<'a> SceneSession<'a> {
                 pixmaps.push(pixmap);
                 continue;
             }
-            let egl_surface = egl.import_pixmap(pixmap.pixmap_xid, semantics)?;
+            let egl_surface = self
+                .egl
+                .as_ref()
+                .ok_or("EGL scene renderer is unavailable")?
+                .import_pixmap(pixmap.pixmap_xid, semantics)?;
+            self.metrics.record_import();
             egl_surfaces.insert(entry.surface_xid, egl_surface);
             pixmaps.push(pixmap);
         }
@@ -1199,6 +1370,8 @@ impl<'a> SceneSession<'a> {
         if !egl_scene_is_renderable(snapshot.entries.len(), egl_surfaces.len()) {
             return Err("scene has canonical surfaces but no EGL-renderable surfaces".into());
         }
+        let render_started = Instant::now();
+        self.metrics.record_render();
         self.render_egl_scene(&snapshot, &egl_surfaces, &pixmaps)?;
         self.state = SceneState::NamedPixmapsReady;
         println!("state: EGLImported surfaces={}", egl_surfaces.len());
@@ -1206,6 +1379,7 @@ impl<'a> SceneSession<'a> {
         Ok(SceneCandidate {
             snapshot,
             generation,
+            render_started,
             pixmaps,
             damage_leases,
             damage_registry,
@@ -1216,6 +1390,8 @@ impl<'a> SceneSession<'a> {
     }
 
     fn rebuild_and_present(&mut self) -> Result<(), Box<dyn Error>> {
+        self.metrics.record_structural_rebuild();
+        self.metrics.clear_pending_damage();
         for attempt in 0..=MAX_CANDIDATE_RETRIES {
             let generation = self.structural_generation;
             self.attempted_structural_generation = generation;
@@ -1229,9 +1405,11 @@ impl<'a> SceneSession<'a> {
                         return Err(error);
                     };
                     if retry_allowed(attempt) {
+                        self.metrics.record_stale_retry();
                         println!("candidate stale; bounded retry: {invalidation:?}");
                         continue;
                     } else {
+                        self.metrics.record_stale_deferred();
                         println!("candidate stale; deferred rebuild: {invalidation:?}");
                         return Ok(());
                     }
@@ -1256,6 +1434,7 @@ impl<'a> SceneSession<'a> {
                     return Err(format!("candidate aborted by shutdown: {reason:?}").into());
                 }
                 GateDecision::Retry(invalidation) if retry_allowed(attempt) => {
+                    self.metrics.record_stale_retry();
                     self.merge_deferred_damage(deferred_damage);
                     self.structure_watches.rollback(&candidate.watch_additions)?;
                     println!("candidate stale; bounded retry: {invalidation:?}");
@@ -1267,6 +1446,7 @@ impl<'a> SceneSession<'a> {
                         println!("candidate stale; bounded retry: {invalidation:?}");
                         continue;
                     } else {
+                        self.metrics.record_stale_deferred();
                         drop(candidate);
                         println!("candidate stale; deferred rebuild: {invalidation:?}");
                         return Ok(());
@@ -1289,6 +1469,7 @@ impl<'a> SceneSession<'a> {
                 break;
             };
             drained += 1;
+            self.observe_event(&event);
             let invalidation = classify_event_with_registries(
                 event,
                 self.root,
@@ -1336,8 +1517,9 @@ impl<'a> SceneSession<'a> {
         &mut self,
         candidate: SceneCandidate<'a>,
     ) -> Result<(), Box<dyn Error>> {
-        let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
-        egl.swap()?;
+        let render_started = candidate.render_started;
+        self.metrics.clear_pending_damage();
+        self.present_frame(render_started, false)?;
         self.state = SceneState::ScenePresented;
         let old_surfaces = self
             .snapshot
@@ -1370,6 +1552,7 @@ impl<'a> SceneSession<'a> {
         for damage in &old_damage_leases {
             retire_damage_lease(damage, removed_surfaces.contains(&damage.surface_xid))?;
         }
+        let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
         egl.make_current()?;
         for surface in old_egl_surfaces.values_mut() {
             egl.destroy_import(surface)?;
@@ -1394,12 +1577,24 @@ impl<'a> SceneSession<'a> {
         );
     }
 
+    fn observe_event(&mut self, event: &Event) {
+        if matches!(event, Event::DamageNotify(_)) {
+            self.metrics.record_damage_event();
+        }
+    }
+
     fn observe_invalidation(&mut self, invalidation: SceneInvalidation) {
+        if matches!(invalidation, SceneInvalidation::PixelDamage(_)) {
+            self.metrics.record_first_damage(Instant::now());
+        }
         observe_structural_generation(&mut self.structural_generation, invalidation);
     }
 
     fn wait_live_pixel(&mut self) -> Result<(), Box<dyn Error>> {
         loop {
+            if let Some(line) = self.metrics.report_if_due(Instant::now()) {
+                println!("{line}");
+            }
             let mut batch = InvalidationBatch::default();
             let pending = std::mem::take(&mut self.pending_damage);
             let had_pending_work = pending_work_requires_iteration(&pending);
@@ -1425,6 +1620,7 @@ impl<'a> SceneSession<'a> {
                         return Ok(());
                     }
                 };
+                self.observe_event(&first);
                 let invalidation = classify_event_with_registries(
                     first,
                     self.root,
@@ -1439,6 +1635,7 @@ impl<'a> SceneSession<'a> {
                     let Some(event) = self.connection.inner.poll_for_event()? else {
                         break;
                     };
+                    self.observe_event(&event);
                     let invalidation = classify_event_with_registries(
                         event,
                         self.root,
@@ -1500,6 +1697,15 @@ impl<'a> SceneSession<'a> {
             }
             SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => {}
         }
+        let render_started = Instant::now();
+        self.metrics.record_pixel_batch(
+            touched_damage
+                .iter()
+                .filter_map(|damage_id| self.damage_registry.get(damage_id))
+                .collect::<HashSet<_>>()
+                .len(),
+        );
+        self.metrics.record_render();
         self.full_recompose_current()?;
         self.connection.inner.get_input_focus()?.reply()?;
         let final_gate = self.drain_current_events()?;
@@ -1514,11 +1720,7 @@ impl<'a> SceneSession<'a> {
             return Ok(());
         }
         if pixel_gate_allows_presentation(final_gate.decision(), ownership_ok, false) {
-            return self
-                .egl
-                .as_ref()
-                .ok_or("EGL scene renderer is unavailable")?
-                .swap();
+            return self.present_frame(render_started, true);
         }
         match final_gate.decision() {
             SceneInvalidation::Shutdown(reason) => {
@@ -1539,6 +1741,7 @@ impl<'a> SceneSession<'a> {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
             };
+            self.observe_event(&event);
             let invalidation = classify_event_with_registries(
                 event,
                 self.root,
@@ -1592,6 +1795,31 @@ impl<'a> SceneSession<'a> {
             )?;
         }
         Ok(())
+    }
+
+    fn present_frame(
+        &mut self,
+        render_started: Instant,
+        pixel_frame: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let swap_started = Instant::now();
+        let result = self
+            .egl
+            .as_ref()
+            .ok_or("EGL scene renderer is unavailable")?
+            .swap();
+        let presented_at = Instant::now();
+        self.metrics.record_swap(
+            presented_at.saturating_duration_since(swap_started),
+            presented_at.saturating_duration_since(render_started),
+            presented_at,
+            pixel_frame,
+            result.is_ok(),
+        );
+        if let Some(line) = self.metrics.report_if_due(presented_at) {
+            println!("{line}");
+        }
+        result
     }
 
     fn current_snapshot(&self) -> &SceneSnapshot {
@@ -2119,6 +2347,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
 
     use super::{
         build_copy_plan,
@@ -2139,7 +2368,7 @@ mod tests {
         observe_structural_generation,
         structural_generation_state, StructuralGenerationState,
         classify_retired_damage_destroy, DamageDestroyClassification, DamageReleaseOutcome,
-        DamageState,
+        DamageState, MetricsWindow,
     };
     use crate::x11::capture::WindowGeometry;
     use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
@@ -3130,5 +3359,152 @@ mod tests {
         ));
         assert!(!pixel_gate_allows_presentation(SceneInvalidation::Ignore, false, false));
         assert!(!pixel_gate_allows_presentation(SceneInvalidation::Ignore, true, true));
+    }
+
+    #[test]
+    fn metrics_aggregate_counts() {
+        let start = Instant::now();
+        let mut metrics = MetricsWindow::new_at(start);
+        metrics.record_damage_event();
+        metrics.record_first_damage(start);
+        metrics.record_damage_event();
+        metrics.record_first_damage(start + Duration::from_millis(1));
+        metrics.record_pixel_batch(2);
+        metrics.record_render();
+        metrics.record_import();
+        metrics.record_structural_rebuild();
+        metrics.record_stale_retry();
+        metrics.record_stale_deferred();
+        metrics.record_swap(
+            Duration::from_micros(10),
+            Duration::from_micros(20),
+            start + Duration::from_millis(2),
+            true,
+            true,
+        );
+        let line = metrics
+            .report_if_due(start + Duration::from_secs(1))
+            .unwrap();
+        assert!(line.contains("damage_events=2"));
+        assert!(line.contains("pixel_batches=1"));
+        assert!(line.contains("damaged_surfaces_max=2"));
+        assert!(line.contains("renders=1"));
+        assert!(line.contains("swaps=1"));
+        assert!(line.contains("structural_rebuilds=1"));
+        assert!(line.contains("egl_imports=1"));
+        assert!(line.contains("stale_retry=1"));
+        assert!(line.contains("stale_deferred=1"));
+    }
+
+    #[test]
+    fn metrics_report_resets_window() {
+        let start = Instant::now();
+        let mut metrics = MetricsWindow::new_at(start);
+        metrics.record_render();
+        assert!(metrics.report_if_due(start + Duration::from_millis(999)).is_none());
+        assert!(metrics.report_if_due(start + Duration::from_secs(1)).is_some());
+        let next = start + Duration::from_secs(2);
+        let line = metrics.report_if_due(next).unwrap();
+        assert!(line.contains("renders=0"));
+        assert!(line.contains("swaps=0"));
+    }
+
+    #[test]
+    fn metrics_compute_average_and_max_swap_duration() {
+        let start = Instant::now();
+        let mut metrics = MetricsWindow::new_at(start);
+        metrics.record_swap(
+            Duration::from_micros(10),
+            Duration::from_micros(30),
+            start,
+            false,
+            true,
+        );
+        metrics.record_swap(
+            Duration::from_micros(20),
+            Duration::from_micros(50),
+            start,
+            false,
+            true,
+        );
+        let line = metrics
+            .report_if_due(start + Duration::from_secs(1))
+            .unwrap();
+        assert!(line.contains("swap_avg_us=15"));
+        assert!(line.contains("swap_max_us=20"));
+        assert!(line.contains("render_to_swap_avg_us=40"));
+        assert!(line.contains("render_to_swap_max_us=50"));
+    }
+
+    #[test]
+    fn metrics_preserve_first_damage_timestamp_across_coalescing() {
+        let start = Instant::now();
+        let mut metrics = MetricsWindow::new_at(start);
+        metrics.record_damage_event();
+        metrics.record_first_damage(start);
+        metrics.record_damage_event();
+        metrics.record_first_damage(start + Duration::from_micros(10));
+        metrics.record_pixel_batch(1);
+        metrics.record_swap(
+            Duration::from_micros(1),
+            Duration::from_micros(2),
+            start + Duration::from_micros(20),
+            true,
+            true,
+        );
+        let line = metrics
+            .report_if_due(start + Duration::from_secs(1))
+            .unwrap();
+        assert!(line.contains("damage_to_present_avg_us=20"));
+        assert!(line.contains("damage_to_present_max_us=20"));
+    }
+
+    #[test]
+    fn metrics_do_not_divide_by_zero() {
+        let start = Instant::now();
+        let mut metrics = MetricsWindow::new_at(start);
+        let line = metrics
+            .report_if_due(start + Duration::from_secs(1))
+            .unwrap();
+        assert!(line.contains("damaged_surfaces_avg=0"));
+        assert!(line.contains("swap_avg_us=0"));
+        assert!(line.contains("damage_to_present_avg_us=0"));
+        assert!(!line.contains("NaN"));
+    }
+
+    #[test]
+    fn structural_only_swap_has_no_damage_latency() {
+        let start = Instant::now();
+        let mut metrics = MetricsWindow::new_at(start);
+        metrics.record_swap(
+            Duration::from_micros(5),
+            Duration::from_micros(15),
+            start + Duration::from_micros(15),
+            false,
+            true,
+        );
+        let line = metrics
+            .report_if_due(start + Duration::from_secs(1))
+            .unwrap();
+        assert!(line.contains("damage_to_present_avg_us=0"));
+        assert!(line.contains("damage_to_present_max_us=0"));
+    }
+
+    #[test]
+    fn metrics_reset_does_not_leak_counters_between_windows() {
+        let start = Instant::now();
+        let mut metrics = MetricsWindow::new_at(start);
+        metrics.record_damage_event();
+        metrics.record_first_damage(start);
+        metrics.record_pixel_batch(3);
+        let _ = metrics.report_if_due(start + Duration::from_secs(1));
+        metrics.record_pixel_batch(1);
+        let line = metrics
+            .report_if_due(start + Duration::from_secs(2))
+            .unwrap();
+        assert!(line.contains("damage_events=0"));
+        assert!(line.contains("pixel_batches=1"));
+        assert!(line.contains("damaged_surfaces_avg=1"));
+        assert!(line.contains("damaged_surfaces_max=1"));
     }
 }
