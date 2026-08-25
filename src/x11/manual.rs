@@ -31,7 +31,7 @@ pub(crate) struct ManualSubwindowsRedirect<'a> {
 }
 
 impl<'a> ManualSubwindowsRedirect<'a> {
-    fn acquire(connection: &'a X11Connection, root: Window) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn acquire(connection: &'a X11Connection, root: Window) -> Result<Self, Box<dyn Error>> {
         let redirect = Self {
             connection,
             root,
@@ -49,7 +49,7 @@ impl<'a> ManualSubwindowsRedirect<'a> {
         Ok(redirect)
     }
 
-    fn unredirect(&mut self) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn unredirect(&mut self) -> Result<(), Box<dyn Error>> {
         if !begin_unredirect(&self.state) {
             return Err("manual unredirect is not available in the current state".into());
         }
@@ -363,7 +363,7 @@ impl<'a> ManualProbeSession<'a> {
     }
 }
 
-fn parse_root(value: &str) -> Result<Window, Box<dyn Error>> {
+pub(crate) fn parse_root(value: &str) -> Result<Window, Box<dyn Error>> {
     let (digits, radix) = value
         .strip_prefix("0x")
         .map_or((value, 10), |digits| (digits, 16));
@@ -377,7 +377,7 @@ pub(crate) fn run(
     ManualProbeSession::run(connection, parse_root(expected_root_value)?)
 }
 
-fn check_selection_available(connection: &X11Connection) -> Result<(), Box<dyn Error>> {
+pub(crate) fn check_selection_available(connection: &X11Connection) -> Result<(), Box<dyn Error>> {
     let name = super::compositor::selection_name(connection.screen_num());
     let atom = connection.inner.intern_atom(true, name.as_bytes())?.reply()?.atom;
     if atom == x11rb::NONE {
@@ -390,7 +390,7 @@ fn check_selection_available(connection: &X11Connection) -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn check_capabilities(connection: &X11Connection) -> Result<(), Box<dyn Error>> {
+pub(crate) fn check_capabilities(connection: &X11Connection) -> Result<(), Box<dyn Error>> {
     let composite = connection.inner.composite_query_version(0, 3)?.reply()?;
     let gates = CapabilityGates {
         composite: (composite.major_version, composite.minor_version) >= (0, 3),

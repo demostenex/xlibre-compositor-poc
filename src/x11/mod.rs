@@ -7,6 +7,7 @@ pub mod preflight;
 pub mod shutdown;
 pub mod overlay;
 pub mod manual;
+pub mod scene;
 
 use x11rb::protocol::xproto::MapState;
 

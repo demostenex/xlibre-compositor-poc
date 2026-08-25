@@ -88,6 +88,32 @@ impl SignalWake {
             }
         }
     }
+
+    pub fn poll_shutdown_pending(&mut self) -> Result<bool, Box<dyn Error>> {
+        let mut descriptor = libc::pollfd {
+            fd: self.read_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err("shutdown wake descriptor became invalid".into());
+            }
+            if !shutdown_ready(descriptor.revents) {
+                return Ok(false);
+            }
+            self.drain()?;
+            return Ok(true);
+        }
+    }
 }
 
 impl Drop for SignalWake {
@@ -136,7 +162,7 @@ pub fn wait_for_event_or_shutdown(
         if descriptors[0].revents & libc::POLLNVAL != 0 {
             return Err("shutdown wake descriptor became invalid".into());
         }
-        if descriptors[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        if shutdown_ready(descriptors[0].revents) {
             signal.drain()?;
             return Ok(WaitResult::Shutdown);
         }
@@ -144,6 +170,10 @@ pub fn wait_for_event_or_shutdown(
             return Err("X11 connection became unavailable".into());
         }
     }
+}
+
+fn shutdown_ready(revents: libc::c_short) -> bool {
+    revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
 }
 
 unsafe fn install_signal(
