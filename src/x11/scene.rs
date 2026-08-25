@@ -4,6 +4,7 @@ use std::error::Error;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::ConnectionExt as CompositeConnectionExt;
+use x11rb::protocol::damage::{self, ConnectionExt as DamageConnectionExt};
 use x11rb::protocol::xproto::{
     self, ChangeWindowAttributesAux, ConnectionExt as XprotoConnectionExt, CreateGCAux,
     EventMask, Rectangle, Window, WindowClass,
@@ -209,6 +210,90 @@ enum PixmapState {
     Active,
     FreeAttempted,
     Released,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DamageState {
+    Active,
+    DestroyAttempted,
+    Released,
+    Disarmed,
+}
+
+struct DamageLease<'a> {
+    connection: &'a X11Connection,
+    surface_xid: Window,
+    damage_xid: damage::Damage,
+    state: Cell<DamageState>,
+}
+
+impl<'a> DamageLease<'a> {
+    fn acquire(
+        connection: &'a X11Connection,
+        surface_xid: Window,
+    ) -> Result<Self, Box<dyn Error>> {
+        let damage_xid = connection.inner.generate_id()?;
+        connection
+            .inner
+            .damage_create(damage_xid, surface_xid, damage::ReportLevel::NON_EMPTY)?
+            .check()?;
+        println!(
+            "DamageLease: damage=0x{:08x} surface=0x{:08x}",
+            damage_xid, surface_xid
+        );
+        Ok(Self {
+            connection,
+            surface_xid,
+            damage_xid,
+            state: Cell::new(DamageState::Active),
+        })
+    }
+
+    fn subtract(&self) -> Result<(), Box<dyn Error>> {
+        if self.state.get() != DamageState::Active {
+            return Ok(());
+        }
+        self.connection
+            .inner
+            .damage_subtract(self.damage_xid, x11rb::NONE, x11rb::NONE)?
+            .check()?;
+        Ok(())
+    }
+
+    fn destroy(&self) -> Result<(), Box<dyn Error>> {
+        if self.state.get() != DamageState::Active {
+            return Ok(());
+        }
+        self.state.set(DamageState::DestroyAttempted);
+        self.connection
+            .inner
+            .damage_destroy(self.damage_xid)?
+            .check()?;
+        self.state.set(DamageState::Released);
+        println!(
+            "DamageLease released: damage=0x{:08x} surface=0x{:08x}",
+            self.damage_xid, self.surface_xid
+        );
+        Ok(())
+    }
+
+    fn disarm_cleanup(&self) {
+        self.state.set(DamageState::Disarmed);
+    }
+}
+
+impl Drop for DamageLease<'_> {
+    fn drop(&mut self) {
+        if self.state.get() != DamageState::Active {
+            return;
+        }
+        self.state.set(DamageState::DestroyAttempted);
+        if let Ok(cookie) = self.connection.inner.damage_destroy(self.damage_xid) {
+            if cookie.check().is_ok() {
+                self.state.set(DamageState::Released);
+            }
+        }
+    }
 }
 
 struct NamedSurfacePixmap<'a> {
@@ -655,7 +740,7 @@ enum SceneState {
     SceneSnapshotReady,
     NamedPixmapsReady,
     ScenePresented,
-    RunningLiveStructural,
+    RunningLivePixel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -669,6 +754,7 @@ enum ShutdownReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SceneInvalidation {
     Ignore,
+    PixelDamage(damage::Damage),
     Geometry(Window),
     Hierarchy,
     Shutdown(ShutdownReason),
@@ -686,12 +772,16 @@ struct InvalidationBatch {
     hierarchy: bool,
     geometry: Option<Window>,
     shutdown: Option<ShutdownReason>,
+    pixel_damage: HashSet<damage::Damage>,
 }
 
 impl InvalidationBatch {
     fn push(&mut self, invalidation: SceneInvalidation) {
         match invalidation {
             SceneInvalidation::Ignore => {}
+            SceneInvalidation::PixelDamage(damage_id) => {
+                self.pixel_damage.insert(damage_id);
+            }
             SceneInvalidation::Geometry(window) if !self.hierarchy => {
                 self.geometry = Some(window);
             }
@@ -713,9 +803,15 @@ impl InvalidationBatch {
             SceneInvalidation::Hierarchy
         } else if let Some(window) = self.geometry {
             SceneInvalidation::Geometry(window)
+        } else if let Some(damage_id) = self.pixel_damage.iter().next().copied() {
+            SceneInvalidation::PixelDamage(damage_id)
         } else {
             SceneInvalidation::Ignore
         }
+    }
+
+    fn pixel_damage(&self) -> &HashSet<damage::Damage> {
+        &self.pixel_damage
     }
 }
 
@@ -734,6 +830,9 @@ struct SceneSession<'a> {
     gc: Option<SceneGc<'a>>,
     scratch: Option<SceneScratchPixmap<'a>>,
     pixmaps: Vec<NamedSurfacePixmap<'a>>,
+    damage_leases: Vec<DamageLease<'a>>,
+    damage_registry: HashMap<damage::Damage, Window>,
+    pending_damage: HashSet<damage::Damage>,
     snapshot: Option<SceneSnapshot>,
     signal: SignalWake,
     state: SceneState,
@@ -743,6 +842,8 @@ struct SceneCandidate<'a> {
     snapshot: SceneSnapshot,
     scratch: SceneScratchPixmap<'a>,
     pixmaps: Vec<NamedSurfacePixmap<'a>>,
+    damage_leases: Vec<DamageLease<'a>>,
+    damage_registry: HashMap<damage::Damage, Window>,
     watch_ids: HashSet<Window>,
     watch_additions: Vec<Window>,
 }
@@ -896,6 +997,7 @@ impl<'a> SceneSession<'a> {
         root_guard(expected_root, root)?;
         check_capabilities(connection)?;
         check_selection_available(connection)?;
+        ensure_damage_version(connection)?;
         let signal = SignalWake::install()?;
         let ownership = CompositorOwnership::claim(connection)?;
         let mut overlay = OverlayLease::acquire(connection, root)?;
@@ -923,6 +1025,9 @@ impl<'a> SceneSession<'a> {
             gc: Some(gc),
             scratch: None,
             pixmaps: Vec::new(),
+            damage_leases: Vec::new(),
+            damage_registry: HashMap::new(),
+            pending_damage: HashSet::new(),
             snapshot: None,
             signal,
             state: SceneState::PlaceholderReady,
@@ -935,7 +1040,7 @@ impl<'a> SceneSession<'a> {
         let mut session = Self::acquire(connection, expected_root)?;
         let operation = session
             .prepare_scene()
-            .and_then(|_| session.wait_live_structural());
+            .and_then(|_| session.wait_live_pixel());
         debug_assert!(coordinator_requires_cleanup(session.state));
         let cleanup = session.cleanup();
         match (operation, cleanup) {
@@ -978,7 +1083,15 @@ impl<'a> SceneSession<'a> {
         let gc = self.gc.as_ref().ok_or("scene GC is unavailable")?;
         scratch.clear(gc.gc)?;
         let mut pixmaps = Vec::new();
+        let mut damage_leases = Vec::new();
+        let mut damage_registry = HashMap::new();
         for entry in &snapshot.entries {
+            if damage_monitoring_enabled(entry) {
+                let damage = DamageLease::acquire(self.connection, entry.surface_xid)?;
+                damage.subtract()?;
+                damage_registry.insert(damage.damage_xid, entry.surface_xid);
+                damage_leases.push(damage);
+            }
             let pixmap = NamedSurfacePixmap::acquire(
                 self.connection,
                 entry,
@@ -993,6 +1106,13 @@ impl<'a> SceneSession<'a> {
                 pixmaps.push(pixmap);
                 continue;
             }
+            pixmaps.push(pixmap);
+        }
+        self.connection.inner.get_input_focus()?.reply()?;
+        for (entry, pixmap) in snapshot.entries.iter().zip(pixmaps.iter()) {
+            if entry.backend == BackendCompatibility::BackendUnsupported {
+                continue;
+            }
             let plan = pixmap.copy_plan(root_geometry).ok_or_else(|| {
                 format!(
                     "surface 0x{:08x} has no visible copy intersection or valid coordinates",
@@ -1001,7 +1121,6 @@ impl<'a> SceneSession<'a> {
             })?;
             let scratch_drawable = scratch.pixmap;
             gc.copy(pixmap.pixmap_xid, scratch_drawable, plan)?;
-            pixmaps.push(pixmap);
         }
         self.state = SceneState::NamedPixmapsReady;
         println!("state: NamedPixmapsReady surfaces={}", pixmaps.len());
@@ -1010,6 +1129,8 @@ impl<'a> SceneSession<'a> {
             snapshot,
             scratch,
             pixmaps,
+            damage_leases,
+            damage_registry,
             watch_ids,
             watch_additions,
         })
@@ -1018,7 +1139,7 @@ impl<'a> SceneSession<'a> {
     fn rebuild_and_present(&mut self) -> Result<(), Box<dyn Error>> {
         for attempt in 0..=MAX_CANDIDATE_RETRIES {
             let candidate = self.build_candidate()?;
-            let gate = match self.pre_commit_gate(&candidate) {
+            let (gate, deferred_damage) = match self.pre_commit_gate(&candidate) {
                 Ok(gate) => gate,
                 Err(error) => {
                     self.structure_watches.rollback(&candidate.watch_additions)?;
@@ -1028,6 +1149,8 @@ impl<'a> SceneSession<'a> {
             match gate {
                 GateDecision::Accept => {
                     self.commit_candidate(candidate)?;
+                    self.pending_damage.extend(deferred_damage);
+                    self.retain_current_pending();
                     return Ok(());
                 }
                 GateDecision::Shutdown(reason) => {
@@ -1035,10 +1158,14 @@ impl<'a> SceneSession<'a> {
                     return Err(format!("candidate aborted by shutdown: {reason:?}").into());
                 }
                 GateDecision::Retry(invalidation) if retry_allowed(attempt) => {
+                    self.pending_damage.extend(deferred_damage);
+                    self.retain_current_pending();
                     self.structure_watches.rollback(&candidate.watch_additions)?;
                     println!("candidate stale; bounded retry: {invalidation:?}");
                 }
                 GateDecision::Retry(invalidation) => {
+                    self.pending_damage.extend(deferred_damage);
+                    self.retain_current_pending();
                     self.structure_watches.rollback(&candidate.watch_additions)?;
                     if old_scene_safe(invalidation) {
                         return Err(format!(
@@ -1059,7 +1186,7 @@ impl<'a> SceneSession<'a> {
     fn pre_commit_gate(
         &mut self,
         candidate: &SceneCandidate<'_>,
-    ) -> Result<GateDecision, Box<dyn Error>> {
+    ) -> Result<(GateDecision, HashSet<damage::Damage>), Box<dyn Error>> {
         self.connection.inner.get_input_focus()?.reply()?;
         let mut batch = InvalidationBatch::default();
         let mut drained = 0;
@@ -1068,30 +1195,34 @@ impl<'a> SceneSession<'a> {
                 break;
             };
             drained += 1;
-            batch.push(classify_event(
+            batch.push(classify_event_with_registries(
                 event,
                 self.root,
                 &candidate.snapshot,
                 self.ownership.as_ref(),
+                &self.damage_registry,
+                &candidate.damage_registry,
             ));
         }
         let batch_decision = batch.decision();
+        let deferred_damage = batch.pixel_damage().clone();
         let ownership_verified = self.verify_ownership().is_ok();
         if !ownership_verified {
-            return Ok(gate_decision_after_batch(
+            return Ok((gate_decision_after_batch(
                 batch_decision,
                 bounded_batch_requires_retry(drained),
                 false,
                 false,
-            ));
+            ), deferred_damage));
         }
         let signal_pending = self.signal.poll_shutdown_pending()?;
-        Ok(gate_decision_after_batch(
+        let decision = candidate_gate_decision(
             batch_decision,
             bounded_batch_requires_retry(drained),
-            guards_allow_retry(true, signal_pending),
+            true,
             signal_pending,
-        ))
+        );
+        Ok((decision, deferred_damage))
     }
 
     fn commit_candidate(&mut self, candidate: SceneCandidate<'a>) -> Result<(), Box<dyn Error>> {
@@ -1132,42 +1263,66 @@ impl<'a> SceneSession<'a> {
         let snapshot = candidate.snapshot;
         let old_scratch = self.scratch.replace(candidate.scratch);
         let old_pixmaps = std::mem::replace(&mut self.pixmaps, candidate.pixmaps);
+        let old_damage_leases = std::mem::replace(&mut self.damage_leases, candidate.damage_leases);
+        self.damage_registry = candidate.damage_registry;
         self.snapshot = Some(snapshot);
         self.structure_watches.reconcile(&candidate.watch_ids)?;
-        drop(old_scratch);
+        for damage in &old_damage_leases {
+            damage.destroy()?;
+        }
         drop(old_pixmaps);
-        self.state = SceneState::RunningLiveStructural;
+        drop(old_scratch);
+        self.retain_current_pending();
+        self.state = SceneState::RunningLivePixel;
         println!("state: ScenePresented (MANUAL active, X11 CopyArea instrument)");
-        println!("state: RunningLiveStructural");
+        println!("state: RunningLivePixel");
         Ok(())
     }
 
-    fn wait_live_structural(&mut self) -> Result<(), Box<dyn Error>> {
+    fn retain_current_pending(&mut self) {
+        self.pending_damage
+            .retain(|damage_id| self.damage_registry.contains_key(damage_id));
+    }
+
+    fn wait_live_pixel(&mut self) -> Result<(), Box<dyn Error>> {
         loop {
-            let first = match wait_for_event_or_shutdown(self.connection, &mut self.signal)? {
-                WaitResult::Event(event) => event,
-                WaitResult::Shutdown => {
-                    println!("scene shutdown: Signal");
-                    return Ok(());
-                }
-            };
             let mut batch = InvalidationBatch::default();
-            batch.push(classify_event(
-                first,
-                self.root,
-                self.current_snapshot(),
-                self.ownership.as_ref(),
-            ));
-            for _ in 1..MAX_EVENTS_PER_BATCH {
-                let Some(event) = self.connection.inner.poll_for_event()? else {
-                    break;
+            let pending = std::mem::take(&mut self.pending_damage);
+            let had_pending_work = pending_work_requires_iteration(&pending);
+            for damage_id in pending {
+                if self.damage_registry.contains_key(&damage_id) {
+                    batch.push(SceneInvalidation::PixelDamage(damage_id));
+                }
+            }
+            if batch.decision() == SceneInvalidation::Ignore && !had_pending_work {
+                let first = match wait_for_event_or_shutdown(self.connection, &mut self.signal)? {
+                    WaitResult::Event(event) => event,
+                    WaitResult::Shutdown => {
+                        println!("scene shutdown: Signal");
+                        return Ok(());
+                    }
                 };
-                batch.push(classify_event(
-                    event,
+                batch.push(classify_event_with_registries(
+                    first,
                     self.root,
                     self.current_snapshot(),
                     self.ownership.as_ref(),
+                    &self.damage_registry,
+                    &self.damage_registry,
                 ));
+                for _ in 1..MAX_EVENTS_PER_BATCH {
+                    let Some(event) = self.connection.inner.poll_for_event()? else {
+                        break;
+                    };
+                    batch.push(classify_event_with_registries(
+                        event,
+                        self.root,
+                        self.current_snapshot(),
+                        self.ownership.as_ref(),
+                        &self.damage_registry,
+                        &self.damage_registry,
+                    ));
+                }
             }
             if self.signal.poll_shutdown_pending()? {
                 println!("scene shutdown: Signal");
@@ -1180,10 +1335,145 @@ impl<'a> SceneSession<'a> {
                     return Ok(());
                 }
                 SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy => {
+                    self.pending_damage.clear();
                     self.rebuild_and_present()?;
+                }
+                SceneInvalidation::PixelDamage(_) => {
+                    self.recompose_current_scene(batch.pixel_damage().clone())?;
                 }
             }
         }
+    }
+
+    fn recompose_current_scene(
+        &mut self,
+        touched_damage: HashSet<damage::Damage>,
+    ) -> Result<(), Box<dyn Error>> {
+        let touched_damage = touched_damage
+            .into_iter()
+            .filter(|damage_id| self.damage_registry.contains_key(damage_id))
+            .collect::<HashSet<_>>();
+        if touched_damage.is_empty() {
+            return Ok(());
+        }
+        for damage_id in subtract_plan(&touched_damage) {
+            self.damage_lease(damage_id)?.subtract()?;
+        }
+        self.connection.inner.get_input_focus()?.reply()?;
+        let post_subtract = self.drain_current_events()?;
+        self.pending_damage.extend(post_subtract.pixel_damage().iter().copied());
+        match post_subtract.decision() {
+            SceneInvalidation::Shutdown(reason) => {
+                println!("scene shutdown: {reason:?}");
+                return Ok(());
+            }
+            SceneInvalidation::Hierarchy | SceneInvalidation::Geometry(_) => {
+                self.pending_damage.clear();
+                return self.rebuild_and_present();
+            }
+            SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => {}
+        }
+        self.full_recompose_current()?;
+        self.connection.inner.get_input_focus()?.reply()?;
+        let final_gate = self.drain_current_events()?;
+        self.pending_damage.extend(final_gate.pixel_damage().iter().copied());
+        let ownership_ok = self.verify_ownership().is_ok();
+        if !ownership_ok {
+            println!("scene shutdown: OwnershipLost");
+            return Ok(());
+        }
+        if self.signal.poll_shutdown_pending()? {
+            println!("scene shutdown: Signal");
+            return Ok(());
+        }
+        if pixel_gate_allows_presentation(final_gate.decision(), ownership_ok, false) {
+            return self.present_current_scratch();
+        }
+        match final_gate.decision() {
+            SceneInvalidation::Shutdown(reason) => {
+                println!("scene shutdown: {reason:?}");
+                Ok(())
+            }
+            SceneInvalidation::Hierarchy | SceneInvalidation::Geometry(_) => {
+                self.pending_damage.clear();
+                self.rebuild_and_present()
+            }
+            SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => Ok(()),
+        }
+    }
+
+    fn drain_current_events(&self) -> Result<InvalidationBatch, Box<dyn Error>> {
+        let mut batch = InvalidationBatch::default();
+        for _ in 0..MAX_EVENTS_PER_BATCH {
+            let Some(event) = self.connection.inner.poll_for_event()? else {
+                break;
+            };
+            batch.push(classify_event_with_registries(
+                event,
+                self.root,
+                self.current_snapshot(),
+                self.ownership.as_ref(),
+                &self.damage_registry,
+                &self.damage_registry,
+            ));
+        }
+        Ok(batch)
+    }
+
+    fn damage_lease(
+        &self,
+        damage_id: damage::Damage,
+    ) -> Result<&DamageLease<'a>, Box<dyn Error>> {
+        self.damage_leases
+            .iter()
+            .find(|lease| lease.damage_xid == damage_id)
+            .ok_or_else(|| format!("current DamageLease is unavailable: 0x{damage_id:08x}").into())
+    }
+
+    fn full_recompose_current(&self) -> Result<(), Box<dyn Error>> {
+        let scratch = self.scratch.as_ref().ok_or("scratch is unavailable")?;
+        let gc = self.gc.as_ref().ok_or("scene GC is unavailable")?;
+        scratch.clear(gc.gc)?;
+        for (entry, pixmap) in self
+            .current_snapshot()
+            .entries
+            .iter()
+            .zip(self.pixmaps.iter())
+        {
+            if entry.backend == BackendCompatibility::BackendUnsupported {
+                continue;
+            }
+            let plan = pixmap.copy_plan(self.current_snapshot().root_geometry).ok_or_else(|| {
+                format!(
+                    "surface 0x{:08x} has no visible copy intersection or valid coordinates",
+                    entry.surface_xid
+                )
+            })?;
+            gc.copy(pixmap.pixmap_xid, scratch.pixmap, plan)?;
+        }
+        Ok(())
+    }
+
+    fn present_current_scratch(&self) -> Result<(), Box<dyn Error>> {
+        let overlay = self.overlay.as_ref().ok_or("overlay is unavailable")?.overlay;
+        let scratch = self.scratch.as_ref().ok_or("scratch is unavailable")?;
+        let gc = self.gc.as_ref().ok_or("scene GC is unavailable")?;
+        let geometry = self.current_snapshot().root_geometry;
+        gc.copy(
+            scratch.pixmap,
+            overlay,
+            CopyPlan {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 0,
+                dst_y: 0,
+                width: geometry.width,
+                height: geometry.height,
+            },
+        )?;
+        self.connection.inner.flush()?;
+        self.connection.inner.get_input_focus()?.reply()?;
+        Ok(())
     }
 
     fn current_snapshot(&self) -> &SceneSnapshot {
@@ -1234,17 +1524,25 @@ impl<'a> SceneSession<'a> {
             return Err(first_error.expect("manual cleanup failure must have an error"));
         }
         self.manual.take();
-        if let Some(scratch) = self.scratch.take() {
-            if let Err(error) = scratch.free() {
+        for damage in &self.damage_leases {
+            if let Err(error) = damage.destroy() {
                 first_error.get_or_insert(error);
             }
         }
+        self.damage_leases.clear();
+        self.damage_registry.clear();
+        self.pending_damage.clear();
         for pixmap in &self.pixmaps {
             if let Err(error) = pixmap.free() {
                 first_error.get_or_insert(error);
             }
         }
         self.pixmaps.clear();
+        if let Some(scratch) = self.scratch.take() {
+            if let Err(error) = scratch.free() {
+                first_error.get_or_insert(error);
+            }
+        }
         if let Some(gc) = self.gc.take() {
             if let Err(error) = gc.free() {
                 first_error.get_or_insert(error);
@@ -1289,6 +1587,12 @@ impl<'a> SceneSession<'a> {
         if let Some(gc) = self.gc.take() {
             gc.disarm_cleanup();
         }
+        for damage in &self.damage_leases {
+            damage.disarm_cleanup();
+        }
+        self.damage_leases.clear();
+        self.damage_registry.clear();
+        self.pending_damage.clear();
         self.structure_watches.disarm_cleanup();
         if let Some(mut watch) = self.root_watch.take() {
             watch.disarm_cleanup();
@@ -1310,6 +1614,26 @@ fn root_guard(expected: Window, actual: Window) -> Result<(), Box<dyn Error>> {
         .into());
     }
     Ok(())
+}
+
+fn ensure_damage_version(connection: &X11Connection) -> Result<(), Box<dyn Error>> {
+    let version = connection.inner.damage_query_version(1, 1)?.reply()?;
+    println!(
+        "XDamage version: {}.{}",
+        version.major_version, version.minor_version
+    );
+    if !damage_version_compatible(version.major_version, version.minor_version) {
+        return Err("XDamage 1.0 or newer is required for live pixel damage".into());
+    }
+    Ok(())
+}
+
+fn damage_version_compatible(major: u32, _minor: u32) -> bool {
+    major >= 1
+}
+
+fn damage_monitoring_enabled(entry: &SurfaceEntry) -> bool {
+    entry.backend == BackendCompatibility::Renderable
 }
 
 fn is_internal_xid(xid: Window, overlay: Window, owner_window: Window) -> bool {
@@ -1348,11 +1672,30 @@ fn canonical_live_event_mask(previous: EventMask) -> EventMask {
     previous | EventMask::STRUCTURE_NOTIFY
 }
 
+#[cfg(test)]
 fn classify_event(
     event: Event,
     root: Window,
     snapshot: &SceneSnapshot,
     ownership: Option<&CompositorOwnership>,
+) -> SceneInvalidation {
+    classify_event_with_registries(
+        event,
+        root,
+        snapshot,
+        ownership,
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+}
+
+fn classify_event_with_registries(
+    event: Event,
+    root: Window,
+    snapshot: &SceneSnapshot,
+    ownership: Option<&CompositorOwnership>,
+    current_registry: &HashMap<damage::Damage, Window>,
+    candidate_registry: &HashMap<damage::Damage, Window>,
 ) -> SceneInvalidation {
     match event {
         Event::SelectionClear(event)
@@ -1372,6 +1715,12 @@ fn classify_event(
             SceneInvalidation::Geometry(event.window)
         }
         Event::ConfigureNotify(_) => SceneInvalidation::Hierarchy,
+        Event::DamageNotify(event)
+            if current_registry.contains_key(&event.damage)
+                || candidate_registry.contains_key(&event.damage) =>
+        {
+            SceneInvalidation::PixelDamage(event.damage)
+        }
         Event::CreateNotify(_)
         | Event::MapNotify(_)
         | Event::UnmapNotify(_)
@@ -1387,7 +1736,7 @@ fn old_scene_safe(invalidation: SceneInvalidation) -> bool {
     match invalidation {
         // A structural or geometry event is evidence that the published
         // pixels may no longer describe current X11 state.
-        SceneInvalidation::Ignore => true,
+        SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => true,
         SceneInvalidation::Geometry(_)
         | SceneInvalidation::Hierarchy
         | SceneInvalidation::Shutdown(_) => false,
@@ -1404,6 +1753,47 @@ fn retry_allowed(attempt: usize) -> bool {
 
 fn guards_allow_retry(ownership_verified: bool, signal_pending: bool) -> bool {
     ownership_verified && !signal_pending
+}
+
+fn pixel_gate_allows_presentation(
+    invalidation: SceneInvalidation,
+    ownership_verified: bool,
+    signal_pending: bool,
+) -> bool {
+    ownership_verified
+        && !signal_pending
+        && matches!(invalidation, SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_))
+}
+
+fn candidate_gate_decision(
+    batch: SceneInvalidation,
+    overflow: bool,
+    ownership_verified: bool,
+    signal_pending: bool,
+) -> GateDecision {
+    if matches!(batch, SceneInvalidation::PixelDamage(_)) && !overflow {
+        if !guards_allow_retry(ownership_verified, signal_pending) {
+            if !ownership_verified {
+                return GateDecision::Shutdown(ShutdownReason::OwnershipLost);
+            }
+            return GateDecision::Shutdown(ShutdownReason::Signal);
+        }
+        return GateDecision::Accept;
+    }
+    gate_decision_after_batch(
+        batch,
+        overflow,
+        ownership_verified,
+        signal_pending,
+    )
+}
+
+fn pending_work_requires_iteration(pending: &HashSet<damage::Damage>) -> bool {
+    !pending.is_empty()
+}
+
+fn subtract_plan(touched: &HashSet<damage::Damage>) -> Vec<damage::Damage> {
+    touched.iter().copied().collect()
 }
 
 fn gate_decision_after_batch(
@@ -1450,20 +1840,23 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::{
         build_copy_plan, classify_event, coordinator_requires_cleanup, eligible_surface,
         is_internal_xid, old_scene_safe, root_guard, BackendCompatibility, CopyPlan,
         PixmapGeometry, RootGeometry,
-        bounded_batch_requires_retry, gate_decision_after_batch, guards_allow_retry, GateDecision,
-        retry_allowed, watch_plan, InvalidationBatch, SceneInvalidation, SceneSnapshot,
+        bounded_batch_requires_retry, candidate_gate_decision, damage_monitoring_enabled,
+        damage_version_compatible, gate_decision_after_batch, guards_allow_retry, GateDecision,
+        pending_work_requires_iteration, pixel_gate_allows_presentation,
+        retry_allowed, subtract_plan, watch_plan, InvalidationBatch, SceneInvalidation, SceneSnapshot,
         root_live_event_mask, canonical_live_event_mask, snapshot_watch_ids, SceneState,
         ShutdownReason, SurfaceEntry, MAX_CANDIDATE_RETRIES, MAX_EVENTS_PER_BATCH,
     };
     use crate::x11::capture::WindowGeometry;
     use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
-    use x11rb::protocol::xproto::{EventMask, MapState, WindowClass};
+    use x11rb::protocol::damage::ReportLevel;
+    use x11rb::protocol::xproto::{EventMask, MapState, Rectangle, WindowClass};
     use x11rb::protocol::Event;
 
     fn root() -> RootGeometry {
@@ -1511,6 +1904,19 @@ mod tests {
             window_type: None,
             role: crate::x11::capture::WindowRole::Unknown,
         }
+    }
+
+    fn damage_event(damage: u32) -> Event {
+        Event::DamageNotify(x11rb::protocol::damage::NotifyEvent {
+            response_type: 0,
+            level: ReportLevel::NON_EMPTY,
+            sequence: 0,
+            drawable: 10,
+            damage,
+            timestamp: 0,
+            area: Rectangle { x: 0, y: 0, width: 1, height: 1 },
+            geometry: Rectangle { x: 0, y: 0, width: 20, height: 20 },
+        })
     }
 
     #[test]
@@ -1731,6 +2137,129 @@ mod tests {
             batch.decision(),
             SceneInvalidation::Shutdown(ShutdownReason::RootConfigure)
         );
+    }
+
+    #[test]
+    fn current_damage_notify_resolves_to_pixel_damage() {
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: Vec::new() };
+        let registry = HashMap::from([(42_u32, 10_u32)]);
+        assert_eq!(
+            super::classify_event_with_registries(
+                damage_event(42), 1, &snapshot, None, &registry, &HashMap::new()
+            ),
+            SceneInvalidation::PixelDamage(42)
+        );
+    }
+
+    #[test]
+    fn stale_and_unknown_damage_notify_are_ignored() {
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: Vec::new() };
+        let registry = HashMap::from([(42_u32, 10_u32)]);
+        assert_eq!(
+            super::classify_event_with_registries(
+                damage_event(41), 1, &snapshot, None, &registry, &HashMap::new()
+            ),
+            SceneInvalidation::Ignore
+        );
+    }
+
+    #[test]
+    fn damage_id_resolution_never_uses_semantic_client() {
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: Vec::new() };
+        let registry = HashMap::from([(42_u32, 10_u32)]);
+        assert_eq!(
+            super::classify_event_with_registries(
+                damage_event(20), 1, &snapshot, None, &registry, &HashMap::new()
+            ),
+            SceneInvalidation::Ignore
+        );
+    }
+
+    #[test]
+    fn damage_batch_deduplicates_touched_leases() {
+        let mut batch = InvalidationBatch::default();
+        batch.push(SceneInvalidation::PixelDamage(42));
+        batch.push(SceneInvalidation::PixelDamage(42));
+        assert_eq!(batch.pixel_damage().len(), 1);
+    }
+
+    #[test]
+    fn subtract_plan_has_one_operation_per_current_damage_id() {
+        let touched = HashSet::from([41_u32, 42_u32, 42_u32]);
+        let plan = subtract_plan(&touched);
+        assert_eq!(plan.len(), 2);
+        assert!(plan.contains(&41));
+        assert!(plan.contains(&42));
+    }
+
+    #[test]
+    fn structural_dominance_hides_pixel_damage_without_dropping_batch_data() {
+        let mut batch = InvalidationBatch::default();
+        batch.push(SceneInvalidation::PixelDamage(42));
+        batch.push(SceneInvalidation::Geometry(10));
+        assert_eq!(batch.decision(), SceneInvalidation::Geometry(10));
+        assert!(batch.pixel_damage().contains(&42));
+        batch.push(SceneInvalidation::Hierarchy);
+        assert_eq!(batch.decision(), SceneInvalidation::Hierarchy);
+        batch.push(SceneInvalidation::Shutdown(ShutdownReason::Signal));
+        assert_eq!(batch.decision(), SceneInvalidation::Shutdown(ShutdownReason::Signal));
+    }
+
+    #[test]
+    fn candidate_pixel_gate_accepts_without_retry() {
+        assert_eq!(
+            candidate_gate_decision(SceneInvalidation::PixelDamage(42), false, true, false),
+            GateDecision::Accept
+        );
+        assert_eq!(
+            candidate_gate_decision(SceneInvalidation::PixelDamage(42), false, true, true),
+            GateDecision::Shutdown(ShutdownReason::Signal)
+        );
+    }
+
+    #[test]
+    fn pixel_damage_gate_does_not_block_presentation() {
+        assert!(pixel_gate_allows_presentation(
+            SceneInvalidation::PixelDamage(42), true, false
+        ));
+        assert!(!pixel_gate_allows_presentation(
+            SceneInvalidation::Hierarchy, true, false
+        ));
+        assert!(!pixel_gate_allows_presentation(
+            SceneInvalidation::PixelDamage(42), true, true
+        ));
+    }
+
+    #[test]
+    fn pending_damage_requires_immediate_iteration() {
+        assert!(pending_work_requires_iteration(&HashSet::from([42_u32])));
+        assert!(!pending_work_requires_iteration(&HashSet::new()));
+    }
+
+    #[test]
+    fn damage_version_policy_accepts_one_zero_and_newer() {
+        assert!(damage_version_compatible(1, 0));
+        assert!(damage_version_compatible(1, 1));
+        assert!(damage_version_compatible(2, 0));
+        assert!(!damage_version_compatible(0, 9));
+    }
+
+    #[test]
+    fn backend_unsupported_has_no_pixel_monitoring_subscription() {
+        let mut unsupported = metadata();
+        unsupported.depth = 32;
+        let entry = eligible_surface(&unsupported, None, root(), 10, 0).unwrap();
+        assert!(!damage_monitoring_enabled(&entry));
+        let renderable = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        assert!(damage_monitoring_enabled(&renderable));
+    }
+
+    #[test]
+    fn current_scene_pixel_path_does_not_change_identity_policy() {
+        let mut entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        entry.semantic_client_xid = Some(99);
+        assert_eq!(entry.surface_xid, 10);
+        assert_eq!(entry.lifecycle_xid, 10);
     }
 
     #[test]
