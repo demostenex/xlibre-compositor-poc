@@ -277,16 +277,16 @@ fn mark_release_confirmed(state: &mut ReleaseState) {
     }
 }
 
-struct OverlayLease<'a> {
+pub(crate) struct OverlayLease<'a> {
     connection: &'a X11Connection,
     root: u32,
-    overlay: u32,
+    pub(crate) overlay: u32,
     input_passthrough_applied: bool,
     release_state: ReleaseState,
 }
 
 impl<'a> OverlayLease<'a> {
-    fn acquire(connection: &'a X11Connection, root: u32) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn acquire(connection: &'a X11Connection, root: u32) -> Result<Self, Box<dyn Error>> {
         let overlay = connection
             .inner
             .composite_get_overlay_window(root)?
@@ -302,7 +302,7 @@ impl<'a> OverlayLease<'a> {
         })
     }
 
-    fn print_metadata(&self) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn print_metadata(&self) -> Result<(), Box<dyn Error>> {
         let screen = &self.connection.inner.setup().roots[self.connection.screen_num()];
         let root_geometry = self.connection.inner.get_geometry(screen.root)?.reply()?;
         let overlay_geometry = self.connection.inner.get_geometry(self.overlay)?.reply()?;
@@ -380,7 +380,7 @@ impl<'a> OverlayLease<'a> {
             .map_err(|error| format!("overlay metadata validation failed: {error}" ).into())
     }
 
-    fn configure_input_passthrough(&mut self) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn configure_input_passthrough(&mut self) -> Result<(), Box<dyn Error>> {
         let region = self.connection.inner.generate_id()?;
         self.connection
             .inner
@@ -412,7 +412,7 @@ impl<'a> OverlayLease<'a> {
         Ok(())
     }
 
-    fn restore_input_shape(&mut self) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn restore_input_shape(&mut self) -> Result<(), Box<dyn Error>> {
         if !self.input_passthrough_applied {
             return Ok(());
         }
@@ -435,7 +435,7 @@ impl<'a> OverlayLease<'a> {
         self.release_overlay()
     }
 
-    fn release_overlay(&mut self) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn release_overlay(&mut self) -> Result<(), Box<dyn Error>> {
         if self.release_state != ReleaseState::Active {
             return Ok(());
         }
@@ -449,6 +449,11 @@ impl<'a> OverlayLease<'a> {
         self.connection.inner.flush()?;
         mark_release_confirmed(&mut self.release_state);
         Ok(())
+    }
+
+    pub(crate) fn disarm_cleanup(&mut self) {
+        self.input_passthrough_applied = false;
+        self.release_state = ReleaseState::Released;
     }
 }
 

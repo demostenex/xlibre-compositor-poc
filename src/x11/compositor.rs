@@ -271,6 +271,10 @@ impl CompositorOwnership {
         self.active.set(false);
         Ok(())
     }
+
+    pub(crate) fn disarm_cleanup(&self) {
+        self.active.set(false);
+    }
 }
 
 impl RedirectedWindow {
