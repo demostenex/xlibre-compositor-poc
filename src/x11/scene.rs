@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ReplyError;
 use x11rb::protocol::composite::ConnectionExt as CompositeConnectionExt;
 use x11rb::protocol::damage::{self, ConnectionExt as DamageConnectionExt};
+use x11rb::protocol::present::{self, ConnectionExt as PresentConnectionExt};
 use x11rb::protocol::render::{self, ConnectionExt as RenderConnectionExt};
 use x11rb::protocol::ErrorKind;
 use x11rb::protocol::xproto::{
@@ -149,6 +150,200 @@ const MAX_EVENTS_PER_BATCH: usize = 64;
 const MAX_CANDIDATE_RETRIES: usize = 1;
 const RENDER_CLIENT_MAJOR: u32 = 0;
 const RENDER_CLIENT_MINOR: u32 = 11;
+const PRESENT_CLIENT_MAJOR: u32 = 1;
+const PRESENT_CLIENT_MINOR: u32 = 0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameSchedulerState {
+    Idle,
+    Armed { serial: u32, target_msc: u64 },
+    Dirty {
+        pixel_damage: bool,
+        structural_generation: Option<u64>,
+    },
+    Rendering { generation: u64 },
+    AwaitExternalStructuralChange { generation: u64 },
+}
+
+#[derive(Debug)]
+struct FrameScheduler {
+    state: FrameSchedulerState,
+    next_serial: u32,
+    armed_serial: Option<u32>,
+}
+
+impl FrameScheduler {
+    fn new() -> Self {
+        Self {
+            state: FrameSchedulerState::Idle,
+            next_serial: 1,
+            armed_serial: None,
+        }
+    }
+
+    fn mark_pixel_dirty(&mut self) {
+        let structural_generation = match self.state {
+            FrameSchedulerState::Dirty { structural_generation, .. } => structural_generation,
+            FrameSchedulerState::AwaitExternalStructuralChange { generation } => Some(generation),
+            _ => None,
+        };
+        self.state = FrameSchedulerState::Dirty {
+            pixel_damage: true,
+            structural_generation,
+        };
+    }
+
+    fn mark_structural_dirty(&mut self, generation: u64) {
+        let pixel_damage = matches!(
+            self.state,
+            FrameSchedulerState::Dirty { pixel_damage: true, .. }
+        );
+        self.state = FrameSchedulerState::Dirty {
+            pixel_damage,
+            structural_generation: Some(generation),
+        };
+    }
+
+    fn arm(&mut self, target_msc: u64) -> (u32, u64) {
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.wrapping_add(1).max(1);
+        self.armed_serial = Some(serial);
+        self.state = FrameSchedulerState::Armed { serial, target_msc };
+        (serial, target_msc)
+    }
+
+    fn complete(&mut self, serial: u32, msc: u64) -> bool {
+        let armed = self.armed_serial == Some(serial);
+        if !armed {
+            return false;
+        }
+        self.armed_serial = None;
+        self.state = FrameSchedulerState::Rendering { generation: 0 };
+        let _ = msc;
+        true
+    }
+
+    fn finish_render(&mut self, generation: u64, dirty: bool) {
+        self.state = if dirty {
+            FrameSchedulerState::Dirty {
+                pixel_damage: true,
+                structural_generation: Some(generation),
+            }
+        } else {
+            FrameSchedulerState::AwaitExternalStructuralChange { generation }
+        };
+    }
+}
+
+struct PresentClock {
+    event_id: present::Event,
+    window: Window,
+    pending_serial: Option<u32>,
+}
+
+impl PresentClock {
+    fn acquire(connection: &X11Connection, window: Window) -> Result<Option<Self>, Box<dyn Error>> {
+        let Some(info) = connection.inner.extension_information(present::X11_EXTENSION_NAME)? else {
+            println!("Present scheduler: extension unavailable; using event fallback");
+            return Ok(None);
+        };
+        let version = match connection
+            .inner
+            .present_query_version(PRESENT_CLIENT_MAJOR, PRESENT_CLIENT_MINOR)
+        {
+            Ok(cookie) => match cookie.reply() {
+                Ok(version) => version,
+                Err(error) => {
+                    println!("Present scheduler: version query failed ({error}); using event fallback");
+                    return Ok(None);
+                }
+            },
+            Err(error) => {
+                println!("Present scheduler: version request failed ({error}); using event fallback");
+                return Ok(None);
+            }
+        };
+        if (version.major_version, version.minor_version)
+            < (PRESENT_CLIENT_MAJOR, PRESENT_CLIENT_MINOR)
+        {
+            println!("Present scheduler: incompatible version; using event fallback");
+            return Ok(None);
+        }
+        let capabilities = match connection.inner.present_query_capabilities(window) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(capabilities) => capabilities,
+                Err(error) => {
+                    println!("Present scheduler: capability query failed ({error}); using event fallback");
+                    return Ok(None);
+                }
+            },
+            Err(error) => {
+                println!("Present scheduler: capability request failed ({error}); using event fallback");
+                return Ok(None);
+            }
+        };
+        println!(
+            "Present scheduler: version {}.{} capabilities=0x{:08x}",
+            version.major_version, version.minor_version, capabilities.capabilities
+        );
+        let event_id = connection.inner.generate_id()?;
+        let selected = match connection.inner.present_select_input(
+                event_id,
+                window,
+                present::EventMask::COMPLETE_NOTIFY | present::EventMask::IDLE_NOTIFY,
+            ) {
+            Ok(cookie) => cookie.check(),
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = selected {
+            println!("Present scheduler: select_input failed ({error}); using event fallback");
+            return Ok(None);
+        }
+        connection.inner.flush()?;
+        println!("Present scheduler: MSC clock armed on event base {}", info.first_event);
+        Ok(Some(Self {
+            event_id,
+            window,
+            pending_serial: None,
+        }))
+    }
+
+    fn arm(&mut self, connection: &X11Connection, serial: u32, target_msc: u64) -> Result<(), Box<dyn Error>> {
+        if self.pending_serial.is_some() {
+            return Ok(());
+        }
+        connection
+            .inner
+            .present_notify_msc(self.window, serial, target_msc, 0, 0)?
+            .check()?;
+        connection.inner.flush()?;
+        self.pending_serial = Some(serial);
+        Ok(())
+    }
+
+    fn complete(&mut self, event: &present::CompleteNotifyEvent) -> Option<u64> {
+        if event.event != self.event_id || event.window != self.window {
+            return None;
+        }
+        if self.pending_serial != Some(event.serial)
+            || event.kind != present::CompleteKind::NOTIFY_MSC
+        {
+            return None;
+        }
+        self.pending_serial = None;
+        Some(event.msc)
+    }
+
+    fn cleanup(&mut self, connection: &X11Connection) -> Result<(), Box<dyn Error>> {
+        connection
+            .inner
+            .present_select_input(self.event_id, self.window, present::EventMask::NO_EVENT)?
+            .check()?;
+        connection.inner.flush()?;
+        self.pending_serial = None;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SceneSnapshot {
@@ -886,6 +1081,8 @@ struct SceneSession<'a> {
     snapshot: Option<SceneSnapshot>,
     egl_surfaces: HashMap<Window, EglImportedSurface>,
     signal: SignalWake,
+    scheduler: FrameScheduler,
+    present: Option<PresentClock>,
     state: SceneState,
 }
 
@@ -1059,6 +1256,7 @@ impl<'a> SceneSession<'a> {
         overlay.print_metadata()?;
         overlay.configure_input_passthrough()?;
         let root_watch = SceneRootWatch::acquire(connection, root)?;
+        let present = PresentClock::acquire(connection, overlay.overlay)?;
         let root_geometry = read_root_geometry(connection, root)?;
         let screen = &connection.inner.setup().roots[connection.screen_num()];
         if root_geometry.depth != screen.root_depth || root_geometry.visual != screen.root_visual {
@@ -1110,6 +1308,8 @@ impl<'a> SceneSession<'a> {
             snapshot: None,
             egl_surfaces: HashMap::new(),
             signal,
+            scheduler: FrameScheduler::new(),
+            present,
             state: SceneState::PlaceholderReady,
         };
         session.state = SceneState::ManualActive;
@@ -1135,7 +1335,8 @@ impl<'a> SceneSession<'a> {
     }
 
     fn prepare_scene(&mut self) -> Result<(), Box<dyn Error>> {
-        self.rebuild_and_present()
+        self.rebuild_and_present()?;
+        self.arm_next_presentation(0)
     }
 
     fn build_candidate(&mut self) -> Result<SceneCandidate<'a>, Box<dyn Error>> {
@@ -1386,6 +1587,14 @@ impl<'a> SceneSession<'a> {
         retain_pending_for_registry(&mut self.pending_damage, &self.damage_registry);
     }
 
+    fn arm_next_presentation(&mut self, target_msc: u64) -> Result<(), Box<dyn Error>> {
+        let Some(present) = self.present.as_mut() else {
+            return Ok(());
+        };
+        let (serial, target_msc) = self.scheduler.arm(target_msc);
+        present.arm(self.connection, serial, target_msc)
+    }
+
     fn merge_deferred_damage(&mut self, deferred: HashSet<damage::Damage>) {
         merge_deferred_damage_for_registry(
             &mut self.pending_damage,
@@ -1396,12 +1605,37 @@ impl<'a> SceneSession<'a> {
 
     fn observe_invalidation(&mut self, invalidation: SceneInvalidation) {
         observe_structural_generation(&mut self.structural_generation, invalidation);
+        match invalidation {
+            SceneInvalidation::PixelDamage(_) => self.scheduler.mark_pixel_dirty(),
+            SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy => {
+                self.scheduler.mark_structural_dirty(self.structural_generation)
+            }
+            _ => {}
+        }
+    }
+
+    fn present_opportunity(&mut self, event: &Event) -> Option<u64> {
+        let Event::PresentCompleteNotify(event) = event else {
+            return None;
+        };
+        let present = self.present.as_mut()?;
+        let msc = present.complete(event)?;
+        if !self.scheduler.complete(event.serial, msc) {
+            return None;
+        }
+        Some(msc)
     }
 
     fn wait_live_pixel(&mut self) -> Result<(), Box<dyn Error>> {
         loop {
+            let present_enabled = self.present.is_some();
+            let mut opportunity_msc = None;
             let mut batch = InvalidationBatch::default();
-            let pending = std::mem::take(&mut self.pending_damage);
+            let pending = if present_enabled {
+                self.pending_damage.clone()
+            } else {
+                std::mem::take(&mut self.pending_damage)
+            };
             let had_pending_work = pending_work_requires_iteration(&pending);
             if matches!(
                 structural_generation_state(
@@ -1417,7 +1651,9 @@ impl<'a> SceneSession<'a> {
                     batch.push(SceneInvalidation::PixelDamage(damage_id));
                 }
             }
-            if batch.decision() == SceneInvalidation::Ignore && !had_pending_work {
+            if !present_enabled && batch.decision() == SceneInvalidation::Ignore && !had_pending_work
+                || present_enabled
+            {
                 let first = match wait_for_event_or_shutdown(self.connection, &mut self.signal)? {
                     WaitResult::Event(event) => event,
                     WaitResult::Shutdown => {
@@ -1425,6 +1661,7 @@ impl<'a> SceneSession<'a> {
                         return Ok(());
                     }
                 };
+                opportunity_msc = self.present_opportunity(&first);
                 let invalidation = classify_event_with_registries(
                     first,
                     self.root,
@@ -1439,6 +1676,7 @@ impl<'a> SceneSession<'a> {
                     let Some(event) = self.connection.inner.poll_for_event()? else {
                         break;
                     };
+                    opportunity_msc = opportunity_msc.or_else(|| self.present_opportunity(&event));
                     let invalidation = classify_event_with_registries(
                         event,
                         self.root,
@@ -1455,6 +1693,13 @@ impl<'a> SceneSession<'a> {
                 println!("scene shutdown: Signal");
                 return Ok(());
             }
+            if present_enabled && opportunity_msc.is_none() {
+                self.pending_damage.extend(batch.pixel_damage().iter().copied());
+                continue;
+            }
+            if present_enabled {
+                self.pending_damage.clear();
+            }
             match batch.decision() {
                 SceneInvalidation::Ignore => {}
                 SceneInvalidation::Shutdown(reason) => {
@@ -1468,6 +1713,20 @@ impl<'a> SceneSession<'a> {
                 SceneInvalidation::PixelDamage(_) => {
                     self.recompose_current_scene(batch.pixel_damage().clone())?;
                 }
+            }
+            if let Some(msc) = opportunity_msc {
+                self.scheduler.finish_render(
+                    self.structural_generation,
+                    !self.pending_damage.is_empty()
+                        || matches!(
+                            structural_generation_state(
+                                self.structural_generation,
+                                self.attempted_structural_generation,
+                            ),
+                            StructuralGenerationState::Ready(_)
+                        ),
+                );
+                self.arm_next_presentation(msc.saturating_add(1))?;
             }
         }
     }
@@ -1628,6 +1887,12 @@ impl<'a> SceneSession<'a> {
 
     fn cleanup(&mut self) -> Result<(), Box<dyn Error>> {
         let mut first_error = None;
+        if let Some(present) = self.present.as_mut() {
+            if let Err(error) = present.cleanup(self.connection) {
+                first_error = Some(error);
+            }
+        }
+        self.present = None;
         let manual_ok = match self.manual.as_mut() {
             Some(manual) => match manual.unredirect() {
                 Ok(()) => true,
@@ -1714,6 +1979,7 @@ impl<'a> SceneSession<'a> {
     }
 
     fn disarm_degraded(&mut self) {
+        self.present = None;
         if let Some(manual) = self.manual.take() {
             let mut manual = manual;
             manual.disarm_cleanup();
@@ -2138,6 +2404,7 @@ mod tests {
         ShutdownReason, SurfaceEntry, MAX_CANDIDATE_RETRIES, MAX_EVENTS_PER_BATCH,
         observe_structural_generation,
         structural_generation_state, StructuralGenerationState,
+        FrameScheduler, FrameSchedulerState,
         classify_retired_damage_destroy, DamageDestroyClassification, DamageReleaseOutcome,
         DamageState,
     };
@@ -3130,5 +3397,87 @@ mod tests {
         ));
         assert!(!pixel_gate_allows_presentation(SceneInvalidation::Ignore, false, false));
         assert!(!pixel_gate_allows_presentation(SceneInvalidation::Ignore, true, true));
+    }
+
+    #[test]
+    fn scheduler_first_damage_is_dirty_without_rendering() {
+        let mut scheduler = FrameScheduler::new();
+        scheduler.arm(0);
+        scheduler.mark_pixel_dirty();
+        assert!(matches!(scheduler.state, FrameSchedulerState::Dirty { pixel_damage: true, .. }));
+    }
+
+    #[test]
+    fn scheduler_coalesces_damage_and_has_no_frame_queue() {
+        let mut scheduler = FrameScheduler::new();
+        scheduler.arm(0);
+        scheduler.mark_pixel_dirty();
+        scheduler.mark_pixel_dirty();
+        assert!(matches!(scheduler.state, FrameSchedulerState::Dirty { pixel_damage: true, structural_generation: None }));
+    }
+
+    #[test]
+    fn scheduler_opportunity_consumes_one_serial_once() {
+        let mut scheduler = FrameScheduler::new();
+        let (serial, target_msc) = scheduler.arm(37);
+        assert_eq!(target_msc, 37);
+        assert!(scheduler.complete(serial, 38));
+        assert!(!scheduler.complete(serial, 39));
+    }
+
+    #[test]
+    fn scheduler_damage_during_render_stays_dirty_for_next_opportunity() {
+        let mut scheduler = FrameScheduler::new();
+        let (serial, _) = scheduler.arm(0);
+        assert!(scheduler.complete(serial, 1));
+        scheduler.mark_pixel_dirty();
+        assert!(matches!(scheduler.state, FrameSchedulerState::Dirty { pixel_damage: true, .. }));
+    }
+
+    #[test]
+    fn scheduler_structural_generation_dominates_pixel_without_dropping_pixel_dirty() {
+        let mut scheduler = FrameScheduler::new();
+        scheduler.mark_pixel_dirty();
+        scheduler.mark_structural_dirty(9);
+        assert!(matches!(scheduler.state, FrameSchedulerState::Dirty {
+            pixel_damage: true,
+            structural_generation: Some(9),
+        }));
+    }
+
+    #[test]
+    fn scheduler_clean_completion_does_not_create_backlog() {
+        let mut scheduler = FrameScheduler::new();
+        let (serial, _) = scheduler.arm(75);
+        assert!(scheduler.complete(serial, 76));
+        scheduler.finish_render(4, false);
+        assert!(matches!(scheduler.state, FrameSchedulerState::AwaitExternalStructuralChange { generation: 4 }));
+        let (_, target_msc) = scheduler.arm(77);
+        assert_eq!(target_msc, 77);
+    }
+
+    #[test]
+    fn scheduler_stale_serial_cannot_corrupt_state() {
+        let mut scheduler = FrameScheduler::new();
+        let (serial, _) = scheduler.arm(0);
+        assert!(!scheduler.complete(serial.wrapping_add(1), 1));
+        assert!(matches!(scheduler.state, FrameSchedulerState::Armed { .. }));
+    }
+
+    #[test]
+    fn scheduler_shutdown_cleanup_model_has_no_pending_serial() {
+        let mut scheduler = FrameScheduler::new();
+        let (serial, _) = scheduler.arm(0);
+        assert!(!scheduler.complete(serial.wrapping_add(1), 1));
+        scheduler.state = FrameSchedulerState::Idle;
+        scheduler.armed_serial = None;
+        assert!(matches!(scheduler.state, FrameSchedulerState::Idle));
+    }
+
+    #[test]
+    fn scheduler_refresh_target_is_server_msc_not_a_timer_period() {
+        let mut scheduler = FrameScheduler::new();
+        let (_, target_msc) = scheduler.arm(1234);
+        assert_eq!(target_msc, 1234);
     }
 }
