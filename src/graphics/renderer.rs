@@ -10,6 +10,8 @@ pub struct SceneRenderer {
     buffer: u32,
     corner_radius_uniform: i32,
     surface_size_uniform: i32,
+    border_width_uniform: i32,
+    border_color_uniform: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,7 +174,9 @@ impl SceneRenderer {
         let surface_size_uniform = unsafe {
             gl::GetUniformLocation(program, b"surface_size\0".as_ptr().cast())
         };
-        if corner_radius_uniform < 0 || surface_size_uniform < 0 {
+        let border_width_uniform = unsafe { gl::GetUniformLocation(program, b"border_width\0".as_ptr().cast()) };
+        let border_color_uniform = unsafe { gl::GetUniformLocation(program, b"border_color\0".as_ptr().cast()) };
+        if corner_radius_uniform < 0 || surface_size_uniform < 0 || border_width_uniform < 0 || border_color_uniform < 0 {
             return Err("rounded-corner shader uniforms are unavailable".into());
         }
 
@@ -193,7 +197,7 @@ impl SceneRenderer {
             gl::BindVertexArray(0);
             gl::BindBuffer(gl::ARRAY_BUFFER, 0);
         }
-        Ok(Self { program, vao, buffer, corner_radius_uniform, surface_size_uniform })
+        Ok(Self { program, vao, buffer, corner_radius_uniform, surface_size_uniform, border_width_uniform, border_color_uniform })
     }
 
     pub fn clear(&self) {
@@ -247,6 +251,8 @@ impl SceneRenderer {
             check_gl_error("blend state")?;
             gl::Uniform1f(self.corner_radius_uniform, plan.corner_radius);
             gl::Uniform2f(self.surface_size_uniform, width as f32, height as f32);
+            gl::Uniform1f(self.border_width_uniform, plan.border_width);
+            gl::Uniform4f(self.border_color_uniform, plan.border_color[0], plan.border_color[1], plan.border_color[2], plan.border_color[3]);
             gl::BindVertexArray(self.vao);
             gl::BindBuffer(gl::ARRAY_BUFFER, self.buffer);
             gl::BufferData(
@@ -369,9 +375,15 @@ mod tests {
         assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 0.0), Some(BlendState::Disabled));
         assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 8.0), Some(BlendState::PremultipliedAlpha));
     }
+
+    #[test]
+    fn border_shader_contract_premultiplies_border_color() {
+        assert!(super::SCENE_FRAGMENT_SHADER.contains("border_color.rgb*border_color.a"));
+        assert!(super::SCENE_FRAGMENT_SHADER.contains("border_width"));
+    }
 }
 
 const VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nout vec2 texcoord;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; }";
 const FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nout vec4 color;\nuniform sampler2D captured;\nvoid main(){ color=texture(captured,texcoord); }";
 const SCENE_VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nlayout(location=2) in vec2 local_position_in;\nout vec2 texcoord;\nout vec2 local_position;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; local_position=local_position_in; }";
-const SCENE_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D captured;\nuniform float corner_radius;\nuniform vec2 surface_size;\nvoid main(){ vec4 sampled=texture(captured,texcoord); if(corner_radius<=0.0){ color=sampled; return; } float radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); vec2 half_size=surface_size*0.5; vec2 q=abs(local_position-half_size)-(half_size-vec2(radius)); float distance=length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; float aa=max(fwidth(distance),0.0001); float coverage=1.0-smoothstep(-aa,aa,distance); color=sampled*coverage; }";
+const SCENE_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D captured;\nuniform float corner_radius;\nuniform vec2 surface_size;\nuniform float border_width;\nuniform vec4 border_color;\nfloat rounded_distance(vec2 point, vec2 size, float radius){ vec2 q=abs(point-size*0.5)-(size*0.5-vec2(radius)); return length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; }\nfloat coverage(float distance){ float aa=max(fwidth(distance),0.0001); return 1.0-smoothstep(-aa,aa,distance); }\nvoid main(){ vec4 sampled=texture(captured,texcoord); float outer_radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); if(border_width<=0.0){ if(corner_radius<=0.0){ color=sampled; return; } color=sampled*coverage(rounded_distance(local_position,surface_size,outer_radius)); return; } float width=min(border_width,min(surface_size.x,surface_size.y)*0.5); float outer=coverage(rounded_distance(local_position,surface_size,outer_radius)); vec2 inner_size=max(surface_size-vec2(2.0*width),vec2(0.0)); float inner_radius=max(outer_radius-width,0.0); float inner=inner_size.x>0.0 && inner_size.y>0.0 ? coverage(rounded_distance(local_position-vec2(width),inner_size,inner_radius)) : 0.0; float border=clamp(outer-inner,0.0,1.0); vec4 premultiplied_border=vec4(border_color.rgb*border_color.a,border_color.a)*border; color=sampled*inner+premultiplied_border; }";

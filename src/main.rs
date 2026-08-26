@@ -27,6 +27,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut compositor_manual_probe = None;
     let mut compositor_scene_x11_probe = None;
     let mut compositor_corner_radius = None;
+    let mut compositor_border_width = None;
+    let mut compositor_border_color = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--diagnostics" => diagnostics_only = true,
@@ -68,6 +70,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "--compositor-corner-radius requires RADIUS",
                 )?.parse::<f32>()?);
             }
+            "--compositor-border-width" => {
+                compositor_border_width = Some(args.next().ok_or(
+                    "--compositor-border-width requires WIDTH",
+                )?.parse::<f32>()?);
+            }
+            "--compositor-border-color" => {
+                compositor_border_color = Some(args.next().ok_or(
+                    "--compositor-border-color requires RRGGBB or RRGGBBAA",
+                )?);
+            }
             "--capture" => {
                 capture_window = Some(args.next().ok_or("--capture requires WINDOW_ID")?)
             }
@@ -76,8 +88,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let connection = x11::connection::X11Connection::connect()?;
 
-    if compositor_corner_radius.is_some() && compositor_scene_x11_probe.is_none() {
-        return Err("--compositor-corner-radius requires --compositor-scene-x11-probe".into());
+    if (compositor_corner_radius.is_some() || compositor_border_width.is_some() || compositor_border_color.is_some())
+        && compositor_scene_x11_probe.is_none()
+    {
+        return Err("visual overrides require --compositor-scene-x11-probe".into());
     }
 
     if let Some(value) = compositor_scene_x11_probe {
@@ -95,10 +109,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             return Err("--compositor-scene-x11-probe cannot be combined with another mode".into());
         }
-        let config = match compositor_corner_radius {
+        let mut config = match compositor_corner_radius {
             Some(radius) => config::CompositorConfig::with_corner_radius(radius)?,
             None => config::CompositorConfig::defaults(),
         };
+        if compositor_border_width.is_some() || compositor_border_color.is_some() {
+            let width = compositor_border_width.unwrap_or(0.0);
+            let color = match compositor_border_color {
+                Some(color) => config::CompositorConfig::parse_color(&color)?,
+                None => config.visuals.border.color,
+            };
+            config = config.with_border(width, color)?;
+        }
         return x11::scene::run(&connection, &value, config);
     }
 

@@ -75,6 +75,14 @@ struct SurfaceEntry {
     override_redirect: bool,
     stacking_index: usize,
     backend: BackendCompatibility,
+    visual_class: SurfaceVisualClass,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurfaceVisualClass {
+    Normal,
+    Dock,
+    Desktop,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -496,7 +504,35 @@ fn eligible_surface(
         override_redirect: metadata.override_redirect,
         stacking_index,
         backend,
+        visual_class: classify_surface_visual_class(metadata.window_type.as_deref()),
     })
+}
+
+fn classify_surface_visual_class(window_type: Option<&str>) -> SurfaceVisualClass {
+    let mut types = window_type.unwrap_or_default().split(',');
+    if types.clone().any(|kind| kind == "_NET_WM_WINDOW_TYPE_DOCK") {
+        SurfaceVisualClass::Dock
+    } else if types.any(|kind| kind == "_NET_WM_WINDOW_TYPE_DESKTOP") {
+        SurfaceVisualClass::Desktop
+    } else {
+        SurfaceVisualClass::Normal
+    }
+}
+
+fn apply_surface_visual_policy(
+    plan: &mut RenderQuadPlan,
+    config: &crate::config::VisualConfig,
+    visual_class: SurfaceVisualClass,
+) {
+    if matches!(visual_class, SurfaceVisualClass::Dock | SurfaceVisualClass::Desktop) {
+        plan.corner_radius = 0.0;
+        plan.border_width = 0.0;
+        plan.border_color = [0.0, 0.0, 0.0, 1.0];
+        return;
+    }
+    plan.corner_radius = effective_corner_radius(config.corner_radius, plan.width, plan.height);
+    plan.border_width = effective_border_width(config.border.width, plan.width, plan.height);
+    plan.border_color = config.border.color;
 }
 
 fn println_surface(entry: &SurfaceEntry) {
@@ -845,6 +881,8 @@ pub(crate) struct RenderQuadPlan {
     pub(crate) u1: f32,
     pub(crate) v1: f32,
     pub(crate) corner_radius: f32,
+    pub(crate) border_width: f32,
+    pub(crate) border_color: [f32; 4],
 }
 
 fn build_render_quad_plan(
@@ -895,6 +933,8 @@ fn build_render_quad_plan(
         u1: (src_x + width) as f32 / f32::from(pixmap.width),
         v1: (src_y + height) as f32 / f32::from(pixmap.height),
         corner_radius: 0.0,
+        border_width: 0.0,
+        border_color: [0.0, 0.0, 0.0, 1.0],
     })
 }
 
@@ -903,6 +943,13 @@ fn effective_corner_radius(radius: f32, width: i32, height: i32) -> f32 {
         return 0.0;
     }
     radius.min(width.min(height) as f32 * 0.5)
+}
+
+fn effective_border_width(border_width: f32, width: i32, height: i32) -> f32 {
+    if !border_width.is_finite() || border_width <= 0.0 || width <= 0 || height <= 0 {
+        return 0.0;
+    }
+    border_width.min(width.min(height) as f32 * 0.5)
 }
 
 #[allow(dead_code)]
@@ -1983,11 +2030,7 @@ impl<'a> SceneSession<'a> {
                 .ok_or_else(|| format!("missing pixmap for EGL surface 0x{:08x}", entry.surface_xid))?;
             let mut plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
                 .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
-            plan.corner_radius = effective_corner_radius(
-                self._config.visuals.corner_radius,
-                plan.width,
-                plan.height,
-            );
+            apply_surface_visual_policy(&mut plan, &self._config.visuals, entry.visual_class);
             egl.render_surface(
                 surface.texture,
                 plan,
@@ -2458,6 +2501,8 @@ fn build_background_render_quad_plan(pixmap: PixmapGeometry, root: RootGeometry)
         u1: f32::from(root.width) / f32::from(pixmap.width),
         v1: f32::from(root.height) / f32::from(pixmap.height),
         corner_radius: 0.0,
+        border_width: 0.0,
+        border_color: [0.0, 0.0, 0.0, 1.0],
     })
 }
 
@@ -2671,6 +2716,8 @@ mod tests {
         build_copy_plan,
         parse_background_property, build_background_render_quad_plan,
         effective_corner_radius,
+        effective_border_width,
+        classify_surface_visual_class, apply_surface_visual_policy, SurfaceVisualClass,
         is_background_property_notify, BackgroundAtoms, BackgroundCandidate, BackgroundPixmap,
         classify_event, coordinator_requires_cleanup, eligible_surface,
         is_internal_xid, root_guard, BackendCompatibility, CandidateBuildError, CopyPlan,
@@ -3920,8 +3967,56 @@ mod tests {
     }
 
     #[test]
+    fn border_width_zero_is_an_exact_no_op() {
+        assert_eq!(effective_border_width(0.0, 100, 80), 0.0);
+        assert_eq!(effective_corner_radius(16.0, 100, 80), 16.0);
+    }
+
+    #[test]
+    fn border_width_clamps_to_half_smallest_dimension() {
+        assert_eq!(effective_border_width(100.0, 100, 80), 40.0);
+        assert_eq!(effective_border_width(-1.0, 100, 80), 0.0);
+        assert_eq!(effective_border_width(8.0, 0, 80), 0.0);
+    }
+
+    #[test]
+    fn border_geometry_is_rectangular_or_rounded_consistently() {
+        assert_eq!(effective_corner_radius(0.0, 100, 80), 0.0);
+        assert_eq!(effective_corner_radius(16.0, 100, 80), 16.0);
+        assert_eq!(effective_border_width(20.0, 100, 80), 20.0);
+    }
+
+    #[test]
+    fn visual_policy_decorates_normal_but_excludes_dock_and_desktop() {
+        let config = crate::config::CompositorConfig::with_corner_radius(12.0)
+            .unwrap()
+            .with_border(2.0, [1.0, 0.0, 0.0, 1.0])
+            .unwrap();
+        let mut normal = build_render_quad_plan(window(0, 0, 20, 20, 0), pixmap(20, 20), root()).unwrap();
+        apply_surface_visual_policy(&mut normal, &config.visuals, SurfaceVisualClass::Normal);
+        assert_eq!(normal.corner_radius, 10.0);
+        assert_eq!(normal.border_width, 2.0);
+
+        for visual_class in [SurfaceVisualClass::Dock, SurfaceVisualClass::Desktop] {
+            let mut excluded = normal;
+            apply_surface_visual_policy(&mut excluded, &config.visuals, visual_class);
+            assert_eq!(excluded.corner_radius, 0.0);
+            assert_eq!(excluded.border_width, 0.0);
+        }
+    }
+
+    #[test]
+    fn window_type_classification_is_exact_and_deterministic() {
+        assert_eq!(classify_surface_visual_class(Some("_NET_WM_WINDOW_TYPE_DOCK")), SurfaceVisualClass::Dock);
+        assert_eq!(classify_surface_visual_class(Some("_NET_WM_WINDOW_TYPE_DESKTOP")), SurfaceVisualClass::Desktop);
+        assert_eq!(classify_surface_visual_class(Some("_NET_WM_WINDOW_TYPE_NORMAL")), SurfaceVisualClass::Normal);
+        assert_eq!(classify_surface_visual_class(None), SurfaceVisualClass::Normal);
+    }
+
+    #[test]
     fn wallpaper_quad_has_zero_corner_radius() {
         let plan = build_background_render_quad_plan(PixmapGeometry { root: 1, x: 0, y: 0, width: 1920, height: 1080, border_width: 0, depth: 24 }, background_root()).unwrap();
         assert_eq!(plan.corner_radius, 0.0);
+        assert_eq!(plan.border_width, 0.0);
     }
 }
