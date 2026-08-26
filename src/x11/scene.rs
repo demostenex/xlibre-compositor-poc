@@ -17,6 +17,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 
 use crate::graphics::egl::{EglImportedSurface, EglSceneRenderer};
+use crate::config::CompositorConfig;
 use super::capture::{WindowGeometry, WindowMetadata};
 use super::compositor::{selection_clear_matches, CompositorOwnership};
 use super::connection::X11Connection;
@@ -1119,6 +1120,7 @@ struct SceneSession<'a> {
     scheduler: FrameScheduler,
     present: Option<PresentClock>,
     state: SceneState,
+    _config: CompositorConfig,
 }
 
 struct SceneCandidate<'a> {
@@ -1278,7 +1280,7 @@ impl<'a> SceneStructureWatches<'a> {
 }
 
 impl<'a> SceneSession<'a> {
-    fn acquire(connection: &'a X11Connection, expected_root: Window) -> Result<Self, Box<dyn Error>> {
+    fn acquire(connection: &'a X11Connection, expected_root: Window, config: CompositorConfig) -> Result<Self, Box<dyn Error>> {
         let root = connection.inner.setup().roots[connection.screen_num()].root;
         root_guard(expected_root, root)?;
         check_capabilities(connection)?;
@@ -1350,13 +1352,14 @@ impl<'a> SceneSession<'a> {
             scheduler: FrameScheduler::new(),
             present,
             state: SceneState::PlaceholderReady,
+            _config: config,
         };
         session.state = SceneState::ManualActive;
         Ok(session)
     }
 
-    fn run(connection: &'a X11Connection, expected_root: Window) -> Result<(), Box<dyn Error>> {
-        let mut session = Self::acquire(connection, expected_root)?;
+    fn run(connection: &'a X11Connection, expected_root: Window, config: CompositorConfig) -> Result<(), Box<dyn Error>> {
+        let mut session = Self::acquire(connection, expected_root, config)?;
         let operation = session
             .prepare_scene()
             .and_then(|_| session.wait_live_pixel());
@@ -2640,8 +2643,9 @@ fn watch_plan(
 pub(crate) fn run(
     connection: &X11Connection,
     expected_root_value: &str,
+    config: CompositorConfig,
 ) -> Result<(), Box<dyn Error>> {
-    SceneSession::run(connection, parse_root(expected_root_value)?)
+    SceneSession::run(connection, parse_root(expected_root_value)?, config)
 }
 
 #[cfg(test)]

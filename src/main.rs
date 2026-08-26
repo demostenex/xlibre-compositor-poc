@@ -1,4 +1,5 @@
 mod diagnostics;
+mod config;
 mod graphics;
 mod x11;
 
@@ -12,6 +13,7 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
+    let config = config::CompositorConfig::defaults();
     let mut args = std::env::args().skip(1);
     let mut diagnostics_only = false;
     let mut capture_window = None;
@@ -84,7 +86,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             return Err("--compositor-scene-x11-probe cannot be combined with another mode".into());
         }
-        return x11::scene::run(&connection, &value);
+        return x11::scene::run(&connection, &value, config);
     }
 
     if let Some(value) = compositor_manual_probe {
