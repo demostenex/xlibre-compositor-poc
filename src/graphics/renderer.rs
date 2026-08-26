@@ -8,6 +8,8 @@ pub struct SceneRenderer {
     program: u32,
     vao: u32,
     buffer: u32,
+    corner_radius_uniform: i32,
+    surface_size_uniform: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,8 +154,8 @@ impl CaptureRenderer {
 
 impl SceneRenderer {
     pub fn new() -> Result<Self, Box<dyn Error>> {
-        let vertex = compile_shader(VERTEX_SHADER, gl::VERTEX_SHADER)?;
-        let fragment = compile_shader(FRAGMENT_SHADER, gl::FRAGMENT_SHADER)?;
+        let vertex = compile_shader(SCENE_VERTEX_SHADER, gl::VERTEX_SHADER)?;
+        let fragment = compile_shader(SCENE_FRAGMENT_SHADER, gl::FRAGMENT_SHADER)?;
         let program = unsafe { gl::CreateProgram() };
         unsafe {
             gl::AttachShader(program, vertex);
@@ -164,6 +166,16 @@ impl SceneRenderer {
         }
         check_program(program)?;
 
+        let corner_radius_uniform = unsafe {
+            gl::GetUniformLocation(program, b"corner_radius\0".as_ptr().cast())
+        };
+        let surface_size_uniform = unsafe {
+            gl::GetUniformLocation(program, b"surface_size\0".as_ptr().cast())
+        };
+        if corner_radius_uniform < 0 || surface_size_uniform < 0 {
+            return Err("rounded-corner shader uniforms are unavailable".into());
+        }
+
         let mut vao = 0;
         let mut buffer = 0;
         unsafe {
@@ -172,14 +184,16 @@ impl SceneRenderer {
             gl::BindVertexArray(vao);
             gl::BindBuffer(gl::ARRAY_BUFFER, buffer);
             gl::BufferData(gl::ARRAY_BUFFER, 0, std::ptr::null(), gl::STREAM_DRAW);
-            gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 16, std::ptr::null());
-            gl::VertexAttribPointer(1, 2, gl::FLOAT, gl::FALSE, 16, 8 as *const c_void);
+            gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 24, std::ptr::null());
+            gl::VertexAttribPointer(1, 2, gl::FLOAT, gl::FALSE, 24, 8 as *const c_void);
+            gl::VertexAttribPointer(2, 2, gl::FLOAT, gl::FALSE, 24, 16 as *const c_void);
             gl::EnableVertexAttribArray(0);
             gl::EnableVertexAttribArray(1);
+            gl::EnableVertexAttribArray(2);
             gl::BindVertexArray(0);
             gl::BindBuffer(gl::ARRAY_BUFFER, 0);
         }
-        Ok(Self { program, vao, buffer })
+        Ok(Self { program, vao, buffer, corner_radius_uniform, surface_size_uniform })
     }
 
     pub fn clear(&self) {
@@ -211,18 +225,18 @@ impl SceneRenderer {
         if right <= left || top <= bottom {
             return Ok(());
         }
-        let vertices: [f32; 24] = [
-            left, bottom, plan.u0, plan.v1,
-            right, bottom, plan.u1, plan.v1,
-            right, top, plan.u1, plan.v0,
-            left, bottom, plan.u0, plan.v1,
-            right, top, plan.u1, plan.v0,
-            left, top, plan.u0, plan.v0,
+        let vertices: [f32; 36] = [
+            left, bottom, plan.u0, plan.v1, 0.0, height as f32,
+            right, bottom, plan.u1, plan.v1, width as f32, height as f32,
+            right, top, plan.u1, plan.v0, width as f32, 0.0,
+            left, bottom, plan.u0, plan.v1, 0.0, height as f32,
+            right, top, plan.u1, plan.v0, width as f32, 0.0,
+            left, top, plan.u0, plan.v0, 0.0, 0.0,
         ];
         unsafe {
             check_gl_error("before scene draw")?;
             gl::UseProgram(self.program);
-            match blend_state_for(pixel_semantics) {
+            match blend_state_for_surface(pixel_semantics, plan.corner_radius) {
                 Some(BlendState::Disabled) => gl::Disable(gl::BLEND),
                 Some(BlendState::PremultipliedAlpha) => {
                     gl::Enable(gl::BLEND);
@@ -231,6 +245,8 @@ impl SceneRenderer {
                 None => return Err("unsupported pixel semantics reached GL renderer".into()),
             }
             check_gl_error("blend state")?;
+            gl::Uniform1f(self.corner_radius_uniform, plan.corner_radius);
+            gl::Uniform2f(self.surface_size_uniform, width as f32, height as f32);
             gl::BindVertexArray(self.vao);
             gl::BindBuffer(gl::ARRAY_BUFFER, self.buffer);
             gl::BufferData(
@@ -248,6 +264,23 @@ impl SceneRenderer {
             gl::UseProgram(0);
         }
         Ok(())
+    }
+}
+
+fn blend_state_for_surface(
+    semantics: crate::x11::scene::EglPixelSemantics,
+    corner_radius: f32,
+) -> Option<BlendState> {
+    if corner_radius > 0.0 {
+        match semantics {
+            crate::x11::scene::EglPixelSemantics::Opaque
+            | crate::x11::scene::EglPixelSemantics::PremultipliedAlpha => {
+                Some(BlendState::PremultipliedAlpha)
+            }
+            crate::x11::scene::EglPixelSemantics::Unsupported => None,
+        }
+    } else {
+        blend_state_for(semantics)
     }
 }
 
@@ -305,7 +338,7 @@ fn program_log(program: u32) -> String { let mut length = 0; unsafe { gl::GetPro
 
 #[cfg(test)]
 mod tests {
-    use super::{blend_state_for, BlendState};
+    use super::{blend_state_for, blend_state_for_surface, BlendState};
     use crate::x11::scene::EglPixelSemantics;
 
     #[test]
@@ -323,7 +356,22 @@ mod tests {
         assert!(super::FRAGMENT_SHADER.contains("texture(captured,texcoord)"));
         assert!(!super::FRAGMENT_SHADER.contains("1.0-texcoord.y"));
     }
+
+    #[test]
+    fn rounded_scene_shader_masks_premultiplied_color_and_alpha() {
+        assert!(super::SCENE_FRAGMENT_SHADER.contains("color=sampled*coverage"));
+        assert!(super::SCENE_FRAGMENT_SHADER.contains("fwidth(distance)"));
+        assert!(super::SCENE_FRAGMENT_SHADER.contains("corner_radius"));
+    }
+
+    #[test]
+    fn opaque_surfaces_enable_blending_only_when_corner_masked() {
+        assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 0.0), Some(BlendState::Disabled));
+        assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 8.0), Some(BlendState::PremultipliedAlpha));
+    }
 }
 
 const VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nout vec2 texcoord;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; }";
 const FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nout vec4 color;\nuniform sampler2D captured;\nvoid main(){ color=texture(captured,texcoord); }";
+const SCENE_VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nlayout(location=2) in vec2 local_position_in;\nout vec2 texcoord;\nout vec2 local_position;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; local_position=local_position_in; }";
+const SCENE_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D captured;\nuniform float corner_radius;\nuniform vec2 surface_size;\nvoid main(){ vec4 sampled=texture(captured,texcoord); if(corner_radius<=0.0){ color=sampled; return; } float radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); vec2 half_size=surface_size*0.5; vec2 q=abs(local_position-half_size)-(half_size-vec2(radius)); float distance=length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; float aa=max(fwidth(distance),0.0001); float coverage=1.0-smoothstep(-aa,aa,distance); color=sampled*coverage; }";

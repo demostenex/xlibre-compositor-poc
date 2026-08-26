@@ -51,6 +51,15 @@ impl CompositorConfig {
     pub(crate) fn defaults() -> Self {
         Self::default()
     }
+
+    pub(crate) fn with_corner_radius(corner_radius: f32) -> Result<Self, &'static str> {
+        if !corner_radius.is_finite() || corner_radius < 0.0 {
+            return Err("corner radius must be finite and non-negative");
+        }
+        let mut config = Self::default();
+        config.visuals.corner_radius = corner_radius;
+        Ok(config)
+    }
 }
 
 #[cfg(test)]
@@ -72,6 +81,13 @@ mod tests {
     #[test]
     fn defaults_are_deterministic() {
         assert_eq!(CompositorConfig::defaults(), CompositorConfig::default());
+    }
+
+    #[test]
+    fn corner_radius_probe_rejects_invalid_values() {
+        assert!(CompositorConfig::with_corner_radius(-1.0).is_err());
+        assert!(CompositorConfig::with_corner_radius(f32::NAN).is_err());
+        assert_eq!(CompositorConfig::with_corner_radius(8.0).unwrap().visuals.corner_radius, 8.0);
     }
 
 }

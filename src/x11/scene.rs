@@ -844,6 +844,7 @@ pub(crate) struct RenderQuadPlan {
     pub(crate) v0: f32,
     pub(crate) u1: f32,
     pub(crate) v1: f32,
+    pub(crate) corner_radius: f32,
 }
 
 fn build_render_quad_plan(
@@ -893,7 +894,15 @@ fn build_render_quad_plan(
         v0: src_y as f32 / f32::from(pixmap.height),
         u1: (src_x + width) as f32 / f32::from(pixmap.width),
         v1: (src_y + height) as f32 / f32::from(pixmap.height),
+        corner_radius: 0.0,
     })
+}
+
+fn effective_corner_radius(radius: f32, width: i32, height: i32) -> f32 {
+    if !radius.is_finite() || radius <= 0.0 || width <= 0 || height <= 0 {
+        return 0.0;
+    }
+    radius.min(width.min(height) as f32 * 0.5)
 }
 
 #[allow(dead_code)]
@@ -1972,8 +1981,13 @@ impl<'a> SceneSession<'a> {
                 .iter()
                 .find(|pixmap| pixmap.surface_xid == entry.surface_xid)
                 .ok_or_else(|| format!("missing pixmap for EGL surface 0x{:08x}", entry.surface_xid))?;
-            let plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
+            let mut plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
                 .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
+            plan.corner_radius = effective_corner_radius(
+                self._config.visuals.corner_radius,
+                plan.width,
+                plan.height,
+            );
             egl.render_surface(
                 surface.texture,
                 plan,
@@ -2443,6 +2457,7 @@ fn build_background_render_quad_plan(pixmap: PixmapGeometry, root: RootGeometry)
         v0: 0.0,
         u1: f32::from(root.width) / f32::from(pixmap.width),
         v1: f32::from(root.height) / f32::from(pixmap.height),
+        corner_radius: 0.0,
     })
 }
 
@@ -2655,6 +2670,7 @@ mod tests {
     use super::{
         build_copy_plan,
         parse_background_property, build_background_render_quad_plan,
+        effective_corner_radius,
         is_background_property_notify, BackgroundAtoms, BackgroundCandidate, BackgroundPixmap,
         classify_event, coordinator_requires_cleanup, eligible_surface,
         is_internal_xid, root_guard, BackendCompatibility, CandidateBuildError, CopyPlan,
@@ -3882,5 +3898,30 @@ mod tests {
         assert_eq!(plan.dst_x, 0);
         assert_eq!(plan.dst_y, 0);
         assert_eq!(plan.width, i32::from(background_root().width));
+    }
+
+    #[test]
+    fn zero_corner_radius_is_an_exact_no_op() {
+        assert_eq!(effective_corner_radius(0.0, 100, 80), 0.0);
+        assert_eq!(effective_corner_radius(-1.0, 100, 80), 0.0);
+        assert_eq!(effective_corner_radius(f32::NAN, 100, 80), 0.0);
+    }
+
+    #[test]
+    fn corner_radius_clamps_to_half_smallest_dimension() {
+        assert_eq!(effective_corner_radius(100.0, 100, 80), 40.0);
+        assert_eq!(effective_corner_radius(20.0, 100, 80), 20.0);
+    }
+
+    #[test]
+    fn corner_radius_rejects_non_positive_geometry() {
+        assert_eq!(effective_corner_radius(8.0, 0, 80), 0.0);
+        assert_eq!(effective_corner_radius(8.0, 100, -1), 0.0);
+    }
+
+    #[test]
+    fn wallpaper_quad_has_zero_corner_radius() {
+        let plan = build_background_render_quad_plan(PixmapGeometry { root: 1, x: 0, y: 0, width: 1920, height: 1080, border_width: 0, depth: 24 }, background_root()).unwrap();
+        assert_eq!(plan.corner_radius, 0.0);
     }
 }

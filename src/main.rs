@@ -13,7 +13,6 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let config = config::CompositorConfig::defaults();
     let mut args = std::env::args().skip(1);
     let mut diagnostics_only = false;
     let mut capture_window = None;
@@ -27,6 +26,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut compositor_overlay_probe = None;
     let mut compositor_manual_probe = None;
     let mut compositor_scene_x11_probe = None;
+    let mut compositor_corner_radius = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--diagnostics" => diagnostics_only = true,
@@ -63,6 +63,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .ok_or("--compositor-scene-x11-probe requires EXPECTED_ROOT_XID")?,
                 )
             }
+            "--compositor-corner-radius" => {
+                compositor_corner_radius = Some(args.next().ok_or(
+                    "--compositor-corner-radius requires RADIUS",
+                )?.parse::<f32>()?);
+            }
             "--capture" => {
                 capture_window = Some(args.next().ok_or("--capture requires WINDOW_ID")?)
             }
@@ -70,6 +75,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     let connection = x11::connection::X11Connection::connect()?;
+
+    if compositor_corner_radius.is_some() && compositor_scene_x11_probe.is_none() {
+        return Err("--compositor-corner-radius requires --compositor-scene-x11-probe".into());
+    }
 
     if let Some(value) = compositor_scene_x11_probe {
         if compositor_probe
@@ -86,6 +95,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             return Err("--compositor-scene-x11-probe cannot be combined with another mode".into());
         }
+        let config = match compositor_corner_radius {
+            Some(radius) => config::CompositorConfig::with_corner_radius(radius)?,
+            None => config::CompositorConfig::defaults(),
+        };
         return x11::scene::run(&connection, &value, config);
     }
 
