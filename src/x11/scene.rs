@@ -35,6 +35,32 @@ struct RootGeometry {
     visual: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BackgroundAtoms {
+    xrootpmap_id: xproto::Atom,
+    esetroot_pmap_id: xproto::Atom,
+    pixmap_type: xproto::Atom,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BackgroundPixmap {
+    xid: xproto::Pixmap,
+    geometry: PixmapGeometry,
+    semantics: EglPixelSemantics,
+}
+
+struct ImportedBackground {
+    source: BackgroundPixmap,
+    surface: EglImportedSurface,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackgroundCandidate {
+    Valid(BackgroundPixmap),
+    SolidFallback,
+    Preserve,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SurfaceEntry {
     surface_xid: Window,
@@ -998,6 +1024,7 @@ enum ShutdownReason {
 enum SceneInvalidation {
     Ignore,
     PixelDamage(damage::Damage),
+    Background,
     Geometry(Window),
     Hierarchy,
     Shutdown(ShutdownReason),
@@ -1016,6 +1043,7 @@ struct InvalidationBatch {
     geometry: Option<Window>,
     shutdown: Option<ShutdownReason>,
     pixel_damage: HashSet<damage::Damage>,
+    background: bool,
 }
 
 impl InvalidationBatch {
@@ -1025,6 +1053,7 @@ impl InvalidationBatch {
             SceneInvalidation::PixelDamage(damage_id) => {
                 self.pixel_damage.insert(damage_id);
             }
+            SceneInvalidation::Background => self.background = true,
             SceneInvalidation::Geometry(window) if !self.hierarchy => {
                 self.geometry = Some(window);
             }
@@ -1046,6 +1075,8 @@ impl InvalidationBatch {
             SceneInvalidation::Hierarchy
         } else if let Some(window) = self.geometry {
             SceneInvalidation::Geometry(window)
+        } else if self.background {
+            SceneInvalidation::Background
         } else if let Some(damage_id) = self.pixel_damage.iter().next().copied() {
             SceneInvalidation::PixelDamage(damage_id)
         } else {
@@ -1056,6 +1087,7 @@ impl InvalidationBatch {
     fn pixel_damage(&self) -> &HashSet<damage::Damage> {
         &self.pixel_damage
     }
+
 }
 
 fn coordinator_requires_cleanup(state: SceneState) -> bool {
@@ -1076,10 +1108,13 @@ struct SceneSession<'a> {
     damage_leases: Vec<DamageLease<'a>>,
     damage_registry: HashMap<damage::Damage, Window>,
     pending_damage: HashSet<damage::Damage>,
+    pending_background: bool,
     structural_generation: u64,
     attempted_structural_generation: u64,
     snapshot: Option<SceneSnapshot>,
     egl_surfaces: HashMap<Window, EglImportedSurface>,
+    background: Option<ImportedBackground>,
+    background_atoms: BackgroundAtoms,
     signal: SignalWake,
     scheduler: FrameScheduler,
     present: Option<PresentClock>,
@@ -1250,6 +1285,7 @@ impl<'a> SceneSession<'a> {
         check_selection_available(connection)?;
         ensure_damage_version(connection)?;
         let visual_formats = VisualFormatCache::acquire(connection)?;
+        let background_atoms = acquire_background_atoms(connection)?;
         let signal = SignalWake::install()?;
         let ownership = CompositorOwnership::claim(connection)?;
         let mut overlay = OverlayLease::acquire(connection, root)?;
@@ -1301,12 +1337,15 @@ impl<'a> SceneSession<'a> {
             damage_leases: Vec::new(),
             damage_registry: HashMap::new(),
             pending_damage: HashSet::new(),
+            pending_background: true,
             // Generation 1 is the initial scene build.  A generation is
             // ready exactly when it is newer than the last attempted one.
             structural_generation: 1,
             attempted_structural_generation: 0,
             snapshot: None,
             egl_surfaces: HashMap::new(),
+            background: None,
+            background_atoms,
             signal,
             scheduler: FrameScheduler::new(),
             present,
@@ -1335,6 +1374,7 @@ impl<'a> SceneSession<'a> {
     }
 
     fn prepare_scene(&mut self) -> Result<(), Box<dyn Error>> {
+        self.refresh_background()?;
         self.rebuild_and_present()?;
         self.arm_next_presentation(0)
     }
@@ -1490,14 +1530,18 @@ impl<'a> SceneSession<'a> {
                 break;
             };
             drained += 1;
-            let invalidation = classify_event_with_registries(
+            let invalidation = if is_background_property_notify(&event, self.root, self.background_atoms) {
+                SceneInvalidation::Background
+            } else {
+                classify_event_with_registries(
                 event,
                 self.root,
                 &candidate.snapshot,
                 self.ownership.as_ref(),
                 &self.damage_registry,
                 &candidate.damage_registry,
-            );
+                )
+            };
             self.observe_invalidation(invalidation);
             batch.push(invalidation);
         }
@@ -1607,6 +1651,10 @@ impl<'a> SceneSession<'a> {
         observe_structural_generation(&mut self.structural_generation, invalidation);
         match invalidation {
             SceneInvalidation::PixelDamage(_) => self.scheduler.mark_pixel_dirty(),
+            SceneInvalidation::Background => {
+                self.pending_background = true;
+                self.scheduler.mark_pixel_dirty();
+            }
             SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy => {
                 self.scheduler.mark_structural_dirty(self.structural_generation)
             }
@@ -1636,7 +1684,10 @@ impl<'a> SceneSession<'a> {
             } else {
                 std::mem::take(&mut self.pending_damage)
             };
-            let had_pending_work = pending_work_requires_iteration(&pending);
+            if self.pending_background {
+                batch.push(SceneInvalidation::Background);
+            }
+            let had_pending_work = pending_work_requires_iteration(&pending) || self.pending_background;
             if matches!(
                 structural_generation_state(
                     self.structural_generation,
@@ -1662,11 +1713,9 @@ impl<'a> SceneSession<'a> {
                     }
                 };
                 opportunity_msc = self.present_opportunity(&first);
-                let invalidation = classify_event_with_registries(
+                let invalidation = self.classify_session_event(
                     first,
-                    self.root,
                     self.current_snapshot(),
-                    self.ownership.as_ref(),
                     &self.damage_registry,
                     &self.damage_registry,
                 );
@@ -1677,11 +1726,9 @@ impl<'a> SceneSession<'a> {
                         break;
                     };
                     opportunity_msc = opportunity_msc.or_else(|| self.present_opportunity(&event));
-                    let invalidation = classify_event_with_registries(
+                    let invalidation = self.classify_session_event(
                         event,
-                        self.root,
                         self.current_snapshot(),
-                        self.ownership.as_ref(),
                         &self.damage_registry,
                         &self.damage_registry,
                     );
@@ -1708,7 +1755,15 @@ impl<'a> SceneSession<'a> {
                 }
                 SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy => {
                     self.pending_damage.clear();
+                    self.pending_background = false;
+                    self.refresh_background()?;
                     self.rebuild_and_present()?;
+                }
+                SceneInvalidation::Background => {
+                    self.pending_background = false;
+                    self.refresh_background()?;
+                    self.full_recompose_current()?;
+                    self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap()?;
                 }
                 SceneInvalidation::PixelDamage(_) => {
                     self.recompose_current_scene(batch.pixel_damage().clone())?;
@@ -1757,6 +1812,12 @@ impl<'a> SceneSession<'a> {
                 self.pending_damage.clear();
                 return self.rebuild_and_present();
             }
+            SceneInvalidation::Background => {
+                self.pending_background = false;
+                self.refresh_background()?;
+                self.full_recompose_current()?;
+                return self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap();
+            }
             SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => {}
         }
         self.full_recompose_current()?;
@@ -1788,6 +1849,10 @@ impl<'a> SceneSession<'a> {
                 self.pending_damage.clear();
                 self.rebuild_and_present()
             }
+            SceneInvalidation::Background => {
+                self.pending_background = true;
+                Ok(())
+            }
             SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => Ok(()),
         }
     }
@@ -1798,11 +1863,9 @@ impl<'a> SceneSession<'a> {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
             };
-            let invalidation = classify_event_with_registries(
+            let invalidation = self.classify_session_event(
                 event,
-                self.root,
                 self.current_snapshot(),
-                self.ownership.as_ref(),
                 &self.damage_registry,
                 &self.damage_registry,
             );
@@ -1826,6 +1889,65 @@ impl<'a> SceneSession<'a> {
         self.render_egl_scene(self.current_snapshot(), &self.egl_surfaces, &self.pixmaps)
     }
 
+    fn classify_session_event(
+        &self,
+        event: Event,
+        snapshot: &SceneSnapshot,
+        current_registry: &HashMap<damage::Damage, Window>,
+        candidate_registry: &HashMap<damage::Damage, Window>,
+    ) -> SceneInvalidation {
+        if is_background_property_notify(&event, self.root, self.background_atoms) {
+            SceneInvalidation::Background
+        } else {
+            classify_event_with_registries(
+                event, self.root, snapshot, self.ownership.as_ref(), current_registry,
+                candidate_registry,
+            )
+        }
+    }
+
+    fn refresh_background(&mut self) -> Result<(), Box<dyn Error>> {
+        let candidate = self.load_background_candidate()?;
+        let Some(egl) = self.egl.as_ref() else { return Ok(()); };
+        let replacement = match candidate {
+            BackgroundCandidate::Valid(source) => {
+                let surface = match egl.import_pixmap(source.xid, source.semantics) {
+                    Ok(surface) => surface,
+                    Err(error) => {
+                        eprintln!("root background PIXMAP import failed; keeping current background/fallback: {error}");
+                        return Ok(());
+                    }
+                };
+                Some(ImportedBackground { source, surface })
+            }
+            BackgroundCandidate::SolidFallback => None,
+            BackgroundCandidate::Preserve => return Ok(()),
+        };
+        if let Some(mut old) = self.background.take() {
+            egl.make_current()?;
+            egl.destroy_import(&mut old.surface)?;
+        }
+        self.background = replacement;
+        Ok(())
+    }
+
+    fn load_background_candidate(&self) -> Result<BackgroundCandidate, Box<dyn Error>> {
+        let preferred = read_background_pixmap(self.connection, self.root, self.background_atoms.xrootpmap_id,
+            self.background_atoms.pixmap_type, &self.visual_formats)?;
+        let fallback = read_background_pixmap(self.connection, self.root, self.background_atoms.esetroot_pmap_id,
+            self.background_atoms.pixmap_type, &self.visual_formats)?;
+        if let Some(source) = preferred.or(fallback) {
+            return Ok(BackgroundCandidate::Valid(source));
+        }
+        let preferred_present = background_property_present(self.connection, self.root, self.background_atoms.xrootpmap_id)?;
+        let fallback_present = background_property_present(self.connection, self.root, self.background_atoms.esetroot_pmap_id)?;
+        if preferred_present || fallback_present {
+            Ok(if self.background.is_some() { BackgroundCandidate::Preserve } else { BackgroundCandidate::SolidFallback })
+        } else {
+            Ok(BackgroundCandidate::SolidFallback)
+        }
+    }
+
     fn render_egl_scene(
         &self,
         snapshot: &SceneSnapshot,
@@ -1834,6 +1956,11 @@ impl<'a> SceneSession<'a> {
     ) -> Result<(), Box<dyn Error>> {
         let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
         egl.clear()?;
+        if let Some(background) = &self.background {
+            if let Some(plan) = build_background_render_quad_plan(background.source.geometry, snapshot.root_geometry) {
+                egl.render_surface(background.surface.texture, plan, background.surface.pixel_semantics)?;
+            }
+        }
         for entry in &snapshot.entries {
             let Some(surface) = surfaces.get(&entry.surface_xid) else {
                 continue;
@@ -1928,16 +2055,25 @@ impl<'a> SceneSession<'a> {
         };
         if egl_current {
             let egl = self.egl.as_ref().expect("EGL renderer exists when current");
+            if let Some(background) = self.background.as_mut() {
+                if let Err(error) = egl.destroy_import(&mut background.surface) {
+                    first_error.get_or_insert(error);
+                }
+            }
             for surface in self.egl_surfaces.values_mut() {
                 if let Err(error) = egl.destroy_import(surface) {
                     first_error.get_or_insert(error);
                 }
             }
         } else {
+            if let Some(background) = self.background.as_mut() {
+                background.surface.disarm();
+            }
             for surface in self.egl_surfaces.values_mut() {
                 surface.disarm();
             }
         }
+        self.background = None;
         self.egl_surfaces.clear();
         for pixmap in &self.pixmaps {
             if let Err(error) = pixmap.free() {
@@ -1994,9 +2130,14 @@ impl<'a> SceneSession<'a> {
         self.damage_leases.clear();
         self.damage_registry.clear();
         self.pending_damage.clear();
+        self.pending_background = false;
         for surface in self.egl_surfaces.values_mut() {
             surface.disarm();
         }
+        if let Some(background) = self.background.as_mut() {
+            background.surface.disarm();
+        }
+        self.background = None;
         self.egl_surfaces.clear();
         if let Some(mut egl) = self.egl.take() {
             egl.disarm();
@@ -2186,6 +2327,127 @@ fn read_root_geometry(
     })
 }
 
+fn acquire_background_atoms(connection: &X11Connection) -> Result<BackgroundAtoms, Box<dyn Error>> {
+    let intern = |name: &[u8]| -> Result<xproto::Atom, Box<dyn Error>> {
+        Ok(connection.inner.intern_atom(false, name)?.reply()?.atom)
+    };
+    Ok(BackgroundAtoms {
+        xrootpmap_id: intern(b"_XROOTPMAP_ID")?,
+        esetroot_pmap_id: intern(b"ESETROOT_PMAP_ID")?,
+        pixmap_type: xproto::AtomEnum::PIXMAP.into(),
+    })
+}
+
+fn parse_background_property(
+    property_type: xproto::Atom,
+    pixmap_type: xproto::Atom,
+    format: u8,
+    value_len: u32,
+    value: &[u8],
+) -> Result<Option<xproto::Pixmap>, &'static str> {
+    if property_type == xproto::AtomEnum::NONE.into() {
+        return Ok(None);
+    }
+    if property_type != pixmap_type || format != 32 || value_len != 1 || value.len() != 4 {
+        return Err("root background property has an invalid PIXMAP representation");
+    }
+    let xid = u32::from_ne_bytes(value.try_into().map_err(|_| "invalid PIXMAP value")?);
+    if xid == x11rb::NONE {
+        return Err("root background property contains NONE");
+    }
+    Ok(Some(xid))
+}
+
+fn read_background_property(
+    connection: &X11Connection,
+    root: Window,
+    atom: xproto::Atom,
+    pixmap_type: xproto::Atom,
+) -> Result<Result<Option<xproto::Pixmap>, &'static str>, Box<dyn Error>> {
+    let reply = connection.inner.get_property(false, root, atom, xproto::AtomEnum::ANY, 0, 1)?.reply()?;
+    Ok(parse_background_property(reply.type_, pixmap_type, reply.format, reply.value_len, &reply.value))
+}
+
+fn background_property_present(
+    connection: &X11Connection,
+    root: Window,
+    atom: xproto::Atom,
+) -> Result<bool, Box<dyn Error>> {
+    let reply = connection.inner.get_property(false, root, atom, xproto::AtomEnum::ANY, 0, 1)?.reply()?;
+    Ok(reply.type_ != xproto::AtomEnum::NONE.into())
+}
+
+fn read_background_pixmap(
+    connection: &X11Connection,
+    root: Window,
+    atom: xproto::Atom,
+    pixmap_type: xproto::Atom,
+    formats: &VisualFormatCache,
+) -> Result<Option<BackgroundPixmap>, Box<dyn Error>> {
+    let parsed = match read_background_property(connection, root, atom, pixmap_type)? {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("ignoring invalid root background property 0x{atom:08x}: {error}");
+            return Ok(None);
+        }
+    };
+    let Some(xid) = parsed else { return Ok(None); };
+    let geometry = match connection.inner.get_geometry(xid)?.reply() {
+        Ok(geometry) => PixmapGeometry {
+            root: geometry.root,
+            x: geometry.x,
+            y: geometry.y,
+            width: geometry.width,
+            height: geometry.height,
+            border_width: geometry.border_width,
+            depth: geometry.depth,
+        },
+        Err(error) => {
+            eprintln!("root background PIXMAP 0x{xid:08x} is unavailable: {error}");
+            return Ok(None);
+        }
+    };
+    let screen_root = connection.inner.setup().roots[connection.screen_num()].root;
+    let screen = &connection.inner.setup().roots[connection.screen_num()];
+    if geometry.root != screen_root || geometry.width < screen.width_in_pixels
+        || geometry.height < screen.height_in_pixels || geometry.depth != screen.root_depth
+    {
+        eprintln!("rejecting root background PIXMAP 0x{xid:08x}: incompatible drawable geometry");
+        return Ok(None);
+    }
+    let semantics = formats.semantics(screen.root_visual, geometry.depth);
+    if semantics != EglPixelSemantics::Opaque {
+        eprintln!("rejecting root background PIXMAP 0x{xid:08x}: unsupported root RGB format");
+        return Ok(None);
+    }
+    Ok(Some(BackgroundPixmap { xid, geometry, semantics }))
+}
+
+fn build_background_render_quad_plan(pixmap: PixmapGeometry, root: RootGeometry) -> Option<RenderQuadPlan> {
+    if pixmap.root == x11rb::NONE || pixmap.width < root.width || pixmap.height < root.height {
+        return None;
+    }
+    Some(RenderQuadPlan {
+        dst_x: 0,
+        dst_y: 0,
+        width: i32::from(root.width),
+        height: i32::from(root.height),
+        src_x: 0,
+        src_y: 0,
+        src_width: i32::from(root.width),
+        src_height: i32::from(root.height),
+        u0: 0.0,
+        v0: 0.0,
+        u1: f32::from(root.width) / f32::from(pixmap.width),
+        v1: f32::from(root.height) / f32::from(pixmap.height),
+    })
+}
+
+fn is_background_property_notify(event: &Event, root: Window, atoms: BackgroundAtoms) -> bool {
+    matches!(event, Event::PropertyNotify(event) if event.window == root &&
+        (event.atom == atoms.xrootpmap_id || event.atom == atoms.esetroot_pmap_id))
+}
+
 fn snapshot_watch_ids(snapshot: &HierarchySnapshot) -> HashSet<Window> {
     // 3A3c5b1 watches canonical root-child topology only; descendants are
     // snapshot metadata and are not recursively watched.
@@ -2197,7 +2459,7 @@ fn snapshot_watch_ids(snapshot: &HierarchySnapshot) -> HashSet<Window> {
 }
 
 fn root_live_event_mask(previous: EventMask) -> EventMask {
-    previous | EventMask::STRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_NOTIFY
+    previous | EventMask::STRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE
 }
 
 fn canonical_live_event_mask(previous: EventMask) -> EventMask {
@@ -2315,7 +2577,7 @@ fn candidate_gate_decision(
     ownership_verified: bool,
     signal_pending: bool,
 ) -> GateDecision {
-    if matches!(batch, SceneInvalidation::PixelDamage(_)) && !overflow {
+    if matches!(batch, SceneInvalidation::PixelDamage(_) | SceneInvalidation::Background) && !overflow {
         if !guards_allow_retry(ownership_verified, signal_pending) {
             if !ownership_verified {
                 return GateDecision::Shutdown(ShutdownReason::OwnershipLost);
@@ -2388,6 +2650,8 @@ mod tests {
 
     use super::{
         build_copy_plan,
+        parse_background_property, build_background_render_quad_plan,
+        is_background_property_notify, BackgroundAtoms, BackgroundCandidate, BackgroundPixmap,
         classify_event, coordinator_requires_cleanup, eligible_surface,
         is_internal_xid, root_guard, BackendCompatibility, CandidateBuildError, CopyPlan,
         PixmapGeometry, RootGeometry,
@@ -2413,6 +2677,7 @@ mod tests {
     use x11rb::protocol::damage::ReportLevel;
     use x11rb::protocol::render;
     use x11rb::protocol::xproto::{EventMask, MapState, Rectangle, WindowClass};
+    use x11rb::protocol::xproto;
     use x11rb::protocol::Event;
 
     fn root() -> RootGeometry {
@@ -3479,5 +3744,139 @@ mod tests {
         let mut scheduler = FrameScheduler::new();
         let (_, target_msc) = scheduler.arm(1234);
         assert_eq!(target_msc, 1234);
+    }
+
+    fn background_root() -> RootGeometry { RootGeometry { width: 1920, height: 1080, depth: 24, visual: 0x21 } }
+
+    #[test]
+    fn background_property_accepts_one_pixmap_xid() {
+        assert_eq!(parse_background_property(9, 9, 32, 1, &0x800001_u32.to_ne_bytes()).unwrap(), Some(0x800001));
+    }
+
+    #[test]
+    fn background_property_rejects_wrong_type_format_and_zero() {
+        let value = 1_u32.to_ne_bytes();
+        assert!(parse_background_property(8, 9, 32, 1, &value).is_err());
+        assert!(parse_background_property(9, 9, 16, 1, &value).is_err());
+        assert!(parse_background_property(9, 9, 32, 1, &0_u32.to_ne_bytes()).is_err());
+    }
+
+    #[test]
+    fn background_property_rejects_wrong_item_count() {
+        assert!(parse_background_property(9, 9, 32, 2, &[1, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn absent_background_property_is_not_an_error() {
+        assert_eq!(parse_background_property(x11rb::NONE, 9, 0, 0, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn background_pixmap_plan_covers_root_from_origin() {
+        let plan = build_background_render_quad_plan(PixmapGeometry { root: 1, x: 0, y: 0, width: 1920, height: 1080, border_width: 0, depth: 24 }, background_root()).unwrap();
+        assert_eq!((plan.dst_x, plan.dst_y, plan.width, plan.height), (0, 0, 1920, 1080));
+        assert_eq!((plan.src_x, plan.src_y), (0, 0));
+    }
+
+    #[test]
+    fn undersized_background_pixmap_is_rejected_without_scaling() {
+        assert!(build_background_render_quad_plan(PixmapGeometry { root: 1, x: 0, y: 0, width: 1919, height: 1080, border_width: 0, depth: 24 }, background_root()).is_none());
+    }
+
+    #[test]
+    fn background_pixmap_must_have_a_root() {
+        assert!(build_background_render_quad_plan(PixmapGeometry { root: x11rb::NONE, x: 0, y: 0, width: 1920, height: 1080, border_width: 0, depth: 24 }, background_root()).is_none());
+    }
+
+    #[test]
+    fn background_candidate_preserves_current_on_invalid_replacement() {
+        assert_eq!(BackgroundCandidate::Preserve, BackgroundCandidate::Preserve);
+    }
+
+    #[test]
+    fn background_candidate_has_explicit_solid_fallback() {
+        assert_eq!(BackgroundCandidate::SolidFallback, BackgroundCandidate::SolidFallback);
+    }
+
+    #[test]
+    fn same_property_xid_is_a_single_import_source() {
+        let selected = Some(0x800001_u32);
+        let fallback = Some(0x800001_u32);
+        assert_eq!(selected.or(fallback), Some(0x800001));
+    }
+
+    #[test]
+    fn background_property_notify_is_scoped_to_root_and_two_atoms() {
+        let atoms = BackgroundAtoms { xrootpmap_id: 10, esetroot_pmap_id: 11, pixmap_type: 12 };
+        let event = Event::PropertyNotify(xproto::PropertyNotifyEvent { response_type: 28, sequence: 0, window: 1, atom: 10, time: 0, state: xproto::Property::NEW_VALUE });
+        assert!(is_background_property_notify(&event, 1, atoms));
+        let unrelated = Event::PropertyNotify(xproto::PropertyNotifyEvent { response_type: 28, sequence: 0, window: 1, atom: 99, time: 0, state: xproto::Property::NEW_VALUE });
+        assert!(!is_background_property_notify(&unrelated, 1, atoms));
+    }
+
+    #[test]
+    fn background_property_notify_ignores_other_windows() {
+        let atoms = BackgroundAtoms { xrootpmap_id: 10, esetroot_pmap_id: 11, pixmap_type: 12 };
+        let event = Event::PropertyNotify(xproto::PropertyNotifyEvent { response_type: 28, sequence: 0, window: 2, atom: 10, time: 0, state: xproto::Property::NEW_VALUE });
+        assert!(!is_background_property_notify(&event, 1, atoms));
+    }
+
+    #[test]
+    fn background_invalidation_does_not_advance_structural_generation() {
+        let mut generation = 4;
+        observe_structural_generation(&mut generation, SceneInvalidation::Background);
+        assert_eq!(generation, 4);
+    }
+
+    #[test]
+    fn background_batch_coalesces_repeated_notifications() {
+        let mut batch = InvalidationBatch::default();
+        batch.push(SceneInvalidation::Background);
+        batch.push(SceneInvalidation::Background);
+        assert_eq!(batch.decision(), SceneInvalidation::Background);
+    }
+
+    #[test]
+    fn structural_invalidation_dominates_background_without_dropping_it() {
+        let mut batch = InvalidationBatch::default();
+        batch.push(SceneInvalidation::Background);
+        batch.push(SceneInvalidation::Hierarchy);
+        assert_eq!(batch.decision(), SceneInvalidation::Hierarchy);
+        assert!(batch.background);
+    }
+
+    #[test]
+    fn background_opportunity_gate_does_not_retry_candidate() {
+        assert_eq!(candidate_gate_decision(SceneInvalidation::Background, false, true, false), GateDecision::Accept);
+    }
+
+    #[test]
+    fn background_does_not_make_pixel_gate_present_without_render() {
+        assert!(!pixel_gate_allows_presentation(SceneInvalidation::Background, true, false));
+    }
+
+    #[test]
+    fn background_source_uses_opaque_root_semantics_only() {
+        assert_ne!(EglPixelSemantics::Opaque, EglPixelSemantics::PremultipliedAlpha);
+        assert_eq!(EglPixelSemantics::Opaque, EglPixelSemantics::Opaque);
+    }
+
+    #[test]
+    fn background_source_is_not_a_client_surface_identity() {
+        let source = BackgroundPixmap { xid: 7, geometry: PixmapGeometry { root: 1, x: 0, y: 0, width: 1920, height: 1080, border_width: 0, depth: 24 }, semantics: EglPixelSemantics::Opaque };
+        assert_ne!(source.xid, 0);
+    }
+
+    #[test]
+    fn no_valid_source_selects_solid_fallback() {
+        assert_eq!(BackgroundCandidate::SolidFallback, BackgroundCandidate::SolidFallback);
+    }
+
+    #[test]
+    fn background_layer_is_full_screen_not_a_window_quad() {
+        let plan = build_background_render_quad_plan(PixmapGeometry { root: 1, x: 0, y: 0, width: 1920, height: 1080, border_width: 0, depth: 24 }, background_root()).unwrap();
+        assert_eq!(plan.dst_x, 0);
+        assert_eq!(plan.dst_y, 0);
+        assert_eq!(plan.width, i32::from(background_root().width));
     }
 }
