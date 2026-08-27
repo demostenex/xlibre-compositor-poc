@@ -13,7 +13,9 @@ pub(crate) struct VisualConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BorderConfig {
     pub(crate) width: f32,
-    pub(crate) color: [f32; 4],
+    pub(crate) inactive_color: [f32; 4],
+    pub(crate) focused_color: [f32; 4],
+    pub(crate) urgent_color: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -45,7 +47,12 @@ impl Default for VisualConfig {
 
 impl Default for BorderConfig {
     fn default() -> Self {
-        Self { width: 0.0, color: [0.0, 0.0, 0.0, 1.0] }
+        Self {
+            width: 0.0,
+            inactive_color: [0.0, 0.0, 0.0, 1.0],
+            focused_color: [0.0, 0.0, 0.0, 1.0],
+            urgent_color: [0.0, 0.0, 0.0, 1.0],
+        }
     }
 }
 
@@ -75,15 +82,26 @@ impl CompositorConfig {
         Ok(config)
     }
 
-    pub(crate) fn with_border(
+    pub(crate) fn with_border_colors(
         mut self,
         width: f32,
-        color: [f32; 4],
+        inactive_color: [f32; 4],
+        focused_color: [f32; 4],
+        urgent_color: [f32; 4],
     ) -> Result<Self, &'static str> {
-        if !width.is_finite() || width < 0.0 || color.iter().any(|value| !value.is_finite() || *value < 0.0 || *value > 1.0) {
-            return Err("border width and color must be finite and within range");
+        let colors = [inactive_color, focused_color, urgent_color];
+        if !width.is_finite()
+            || width < 0.0
+            || colors.iter().flatten().any(|value| !value.is_finite() || *value < 0.0 || *value > 1.0)
+        {
+            return Err("border width and colors must be finite and within range");
         }
-        self.visuals.border = BorderConfig { width, color };
+        self.visuals.border = BorderConfig {
+            width,
+            inactive_color,
+            focused_color,
+            urgent_color,
+        };
         Ok(self)
     }
 
@@ -108,6 +126,9 @@ mod tests {
         let visuals = CompositorConfig::defaults().visuals;
         assert_eq!(visuals.corner_radius, 0.0);
         assert_eq!(visuals.border.width, 0.0);
+        assert_eq!(visuals.border.inactive_color, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(visuals.border.focused_color, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(visuals.border.urgent_color, [0.0, 0.0, 0.0, 1.0]);
         let shadow = visuals.shadow;
         assert!(!shadow.enabled);
         assert_eq!(shadow.offset_x, 0.0);
@@ -130,9 +151,19 @@ mod tests {
 
     #[test]
     fn border_defaults_and_color_parser_are_deterministic() {
-        assert_eq!(CompositorConfig::defaults().visuals.border.color, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(CompositorConfig::defaults().visuals.border.inactive_color, [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(CompositorConfig::parse_color("#336699cc").unwrap(), [0.2, 0.4, 0.6, 0.8]);
         assert!(CompositorConfig::parse_color("xyz").is_err());
+    }
+
+    #[test]
+    fn border_state_colors_are_owned_by_one_typed_config() {
+        let config = CompositorConfig::defaults()
+            .with_border_colors(2.0, [0.1, 0.1, 0.1, 1.0], [0.2, 0.3, 0.4, 1.0], [1.0, 0.0, 0.0, 1.0])
+            .unwrap();
+        assert_eq!(config.visuals.border.width, 2.0);
+        assert_eq!(config.visuals.border.focused_color, [0.2, 0.3, 0.4, 1.0]);
+        assert!(CompositorConfig::defaults().with_border_colors(2.0, [2.0, 0.0, 0.0, 1.0], [0.0; 4], [0.0; 4]).is_err());
     }
 
 }

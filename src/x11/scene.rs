@@ -44,6 +44,20 @@ struct BackgroundAtoms {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VisualAtoms {
+    active_window: xproto::Atom,
+    wm_hints: xproto::Atom,
+    net_wm_state: xproto::Atom,
+    demands_attention: xproto::Atom,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CachedUrgency {
+    wm_hints: bool,
+    demands_attention: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BackgroundPixmap {
     xid: xproto::Pixmap,
     geometry: PixmapGeometry,
@@ -76,6 +90,7 @@ struct SurfaceEntry {
     stacking_index: usize,
     backend: BackendCompatibility,
     visual_class: SurfaceVisualClass,
+    resolved_border_color: [u32; 4],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +98,13 @@ enum SurfaceVisualClass {
     Normal,
     Dock,
     Desktop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BorderVisualState {
+    Inactive,
+    Focused,
+    Urgent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -505,6 +527,7 @@ fn eligible_surface(
         stacking_index,
         backend,
         visual_class: classify_surface_visual_class(metadata.window_type.as_deref()),
+        resolved_border_color: [0.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits()],
     })
 }
 
@@ -532,7 +555,7 @@ fn apply_surface_visual_policy(
     }
     plan.corner_radius = effective_corner_radius(config.corner_radius, plan.width, plan.height);
     plan.border_width = effective_border_width(config.border.width, plan.width, plan.height);
-    plan.border_color = config.border.color;
+    plan.border_color = config.border.inactive_color;
 }
 
 fn println_surface(entry: &SurfaceEntry) {
@@ -1082,6 +1105,7 @@ enum SceneInvalidation {
     Ignore,
     PixelDamage(damage::Damage),
     Background,
+    VisualState,
     Geometry(Window),
     Hierarchy,
     Shutdown(ShutdownReason),
@@ -1101,6 +1125,7 @@ struct InvalidationBatch {
     shutdown: Option<ShutdownReason>,
     pixel_damage: HashSet<damage::Damage>,
     background: bool,
+    visual_state: bool,
 }
 
 impl InvalidationBatch {
@@ -1111,6 +1136,7 @@ impl InvalidationBatch {
                 self.pixel_damage.insert(damage_id);
             }
             SceneInvalidation::Background => self.background = true,
+            SceneInvalidation::VisualState => self.visual_state = true,
             SceneInvalidation::Geometry(window) if !self.hierarchy => {
                 self.geometry = Some(window);
             }
@@ -1134,6 +1160,8 @@ impl InvalidationBatch {
             SceneInvalidation::Geometry(window)
         } else if self.background {
             SceneInvalidation::Background
+        } else if self.visual_state {
+            SceneInvalidation::VisualState
         } else if let Some(damage_id) = self.pixel_damage.iter().next().copied() {
             SceneInvalidation::PixelDamage(damage_id)
         } else {
@@ -1172,6 +1200,11 @@ struct SceneSession<'a> {
     egl_surfaces: HashMap<Window, EglImportedSurface>,
     background: Option<ImportedBackground>,
     background_atoms: BackgroundAtoms,
+    visual_atoms: VisualAtoms,
+    active_window: Option<Window>,
+    active_window_initialized: bool,
+    urgency: HashMap<Window, CachedUrgency>,
+    pending_visual_state: bool,
     signal: SignalWake,
     scheduler: FrameScheduler,
     present: Option<PresentClock>,
@@ -1344,6 +1377,7 @@ impl<'a> SceneSession<'a> {
         ensure_damage_version(connection)?;
         let visual_formats = VisualFormatCache::acquire(connection)?;
         let background_atoms = acquire_background_atoms(connection)?;
+        let visual_atoms = acquire_visual_atoms(connection)?;
         let signal = SignalWake::install()?;
         let ownership = CompositorOwnership::claim(connection)?;
         let mut overlay = OverlayLease::acquire(connection, root)?;
@@ -1404,6 +1438,11 @@ impl<'a> SceneSession<'a> {
             egl_surfaces: HashMap::new(),
             background: None,
             background_atoms,
+            visual_atoms,
+            active_window: None,
+            active_window_initialized: false,
+            urgency: HashMap::new(),
+            pending_visual_state: false,
             signal,
             scheduler: FrameScheduler::new(),
             present,
@@ -1438,6 +1477,25 @@ impl<'a> SceneSession<'a> {
         self.arm_next_presentation(0)
     }
 
+    fn initialize_visual_state(&mut self, snapshot: &SceneSnapshot) -> Result<(), Box<dyn Error>> {
+        if !self.active_window_initialized {
+            self.active_window = read_active_window(self.connection, self.root, self.visual_atoms.active_window)?;
+            self.active_window_initialized = true;
+        }
+        for client in snapshot.entries.iter().filter_map(|entry| entry.semantic_client_xid) {
+            if self.urgency.contains_key(&client) {
+                continue;
+            }
+            let cached = match read_client_urgency(self.connection, client, self.visual_atoms) {
+                Ok(cached) => cached,
+                Err(error) if super::capture::is_bad_window_error(error.as_ref()) => CachedUrgency::default(),
+                Err(error) => return Err(error),
+            };
+            self.urgency.insert(client, cached);
+        }
+        Ok(())
+    }
+
     fn build_candidate(&mut self) -> Result<SceneCandidate<'a>, Box<dyn Error>> {
         let generation = self.structural_generation;
         let root_geometry = read_root_geometry(self.connection, self.root)?;
@@ -1449,12 +1507,14 @@ impl<'a> SceneSession<'a> {
             .as_ref()
             .ok_or("ownership is unavailable")?
             .owner_window;
-        let snapshot = SceneSnapshot::from_hierarchy(
+        let mut snapshot = SceneSnapshot::from_hierarchy(
             hierarchy,
             root_geometry,
             overlay,
             owner,
         )?;
+        self.initialize_visual_state(&snapshot)?;
+        resolve_snapshot_border_colors(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
         self.state = SceneState::SceneSnapshotReady;
         let mut pixmaps = Vec::new();
         let mut damage_leases = Vec::new();
@@ -1589,8 +1649,16 @@ impl<'a> SceneSession<'a> {
                 break;
             };
             drained += 1;
+            let visual_invalidation = if is_visual_property_notify(&event, self.root, self.visual_atoms, &candidate.snapshot) {
+                let entries = candidate.snapshot.entries.clone();
+                self.update_visual_state(&event, &entries)?
+            } else {
+                None
+            };
             let invalidation = if is_background_property_notify(&event, self.root, self.background_atoms) {
                 SceneInvalidation::Background
+            } else if let Some(invalidation) = visual_invalidation {
+                invalidation
             } else {
                 classify_event_with_registries(
                 event,
@@ -1670,6 +1738,13 @@ impl<'a> SceneSession<'a> {
         let mut old_egl_surfaces = std::mem::replace(&mut self.egl_surfaces, candidate.egl_surfaces);
         self.damage_registry = candidate.damage_registry;
         self.snapshot = Some(snapshot);
+        let live_clients = self
+            .current_snapshot()
+            .entries
+            .iter()
+            .filter_map(|entry| entry.semantic_client_xid)
+            .collect::<HashSet<_>>();
+        self.urgency.retain(|client, _| live_clients.contains(client));
         self.structure_watches.reconcile(&candidate.watch_ids)?;
         for damage in &old_damage_leases {
             retire_damage_lease(damage, removed_surfaces.contains(&damage.surface_xid))?;
@@ -1714,6 +1789,10 @@ impl<'a> SceneSession<'a> {
                 self.pending_background = true;
                 self.scheduler.mark_pixel_dirty();
             }
+            SceneInvalidation::VisualState => {
+                self.pending_visual_state = true;
+                self.scheduler.mark_pixel_dirty();
+            }
             SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy => {
                 self.scheduler.mark_structural_dirty(self.structural_generation)
             }
@@ -1746,7 +1825,12 @@ impl<'a> SceneSession<'a> {
             if self.pending_background {
                 batch.push(SceneInvalidation::Background);
             }
-            let had_pending_work = pending_work_requires_iteration(&pending) || self.pending_background;
+            if self.pending_visual_state {
+                batch.push(SceneInvalidation::VisualState);
+            }
+            let had_pending_work = pending_work_requires_iteration(&pending)
+                || self.pending_background
+                || self.pending_visual_state;
             if matches!(
                 structural_generation_state(
                     self.structural_generation,
@@ -1772,12 +1856,10 @@ impl<'a> SceneSession<'a> {
                     }
                 };
                 opportunity_msc = self.present_opportunity(&first);
-                let invalidation = self.classify_session_event(
-                    first,
-                    self.current_snapshot(),
-                    &self.damage_registry,
-                    &self.damage_registry,
-                );
+                let visual_invalidation = self.maybe_update_visual_state(&first)?;
+                let invalidation = visual_invalidation.unwrap_or_else(|| {
+                    self.classify_session_event(first, self.current_snapshot(), &self.damage_registry, &self.damage_registry)
+                });
                 self.observe_invalidation(invalidation);
                 batch.push(invalidation);
                 for _ in 1..MAX_EVENTS_PER_BATCH {
@@ -1785,12 +1867,10 @@ impl<'a> SceneSession<'a> {
                         break;
                     };
                     opportunity_msc = opportunity_msc.or_else(|| self.present_opportunity(&event));
-                    let invalidation = self.classify_session_event(
-                        event,
-                        self.current_snapshot(),
-                        &self.damage_registry,
-                        &self.damage_registry,
-                    );
+                    let visual_invalidation = self.maybe_update_visual_state(&event)?;
+                    let invalidation = visual_invalidation.unwrap_or_else(|| {
+                        self.classify_session_event(event, self.current_snapshot(), &self.damage_registry, &self.damage_registry)
+                    });
                     self.observe_invalidation(invalidation);
                     batch.push(invalidation);
                 }
@@ -1803,10 +1883,17 @@ impl<'a> SceneSession<'a> {
                 self.pending_damage.extend(batch.pixel_damage().iter().copied());
                 continue;
             }
+            let decision = batch.decision();
+            let batch_pixel_damage = batch.pixel_damage().clone();
+            if batch_damage_requires_subtraction(decision, &batch_pixel_damage) {
+                for damage_id in &batch_pixel_damage {
+                    self.damage_lease(*damage_id)?.subtract()?;
+                }
+            }
             if present_enabled {
                 self.pending_damage.clear();
             }
-            match batch.decision() {
+            match decision {
                 SceneInvalidation::Ignore => {}
                 SceneInvalidation::Shutdown(reason) => {
                     println!("scene shutdown: {reason:?}");
@@ -1821,6 +1908,11 @@ impl<'a> SceneSession<'a> {
                 SceneInvalidation::Background => {
                     self.pending_background = false;
                     self.refresh_background()?;
+                    self.full_recompose_current()?;
+                    self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap()?;
+                }
+                SceneInvalidation::VisualState => {
+                    self.pending_visual_state = false;
                     self.full_recompose_current()?;
                     self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap()?;
                 }
@@ -1877,6 +1969,11 @@ impl<'a> SceneSession<'a> {
                 self.full_recompose_current()?;
                 return self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap();
             }
+            SceneInvalidation::VisualState => {
+                self.pending_visual_state = false;
+                self.full_recompose_current()?;
+                return self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap();
+            }
             SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => {}
         }
         self.full_recompose_current()?;
@@ -1912,6 +2009,10 @@ impl<'a> SceneSession<'a> {
                 self.pending_background = true;
                 Ok(())
             }
+            SceneInvalidation::VisualState => {
+                self.pending_visual_state = true;
+                Ok(())
+            }
             SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => Ok(()),
         }
     }
@@ -1922,12 +2023,10 @@ impl<'a> SceneSession<'a> {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
             };
-            let invalidation = self.classify_session_event(
-                event,
-                self.current_snapshot(),
-                &self.damage_registry,
-                &self.damage_registry,
-            );
+            let visual_invalidation = self.maybe_update_visual_state(&event)?;
+            let invalidation = visual_invalidation.unwrap_or_else(|| {
+                self.classify_session_event(event, self.current_snapshot(), &self.damage_registry, &self.damage_registry)
+            });
             self.observe_invalidation(invalidation);
             batch.push(invalidation);
         }
@@ -1963,6 +2062,102 @@ impl<'a> SceneSession<'a> {
                 candidate_registry,
             )
         }
+    }
+
+    fn maybe_update_visual_state(
+        &mut self,
+        event: &Event,
+    ) -> Result<Option<SceneInvalidation>, Box<dyn Error>> {
+        let relevant = {
+            let snapshot = self.current_snapshot();
+            is_visual_property_notify(event, self.root, self.visual_atoms, snapshot)
+        };
+        if !relevant {
+            return Ok(None);
+        }
+        let entries = self.current_snapshot().entries.clone();
+        self.update_visual_state(event, &entries)
+    }
+
+    fn update_visual_state(
+        &mut self,
+        event: &Event,
+        entries: &[SurfaceEntry],
+    ) -> Result<Option<SceneInvalidation>, Box<dyn Error>> {
+        let Event::PropertyNotify(property) = event else {
+            return Ok(None);
+        };
+        if property.window == self.root && property.atom == self.visual_atoms.active_window {
+            let active_window = read_active_window(self.connection, self.root, self.visual_atoms.active_window)?;
+            if active_window == self.active_window {
+                return Ok(None);
+            }
+            let previous = self.active_window;
+            let affected = entries.iter().any(|entry| {
+                entry.semantic_client_xid == previous || entry.semantic_client_xid == active_window
+            });
+            self.active_window = active_window;
+            let changed = affected && self.refresh_resolved_border_colors(&[previous, active_window]);
+            return Ok(changed.then_some(SceneInvalidation::VisualState));
+        }
+        let Some(entry) = entries.iter().find(|entry| entry.semantic_client_xid == Some(property.window)) else {
+            return Ok(None);
+        };
+        let Some(old) = self.urgency.get(&property.window).copied() else {
+            return Ok(None);
+        };
+        let updated = if property.atom == self.visual_atoms.wm_hints {
+            let wm_hints = match read_wm_hints_urgency(self.connection, property.window, self.visual_atoms.wm_hints) {
+                Ok(value) => value,
+                Err(error) if super::capture::is_bad_window_error(error.as_ref()) => {
+                    self.urgency.remove(&property.window);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            CachedUrgency { wm_hints, ..old }
+        } else if property.atom == self.visual_atoms.net_wm_state {
+            let demands_attention = match read_demands_attention(self.connection, property.window, self.visual_atoms) {
+                Ok(value) => value,
+                Err(error) if super::capture::is_bad_window_error(error.as_ref()) => {
+                    self.urgency.remove(&property.window);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            CachedUrgency { demands_attention, ..old }
+        } else {
+            return Ok(None);
+        };
+        self.urgency.insert(property.window, updated);
+        let before = entry.resolved_border_color;
+        let changed = self.refresh_resolved_border_colors(&[Some(property.window)]);
+        let after = self.current_snapshot().entries.iter()
+            .find(|candidate| candidate.semantic_client_xid == Some(property.window))
+            .map_or(before, |candidate| candidate.resolved_border_color);
+        if changed && before != after {
+            Ok(Some(SceneInvalidation::VisualState))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn refresh_resolved_border_colors(&mut self, clients: &[Option<Window>]) -> bool {
+        let active_window = self.active_window;
+        let visuals = &self._config.visuals;
+        let urgency = &self.urgency;
+        let Some(snapshot) = self.snapshot.as_mut() else { return false; };
+        let mut changed = false;
+        for entry in &mut snapshot.entries {
+            if !clients.iter().any(|client| *client == entry.semantic_client_xid) {
+                continue;
+            }
+            let color = resolved_border_color(visuals, entry, active_window, urgency);
+            let color = color.map(f32::to_bits);
+            changed |= entry.resolved_border_color != color;
+            entry.resolved_border_color = color;
+        }
+        changed
     }
 
     fn refresh_background(&mut self) -> Result<(), Box<dyn Error>> {
@@ -2031,6 +2226,7 @@ impl<'a> SceneSession<'a> {
             let mut plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
                 .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
             apply_surface_visual_policy(&mut plan, &self._config.visuals, entry.visual_class);
+            plan.border_color = entry.resolved_border_color.map(f32::from_bits);
             egl.render_surface(
                 surface.texture,
                 plan,
@@ -2398,6 +2594,123 @@ fn acquire_background_atoms(connection: &X11Connection) -> Result<BackgroundAtom
     })
 }
 
+fn acquire_visual_atoms(connection: &X11Connection) -> Result<VisualAtoms, Box<dyn Error>> {
+    let intern = |name: &[u8]| -> Result<xproto::Atom, Box<dyn Error>> {
+        Ok(connection.inner.intern_atom(false, name)?.reply()?.atom)
+    };
+    Ok(VisualAtoms {
+        active_window: intern(b"_NET_ACTIVE_WINDOW")?,
+        wm_hints: intern(b"WM_HINTS")?,
+        net_wm_state: intern(b"_NET_WM_STATE")?,
+        demands_attention: intern(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
+    })
+}
+
+fn read_active_window(connection: &X11Connection, root: Window, atom: xproto::Atom) -> Result<Option<Window>, Box<dyn Error>> {
+    let reply = connection.inner.get_property(false, root, atom, xproto::AtomEnum::WINDOW, 0, 1)?.reply()?;
+    Ok(reply.value32().and_then(|mut values| values.next()).filter(|window| *window != x11rb::NONE))
+}
+
+fn read_client_urgency(
+    connection: &X11Connection,
+    client: Window,
+    atoms: VisualAtoms,
+) -> Result<CachedUrgency, Box<dyn Error>> {
+    let hints = connection.inner.get_property(false, client, atoms.wm_hints, xproto::AtomEnum::ANY, 0, 9)?.reply()?;
+    let wm_hints_urgent = wm_hints_urgency(hints.value32().and_then(|mut values| values.next()));
+    let state = connection.inner.get_property(false, client, atoms.net_wm_state, xproto::AtomEnum::ATOM, 0, u32::MAX)?.reply()?;
+    Ok(CachedUrgency {
+        wm_hints: wm_hints_urgent,
+        demands_attention: state_demands_attention(state.value32(), atoms.demands_attention),
+    })
+}
+
+fn read_wm_hints_urgency(
+    connection: &X11Connection,
+    client: Window,
+    atom: xproto::Atom,
+) -> Result<bool, Box<dyn Error>> {
+    let hints = connection.inner.get_property(false, client, atom, xproto::AtomEnum::ANY, 0, 9)?.reply()?;
+    Ok(wm_hints_urgency(hints.value32().and_then(|mut values| values.next())))
+}
+
+fn read_demands_attention(
+    connection: &X11Connection,
+    client: Window,
+    atoms: VisualAtoms,
+) -> Result<bool, Box<dyn Error>> {
+    let state = connection.inner.get_property(false, client, atoms.net_wm_state, xproto::AtomEnum::ATOM, 0, u32::MAX)?.reply()?;
+    Ok(state_demands_attention(state.value32(), atoms.demands_attention))
+}
+
+fn wm_hints_urgency(flags: Option<u32>) -> bool {
+    flags.is_some_and(|flags| flags & (1 << 8) != 0)
+}
+
+fn state_demands_attention(values: Option<impl Iterator<Item = u32>>, atom: xproto::Atom) -> bool {
+    values.is_some_and(|mut values| values.any(|value| value == atom))
+}
+
+fn border_visual_state(
+    entry: &SurfaceEntry,
+    active_window: Option<Window>,
+    urgency: &HashMap<Window, CachedUrgency>,
+) -> BorderVisualState {
+    if matches!(entry.visual_class, SurfaceVisualClass::Dock | SurfaceVisualClass::Desktop) {
+        return BorderVisualState::Inactive;
+    }
+    if entry.semantic_client_xid.is_some_and(|client| urgency.get(&client).is_some_and(|state| state.wm_hints || state.demands_attention)) {
+        BorderVisualState::Urgent
+    } else if entry.semantic_client_xid == active_window {
+        BorderVisualState::Focused
+    } else {
+        BorderVisualState::Inactive
+    }
+}
+
+fn border_color(config: &crate::config::BorderConfig, state: BorderVisualState) -> [f32; 4] {
+    match state {
+        BorderVisualState::Inactive => config.inactive_color,
+        BorderVisualState::Focused => config.focused_color,
+        BorderVisualState::Urgent => config.urgent_color,
+    }
+}
+
+fn rendered_border_color(
+    visuals: &crate::config::VisualConfig,
+    entry: &SurfaceEntry,
+    active_window: Option<Window>,
+    urgency: &HashMap<Window, CachedUrgency>,
+) -> Option<[f32; 4]> {
+    if matches!(entry.visual_class, SurfaceVisualClass::Dock | SurfaceVisualClass::Desktop)
+        || effective_border_width(visuals.border.width, i32::from(entry.geometry.width), i32::from(entry.geometry.height)) == 0.0
+    {
+        return None;
+    }
+    Some(border_color(&visuals.border, border_visual_state(entry, active_window, urgency)))
+}
+
+fn resolved_border_color(
+    visuals: &crate::config::VisualConfig,
+    entry: &SurfaceEntry,
+    active_window: Option<Window>,
+    urgency: &HashMap<Window, CachedUrgency>,
+) -> [f32; 4] {
+    rendered_border_color(visuals, entry, active_window, urgency)
+        .unwrap_or([0.0, 0.0, 0.0, 1.0])
+}
+
+fn resolve_snapshot_border_colors(
+    snapshot: &mut SceneSnapshot,
+    visuals: &crate::config::VisualConfig,
+    active_window: Option<Window>,
+    urgency: &HashMap<Window, CachedUrgency>,
+) {
+    for entry in &mut snapshot.entries {
+        entry.resolved_border_color = resolved_border_color(visuals, entry, active_window, urgency).map(f32::to_bits);
+    }
+}
+
 fn parse_background_property(
     property_type: xproto::Atom,
     pixmap_type: xproto::Atom,
@@ -2512,13 +2825,12 @@ fn is_background_property_notify(event: &Event, root: Window, atoms: BackgroundA
 }
 
 fn snapshot_watch_ids(snapshot: &HierarchySnapshot) -> HashSet<Window> {
-    // 3A3c5b1 watches canonical root-child topology only; descendants are
-    // snapshot metadata and are not recursively watched.
-    snapshot
-        .children
-        .iter()
-        .map(|binding| binding.root_child_xid)
-        .collect()
+    let mut ids = HashSet::new();
+    for binding in &snapshot.children {
+        ids.insert(binding.root_child_xid);
+        ids.extend(binding.semantic_client_xids.iter().copied());
+    }
+    ids
 }
 
 fn root_live_event_mask(previous: EventMask) -> EventMask {
@@ -2526,7 +2838,25 @@ fn root_live_event_mask(previous: EventMask) -> EventMask {
 }
 
 fn canonical_live_event_mask(previous: EventMask) -> EventMask {
-    previous | EventMask::STRUCTURE_NOTIFY
+    previous | EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE
+}
+
+fn is_visual_property_notify(
+    event: &Event,
+    root: Window,
+    atoms: VisualAtoms,
+    snapshot: &SceneSnapshot,
+) -> bool {
+    let Event::PropertyNotify(event) = event else {
+        return false;
+    };
+    if event.window == root && event.atom == atoms.active_window {
+        return true;
+    }
+    snapshot.entries.iter().any(|entry| {
+        entry.semantic_client_xid == Some(event.window)
+            && (event.atom == atoms.wm_hints || event.atom == atoms.net_wm_state)
+    })
 }
 
 #[cfg(test)]
@@ -2595,6 +2925,18 @@ fn observe_structural_generation(generation: &mut u64, invalidation: SceneInvali
     }
 }
 
+fn batch_damage_requires_subtraction(
+    decision: SceneInvalidation,
+    pixel_damage: &HashSet<damage::Damage>,
+) -> bool {
+    !pixel_damage.is_empty()
+        && matches!(
+            decision,
+            SceneInvalidation::Background
+                | SceneInvalidation::VisualState
+        )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StructuralGenerationState {
     Ready(u64),
@@ -2640,7 +2982,7 @@ fn candidate_gate_decision(
     ownership_verified: bool,
     signal_pending: bool,
 ) -> GateDecision {
-    if matches!(batch, SceneInvalidation::PixelDamage(_) | SceneInvalidation::Background) && !overflow {
+    if matches!(batch, SceneInvalidation::PixelDamage(_) | SceneInvalidation::Background | SceneInvalidation::VisualState) && !overflow {
         if !guards_allow_retry(ownership_verified, signal_pending) {
             if !ownership_verified {
                 return GateDecision::Shutdown(ShutdownReason::OwnershipLost);
@@ -2717,7 +3059,9 @@ mod tests {
         parse_background_property, build_background_render_quad_plan,
         effective_corner_radius,
         effective_border_width,
-        classify_surface_visual_class, apply_surface_visual_policy, SurfaceVisualClass,
+        classify_surface_visual_class, apply_surface_visual_policy, border_visual_state,
+        rendered_border_color, BorderVisualState, CachedUrgency, SurfaceVisualClass,
+        wm_hints_urgency, state_demands_attention,
         is_background_property_notify, BackgroundAtoms, BackgroundCandidate, BackgroundPixmap,
         classify_event, coordinator_requires_cleanup, eligible_surface,
         is_internal_xid, root_guard, BackendCompatibility, CandidateBuildError, CopyPlan,
@@ -2734,6 +3078,7 @@ mod tests {
         root_live_event_mask, canonical_live_event_mask, snapshot_watch_ids, SceneState,
         ShutdownReason, SurfaceEntry, MAX_CANDIDATE_RETRIES, MAX_EVENTS_PER_BATCH,
         observe_structural_generation,
+        batch_damage_requires_subtraction,
         structural_generation_state, StructuralGenerationState,
         FrameScheduler, FrameSchedulerState,
         classify_retired_damage_destroy, DamageDestroyClassification, DamageReleaseOutcome,
@@ -3146,6 +3491,44 @@ mod tests {
         batch.push(SceneInvalidation::PixelDamage(42));
         batch.push(SceneInvalidation::PixelDamage(42));
         assert_eq!(batch.pixel_damage().len(), 1);
+    }
+
+    #[test]
+    fn visual_batch_preserves_pixel_subtraction_obligation() {
+        let damage = HashSet::from([41_u32, 42_u32]);
+        assert!(batch_damage_requires_subtraction(
+            SceneInvalidation::VisualState,
+            &damage,
+        ));
+        assert!(batch_damage_requires_subtraction(
+            SceneInvalidation::Background,
+            &damage,
+        ));
+        assert!(!batch_damage_requires_subtraction(
+            SceneInvalidation::PixelDamage(41),
+            &HashSet::new(),
+        ));
+    }
+
+    #[test]
+    fn combined_visual_pixel_batch_subtracts_each_id_once() {
+        let mut batch = InvalidationBatch::default();
+        batch.push(SceneInvalidation::VisualState);
+        batch.push(SceneInvalidation::PixelDamage(41));
+        batch.push(SceneInvalidation::PixelDamage(41));
+        batch.push(SceneInvalidation::PixelDamage(42));
+        let ids = batch.pixel_damage().clone();
+        assert_eq!(batch.decision(), SceneInvalidation::VisualState);
+        assert!(batch_damage_requires_subtraction(batch.decision(), &ids));
+        assert_eq!(subtract_plan(&ids).len(), 2);
+    }
+
+    #[test]
+    fn visual_only_batch_has_no_damage_subtraction_obligation() {
+        assert!(!batch_damage_requires_subtraction(
+            SceneInvalidation::VisualState,
+            &HashSet::new(),
+        ));
     }
 
     #[test]
@@ -3581,6 +3964,96 @@ mod tests {
     }
 
     #[test]
+    fn border_state_precedence_is_urgent_then_focused_then_inactive() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        assert_eq!(border_visual_state(&entry, None, &HashMap::new()), BorderVisualState::Inactive);
+        assert_eq!(border_visual_state(&entry, Some(20), &HashMap::new()), BorderVisualState::Focused);
+        assert_eq!(border_visual_state(&entry, Some(20), &HashMap::from([(20, CachedUrgency { wm_hints: true, demands_attention: false })])), BorderVisualState::Urgent);
+        assert_eq!(entry.surface_xid, 10);
+        assert_eq!(entry.lifecycle_xid, 10);
+    }
+
+    #[test]
+    fn visual_state_changes_coalesce_without_structural_invalidation() {
+        let mut batch = InvalidationBatch::default();
+        batch.push(SceneInvalidation::VisualState);
+        batch.push(SceneInvalidation::VisualState);
+        assert_eq!(batch.decision(), SceneInvalidation::VisualState);
+        let mut generation = 4;
+        observe_structural_generation(&mut generation, SceneInvalidation::VisualState);
+        assert_eq!(generation, 4);
+    }
+
+    #[test]
+    fn both_supported_urgency_sources_are_recognized() {
+        assert!(wm_hints_urgency(Some(1 << 8)));
+        assert!(!wm_hints_urgency(Some(0)));
+        assert!(!wm_hints_urgency(None));
+        assert!(state_demands_attention(Some([7, 42].into_iter()), 42));
+        assert!(!state_demands_attention(Some([7, 42].into_iter()), 9));
+    }
+
+    #[test]
+    fn identical_active_client_has_identical_rendered_state() {
+        let config = crate::config::CompositorConfig::defaults()
+            .with_border_colors(2.0, [0.1, 0.1, 0.1, 1.0], [0.2, 0.2, 0.2, 1.0], [1.0, 0.0, 0.0, 1.0])
+            .unwrap();
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let urgency = HashMap::new();
+        assert_eq!(
+            rendered_border_color(&config.visuals, &entry, Some(20), &urgency),
+            rendered_border_color(&config.visuals, &entry, Some(20), &urgency)
+        );
+    }
+
+    #[test]
+    fn focus_transition_only_changes_old_and_new_canonical_surfaces() {
+        let config = crate::config::CompositorConfig::defaults()
+            .with_border_colors(2.0, [0.1, 0.1, 0.1, 1.0], [0.2, 0.2, 0.2, 1.0], [1.0, 0.0, 0.0, 1.0])
+            .unwrap();
+        let first = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let second = eligible_surface(&metadata(), Some(30), root(), 11, 1).unwrap();
+        let urgency = HashMap::new();
+        let before_first = rendered_border_color(&config.visuals, &first, Some(20), &urgency);
+        let after_first = rendered_border_color(&config.visuals, &first, Some(30), &urgency);
+        let before_second = rendered_border_color(&config.visuals, &second, Some(20), &urgency);
+        let after_second = rendered_border_color(&config.visuals, &second, Some(30), &urgency);
+        assert_ne!(before_first, after_first);
+        assert_ne!(before_second, after_second);
+        assert_eq!(first.surface_xid, 10);
+        assert_eq!(second.surface_xid, 11);
+    }
+
+    #[test]
+    fn clearing_one_urgency_source_does_not_dirty_when_other_remains() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let mut urgency = HashMap::from([(20, CachedUrgency { wm_hints: true, demands_attention: true })]);
+        let before = border_visual_state(&entry, Some(20), &urgency);
+        urgency.insert(20, CachedUrgency { wm_hints: false, demands_attention: true });
+        let after = border_visual_state(&entry, Some(20), &urgency);
+        assert_eq!(before, BorderVisualState::Urgent);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn removed_client_is_purged_from_visual_cache() {
+        let mut urgency = HashMap::from([(20, CachedUrgency { wm_hints: true, demands_attention: false })]);
+        let live = HashSet::from([30]);
+        urgency.retain(|client, _| live.contains(client));
+        assert!(urgency.is_empty());
+    }
+
+    #[test]
+    fn dock_and_desktop_never_receive_stateful_border() {
+        for kind in ["_NET_WM_WINDOW_TYPE_DOCK", "_NET_WM_WINDOW_TYPE_DESKTOP"] {
+            let mut source = metadata();
+            source.window_type = Some(kind.to_owned());
+            let entry = eligible_surface(&source, Some(20), root(), 10, 0).unwrap();
+            assert_eq!(border_visual_state(&entry, Some(20), &HashMap::from([(20, CachedUrgency { wm_hints: true, demands_attention: true })])), BorderVisualState::Inactive);
+        }
+    }
+
+    #[test]
     fn guards_require_ownership_and_no_pending_signal() {
         assert!(guards_allow_retry(true, false));
         assert!(!guards_allow_retry(false, false));
@@ -3594,6 +4067,7 @@ mod tests {
         assert!(root_mask.contains(EventMask::SUBSTRUCTURE_NOTIFY));
         let canonical_mask = canonical_live_event_mask(EventMask::NO_EVENT);
         assert!(canonical_mask.contains(EventMask::STRUCTURE_NOTIFY));
+        assert!(canonical_mask.contains(EventMask::PROPERTY_CHANGE));
         assert!(!canonical_mask.contains(EventMask::SUBSTRUCTURE_NOTIFY));
     }
 
@@ -3612,7 +4086,7 @@ mod tests {
             root: 1,
             children: vec![binding],
         };
-        assert_eq!(snapshot_watch_ids(&snapshot), HashSet::from([10]));
+        assert_eq!(snapshot_watch_ids(&snapshot), HashSet::from([10, 30]));
     }
 
     #[test]
@@ -3990,7 +4464,7 @@ mod tests {
     fn visual_policy_decorates_normal_but_excludes_dock_and_desktop() {
         let config = crate::config::CompositorConfig::with_corner_radius(12.0)
             .unwrap()
-            .with_border(2.0, [1.0, 0.0, 0.0, 1.0])
+            .with_border_colors(2.0, [1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0])
             .unwrap();
         let mut normal = build_render_quad_plan(window(0, 0, 20, 20, 0), pixmap(20, 20), root()).unwrap();
         apply_surface_visual_policy(&mut normal, &config.visuals, SurfaceVisualClass::Normal);
