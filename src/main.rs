@@ -5,6 +5,90 @@ mod x11;
 
 use std::error::Error;
 
+#[derive(Clone, Debug, PartialEq)]
+struct ShadowCliArgs {
+    enabled: bool,
+    color: Option<String>,
+    extent: Option<f32>,
+    offset_x: Option<f32>,
+    offset_y: Option<f32>,
+    strength: Option<f32>,
+}
+
+fn parse_shadow_arguments(args: &[String]) -> Result<ShadowCliArgs, Box<dyn Error>> {
+    let mut parsed = ShadowCliArgs {
+        enabled: false,
+        color: None,
+        extent: None,
+        offset_x: None,
+        offset_y: None,
+        strength: None,
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--compositor-shadow-enabled" => parsed.enabled = true,
+            "--compositor-shadow-color" => {
+                index += 1;
+                parsed.color = Some(args.get(index).ok_or(
+                    "--compositor-shadow-color requires RRGGBB",
+                )?.clone());
+            }
+            "--compositor-shadow-extent" => {
+                index += 1;
+                parsed.extent = Some(args.get(index).ok_or(
+                    "--compositor-shadow-extent requires FLOAT",
+                )?.parse::<f32>()?);
+            }
+            "--compositor-shadow-offset-x" => {
+                index += 1;
+                parsed.offset_x = Some(args.get(index).ok_or(
+                    "--compositor-shadow-offset-x requires FLOAT",
+                )?.parse::<f32>()?);
+            }
+            "--compositor-shadow-offset-y" => {
+                index += 1;
+                parsed.offset_y = Some(args.get(index).ok_or(
+                    "--compositor-shadow-offset-y requires FLOAT",
+                )?.parse::<f32>()?);
+            }
+            "--compositor-shadow-strength" => {
+                index += 1;
+                parsed.strength = Some(args.get(index).ok_or(
+                    "--compositor-shadow-strength requires FLOAT",
+                )?.parse::<f32>()?);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+fn apply_shadow_config(
+    config: config::CompositorConfig,
+    args: &ShadowCliArgs,
+) -> Result<config::CompositorConfig, Box<dyn Error>> {
+    if !args.enabled && args.color.is_none() && args.extent.is_none()
+        && args.offset_x.is_none() && args.offset_y.is_none() && args.strength.is_none()
+    {
+        return Ok(config);
+    }
+    let defaults = config.visuals.shadow;
+    let color = args.color.as_deref()
+        .map(config::CompositorConfig::parse_rgb_color)
+        .transpose()?
+        .unwrap_or(defaults.color);
+    Ok(config.with_shadow(
+        args.enabled,
+        color,
+        args.extent.unwrap_or(defaults.extent),
+        args.offset_x.unwrap_or(defaults.offset_x),
+        args.offset_y.unwrap_or(defaults.offset_y),
+        args.strength.unwrap_or(defaults.strength),
+    )?)
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error}");
@@ -13,7 +97,9 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let mut args = std::env::args().skip(1);
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let shadow_args = parse_shadow_arguments(&raw_args)?;
+    let mut args = raw_args.into_iter();
     let mut diagnostics_only = false;
     let mut capture_window = None;
     let mut compositor_probe = false;
@@ -32,6 +118,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut compositor_border_inactive_color = None;
     let mut compositor_border_focused_color = None;
     let mut compositor_border_urgent_color = None;
+    let mut compositor_shadow_enabled = false;
+    let mut compositor_shadow_color = None;
+    let mut compositor_shadow_extent = None;
+    let mut compositor_shadow_offset_x = None;
+    let mut compositor_shadow_offset_y = None;
+    let mut compositor_shadow_strength = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--diagnostics" => diagnostics_only = true,
@@ -98,6 +190,32 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "--compositor-border-urgent-color requires RRGGBB or RRGGBBAA",
                 )?);
             }
+            "--compositor-shadow-enabled" => compositor_shadow_enabled = true,
+            "--compositor-shadow-color" => {
+                compositor_shadow_color = Some(args.next().ok_or(
+                    "--compositor-shadow-color requires RRGGBB",
+                )?);
+            }
+            "--compositor-shadow-extent" => {
+                compositor_shadow_extent = Some(args.next().ok_or(
+                    "--compositor-shadow-extent requires FLOAT",
+                )?.parse::<f32>()?);
+            }
+            "--compositor-shadow-offset-x" => {
+                compositor_shadow_offset_x = Some(args.next().ok_or(
+                    "--compositor-shadow-offset-x requires FLOAT",
+                )?.parse::<f32>()?);
+            }
+            "--compositor-shadow-offset-y" => {
+                compositor_shadow_offset_y = Some(args.next().ok_or(
+                    "--compositor-shadow-offset-y requires FLOAT",
+                )?.parse::<f32>()?);
+            }
+            "--compositor-shadow-strength" => {
+                compositor_shadow_strength = Some(args.next().ok_or(
+                    "--compositor-shadow-strength requires FLOAT",
+                )?.parse::<f32>()?);
+            }
             "--capture" => {
                 capture_window = Some(args.next().ok_or("--capture requires WINDOW_ID")?)
             }
@@ -108,7 +226,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     if (compositor_corner_radius.is_some() || compositor_border_width.is_some() || compositor_border_color.is_some()
         || compositor_border_inactive_color.is_some() || compositor_border_focused_color.is_some()
-        || compositor_border_urgent_color.is_some())
+        || compositor_border_urgent_color.is_some() || compositor_shadow_enabled
+        || compositor_shadow_color.is_some() || compositor_shadow_extent.is_some()
+        || compositor_shadow_offset_x.is_some() || compositor_shadow_offset_y.is_some()
+        || compositor_shadow_strength.is_some())
         && compositor_scene_x11_probe.is_none()
     {
         return Err("visual overrides require --compositor-scene-x11-probe".into());
@@ -155,6 +276,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 None => legacy_color,
             };
             config = config.with_border_colors(width, inactive, focused, urgent)?;
+        }
+        if compositor_shadow_enabled || compositor_shadow_color.is_some() || compositor_shadow_extent.is_some()
+            || compositor_shadow_offset_x.is_some() || compositor_shadow_offset_y.is_some()
+            || compositor_shadow_strength.is_some()
+        {
+            config = apply_shadow_config(config, &shadow_args)?;
         }
         return x11::scene::run(&connection, &value, config);
     }
@@ -467,5 +594,77 @@ fn cleanup_compositor_capture(
     }
     if let Err(error) = ownership.release(connection) {
         eprintln!("compositor ownership cleanup failed: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_shadow_config, parse_shadow_arguments};
+    use crate::config::CompositorConfig;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn shadow_cli_parser_reads_all_runtime_parameters() {
+        let parsed = parse_shadow_arguments(&args(&[
+            "program", "--compositor-shadow-enabled", "--compositor-shadow-color", "4C7899",
+            "--compositor-shadow-extent", "18", "--compositor-shadow-offset-x", "-3",
+            "--compositor-shadow-offset-y", "4", "--compositor-shadow-strength", "0.28",
+        ])).unwrap();
+        assert_eq!(parsed.enabled, true);
+        assert_eq!(parsed.color.as_deref(), Some("4C7899"));
+        assert_eq!(parsed.extent, Some(18.0));
+        assert_eq!(parsed.offset_x, Some(-3.0));
+        assert_eq!(parsed.offset_y, Some(4.0));
+        assert_eq!(parsed.strength, Some(0.28));
+    }
+
+    #[test]
+    fn shadow_cli_values_reach_shadow_config_and_defaults_stay_disabled() {
+        let defaults = apply_shadow_config(
+            CompositorConfig::defaults(),
+            &parse_shadow_arguments(&args(&["program"])).unwrap(),
+        ).unwrap();
+        assert!(!defaults.visuals.shadow.enabled);
+        let parsed = parse_shadow_arguments(&args(&[
+            "program", "--compositor-shadow-enabled", "--compositor-shadow-color", "4C7899",
+            "--compositor-shadow-extent", "18", "--compositor-shadow-offset-x", "-3",
+            "--compositor-shadow-offset-y", "4", "--compositor-shadow-strength", "0.28",
+        ])).unwrap();
+        let config = apply_shadow_config(CompositorConfig::defaults(), &parsed).unwrap();
+        assert!(config.visuals.shadow.enabled);
+        assert_eq!(config.visuals.shadow.color, [0x4c, 0x78, 0x99]);
+        assert_eq!(config.visuals.shadow.extent, 18.0);
+        assert_eq!(config.visuals.shadow.offset_x, -3.0);
+        assert_eq!(config.visuals.shadow.offset_y, 4.0);
+        assert_eq!(config.visuals.shadow.strength, 0.28);
+    }
+
+    #[test]
+    fn shadow_cli_offsets_accept_negative_zero_and_positive_values() {
+        for (x, y) in [(-4.0, -4.0), (0.0, 0.0), (4.0, 4.0)] {
+            let parsed = parse_shadow_arguments(&args(&[
+                "program", "--compositor-shadow-enabled", "--compositor-shadow-extent", "18",
+                "--compositor-shadow-offset-x", &x.to_string(), "--compositor-shadow-offset-y",
+                &y.to_string(), "--compositor-shadow-strength", "0.28",
+            ])).unwrap();
+            let config = apply_shadow_config(CompositorConfig::defaults(), &parsed).unwrap();
+            assert_eq!(config.visuals.shadow.offset_x, x);
+            assert_eq!(config.visuals.shadow.offset_y, y);
+        }
+    }
+
+    #[test]
+    fn shadow_cli_invalid_values_return_clean_errors() {
+        for values in [
+            &["program", "--compositor-shadow-color", "ZZZZZZ"][..],
+            &["program", "--compositor-shadow-enabled", "--compositor-shadow-strength", "2"][..],
+            &["program", "--compositor-shadow-enabled", "--compositor-shadow-extent", "0"][..],
+        ] {
+            let parsed = parse_shadow_arguments(&args(&values)).unwrap();
+            assert!(apply_shadow_config(CompositorConfig::defaults(), &parsed).is_err());
+        }
     }
 }

@@ -813,6 +813,17 @@ impl EglSceneRenderer {
         Ok(())
     }
 
+    pub fn render_shadow(
+        &self,
+        params: crate::graphics::renderer::ShadowParams,
+    ) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer
+            .as_ref()
+            .ok_or("EGL scene renderer is unavailable")?
+            .render_shadow(params, self.width as i32, self.height as i32)?;
+        Ok(())
+    }
+
     pub fn swap(&self) -> Result<(), Box<dyn Error>> {
         self.instance.swap_buffers(self.display, self.surface)?;
         Ok(())

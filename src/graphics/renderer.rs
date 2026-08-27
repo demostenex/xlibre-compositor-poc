@@ -12,6 +12,134 @@ pub struct SceneRenderer {
     surface_size_uniform: i32,
     border_width_uniform: i32,
     border_color_uniform: i32,
+    shadow_mode_uniform: i32,
+    shadow_extent_uniform: i32,
+    shadow_strength_uniform: i32,
+    shadow_color_uniform: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ShadowParams {
+    pub(crate) outer_x: f32,
+    pub(crate) outer_y: f32,
+    pub(crate) outer_width: f32,
+    pub(crate) outer_height: f32,
+    pub(crate) corner_radius: f32,
+    pub(crate) extent: f32,
+    pub(crate) offset_x: f32,
+    pub(crate) offset_y: f32,
+    pub(crate) strength: f32,
+    pub(crate) color: [f32; 3],
+}
+
+pub(crate) fn normalized_shadow_color(color: [u8; 3]) -> [f32; 3] {
+    color.map(|component| f32::from(component) / 255.0)
+}
+
+impl ShadowParams {
+    pub(crate) fn new(
+        outer_x: f32,
+        outer_y: f32,
+        outer_width: f32,
+        outer_height: f32,
+        corner_radius: f32,
+        extent: f32,
+        offset_x: f32,
+        offset_y: f32,
+        strength: f32,
+    ) -> Option<Self> {
+        let values = [
+            outer_x,
+            outer_y,
+            outer_width,
+            outer_height,
+            corner_radius,
+            extent,
+            offset_x,
+            offset_y,
+            strength,
+        ];
+        if values.iter().any(|value| !value.is_finite())
+            || outer_width <= 0.0
+            || outer_height <= 0.0
+            || corner_radius < 0.0
+            || extent <= 0.0
+            || strength <= 0.0
+            || strength > 1.0
+        {
+            return None;
+        }
+        Some(Self {
+            outer_x,
+            outer_y,
+            outer_width,
+            outer_height,
+            corner_radius: corner_radius.min(outer_width.min(outer_height) * 0.5),
+            extent,
+            offset_x,
+            offset_y,
+            strength,
+            color: [0.0, 0.0, 0.0],
+        })
+    }
+
+    fn quad(self, root_width: i32, root_height: i32) -> Option<ShadowQuadPlan> {
+        build_shadow_quad_plan(self, root_width, root_height)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShadowQuadPlan {
+    dst_x: i32,
+    dst_y: i32,
+    width: i32,
+    height: i32,
+    local_x: f32,
+    local_y: f32,
+}
+
+fn build_shadow_quad_plan(
+    params: ShadowParams,
+    root_width: i32,
+    root_height: i32,
+) -> Option<ShadowQuadPlan> {
+    if root_width <= 0 || root_height <= 0 {
+        return None;
+    }
+
+    let left = params.outer_x + params.offset_x - params.extent;
+    let top = params.outer_y + params.offset_y - params.extent;
+    let right = left + params.outer_width + 2.0 * params.extent;
+    let bottom = top + params.outer_height + 2.0 * params.extent;
+    let framebuffer_width = root_width as f32;
+    let framebuffer_height = root_height as f32;
+    let clipped_left = left.max(0.0).min(framebuffer_width);
+    let clipped_top = top.max(0.0).min(framebuffer_height);
+    let clipped_right = right.max(0.0).min(framebuffer_width);
+    let clipped_bottom = bottom.max(0.0).min(framebuffer_height);
+
+    if clipped_right <= clipped_left || clipped_bottom <= clipped_top {
+        return None;
+    }
+
+    let dst_x = clipped_left.floor() as i32;
+    let dst_y = clipped_top.floor() as i32;
+    let end_x = clipped_right.ceil() as i32;
+    let end_y = clipped_bottom.ceil() as i32;
+    let width = end_x - dst_x;
+    let height = end_y - dst_y;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    Some(ShadowQuadPlan {
+        dst_x,
+        dst_y,
+        width,
+        height,
+        local_x: dst_x as f32 - left,
+        local_y: dst_y as f32 - top,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,7 +304,19 @@ impl SceneRenderer {
         };
         let border_width_uniform = unsafe { gl::GetUniformLocation(program, b"border_width\0".as_ptr().cast()) };
         let border_color_uniform = unsafe { gl::GetUniformLocation(program, b"border_color\0".as_ptr().cast()) };
-        if corner_radius_uniform < 0 || surface_size_uniform < 0 || border_width_uniform < 0 || border_color_uniform < 0 {
+        let shadow_mode_uniform = unsafe { gl::GetUniformLocation(program, b"shadow_mode\0".as_ptr().cast()) };
+        let shadow_extent_uniform = unsafe { gl::GetUniformLocation(program, b"shadow_extent\0".as_ptr().cast()) };
+        let shadow_strength_uniform = unsafe { gl::GetUniformLocation(program, b"shadow_strength\0".as_ptr().cast()) };
+        let shadow_color_uniform = unsafe { gl::GetUniformLocation(program, b"shadow_color\0".as_ptr().cast()) };
+        if corner_radius_uniform < 0
+            || surface_size_uniform < 0
+            || border_width_uniform < 0
+            || border_color_uniform < 0
+            || shadow_mode_uniform < 0
+            || shadow_extent_uniform < 0
+            || shadow_strength_uniform < 0
+            || shadow_color_uniform < 0
+        {
             return Err("rounded-corner shader uniforms are unavailable".into());
         }
 
@@ -197,7 +337,12 @@ impl SceneRenderer {
             gl::BindVertexArray(0);
             gl::BindBuffer(gl::ARRAY_BUFFER, 0);
         }
-        Ok(Self { program, vao, buffer, corner_radius_uniform, surface_size_uniform, border_width_uniform, border_color_uniform })
+        Ok(Self {
+            program, vao, buffer, corner_radius_uniform, surface_size_uniform,
+            border_width_uniform, border_color_uniform, shadow_mode_uniform,
+            shadow_extent_uniform, shadow_strength_uniform,
+            shadow_color_uniform,
+        })
     }
 
     pub fn clear(&self) {
@@ -240,6 +385,7 @@ impl SceneRenderer {
         unsafe {
             check_gl_error("before scene draw")?;
             gl::UseProgram(self.program);
+            gl::Uniform1i(self.shadow_mode_uniform, 0);
             match blend_state_for_surface(pixel_semantics, plan.corner_radius) {
                 Some(BlendState::Disabled) => gl::Disable(gl::BLEND),
                 Some(BlendState::PremultipliedAlpha) => {
@@ -265,6 +411,66 @@ impl SceneRenderer {
             gl::DrawArrays(gl::TRIANGLES, 0, 6);
             check_gl_error("scene draw")?;
             gl::BindTexture(gl::TEXTURE_2D, 0);
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+            gl::BindVertexArray(0);
+            gl::UseProgram(0);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn render_shadow(
+        &self,
+        params: ShadowParams,
+        root_width: i32,
+        root_height: i32,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(plan) = params.quad(root_width, root_height) else {
+            return Ok(());
+        };
+
+        let left = (plan.dst_x as f32 / root_width as f32) * 2.0 - 1.0;
+        let right = ((plan.dst_x + plan.width) as f32 / root_width as f32) * 2.0 - 1.0;
+        let top = 1.0 - (plan.dst_y as f32 / root_height as f32) * 2.0;
+        let bottom =
+            1.0 - ((plan.dst_y + plan.height) as f32 / root_height as f32) * 2.0;
+        let local_right = plan.local_x + plan.width as f32;
+        let local_bottom = plan.local_y + plan.height as f32;
+        let vertices: [f32; 36] = [
+            left, bottom, 0.0, 0.0, plan.local_x, local_bottom,
+            right, bottom, 0.0, 0.0, local_right, local_bottom,
+            right, top, 0.0, 0.0, local_right, plan.local_y,
+            left, bottom, 0.0, 0.0, plan.local_x, local_bottom,
+            right, top, 0.0, 0.0, local_right, plan.local_y,
+            left, top, 0.0, 0.0, plan.local_x, plan.local_y,
+        ];
+
+        unsafe {
+            check_gl_error("before shadow draw")?;
+            gl::UseProgram(self.program);
+            gl::Enable(gl::BLEND);
+            gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
+            gl::Uniform1i(self.shadow_mode_uniform, 1);
+            gl::Uniform1f(self.corner_radius_uniform, params.corner_radius);
+            gl::Uniform2f(
+                self.surface_size_uniform,
+                params.outer_width,
+                params.outer_height,
+            );
+            gl::Uniform1f(self.border_width_uniform, 0.0);
+            gl::Uniform4f(self.border_color_uniform, 0.0, 0.0, 0.0, 0.0);
+            gl::Uniform1f(self.shadow_extent_uniform, params.extent);
+            gl::Uniform1f(self.shadow_strength_uniform, params.strength);
+            gl::Uniform3f(self.shadow_color_uniform, params.color[0], params.color[1], params.color[2]);
+            gl::BindVertexArray(self.vao);
+            gl::BindBuffer(gl::ARRAY_BUFFER, self.buffer);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                (vertices.len() * std::mem::size_of::<f32>()) as isize,
+                vertices.as_ptr().cast(),
+                gl::STREAM_DRAW,
+            );
+            gl::DrawArrays(gl::TRIANGLES, 0, 6);
+            check_gl_error("shadow draw")?;
             gl::BindBuffer(gl::ARRAY_BUFFER, 0);
             gl::BindVertexArray(0);
             gl::UseProgram(0);
@@ -344,7 +550,10 @@ fn program_log(program: u32) -> String { let mut length = 0; unsafe { gl::GetPro
 
 #[cfg(test)]
 mod tests {
-    use super::{blend_state_for, blend_state_for_surface, BlendState};
+    use super::{
+        blend_state_for, blend_state_for_surface, build_shadow_quad_plan, BlendState,
+        ShadowParams,
+    };
     use crate::x11::scene::EglPixelSemantics;
 
     #[test]
@@ -381,9 +590,134 @@ mod tests {
         assert!(super::SCENE_FRAGMENT_SHADER.contains("border_color.rgb*border_color.a"));
         assert!(super::SCENE_FRAGMENT_SHADER.contains("border_width"));
     }
+
+    #[test]
+    fn shadow_bounds_expand_by_extent_and_apply_offset() {
+        let params = ShadowParams::new(
+            100.0, 80.0, 200.0, 100.0, 16.0, 8.0, 3.0, -4.0, 0.5,
+        ).unwrap();
+        let plan = build_shadow_quad_plan(params, 1000, 800).unwrap();
+        assert_eq!((plan.dst_x, plan.dst_y), (95, 68));
+        assert_eq!((plan.width, plan.height), (216, 116));
+        assert_eq!((plan.local_x, plan.local_y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn shadow_zero_offset_is_symmetric() {
+        let params = ShadowParams::new(
+            100.0, 80.0, 200.0, 100.0, 16.0, 8.0, 0.0, 0.0, 0.5,
+        ).unwrap();
+        let plan = build_shadow_quad_plan(params, 1000, 800).unwrap();
+        assert_eq!((plan.dst_x, plan.dst_y), (92, 72));
+        assert_eq!((plan.width, plan.height), (216, 116));
+    }
+
+    #[test]
+    fn shadow_positive_and_negative_offsets_shift_geometry() {
+        let positive = ShadowParams::new(
+            100.0, 80.0, 200.0, 100.0, 16.0, 8.0, 5.0, 7.0, 0.5,
+        ).unwrap();
+        let negative = ShadowParams::new(
+            100.0, 80.0, 200.0, 100.0, 16.0, 8.0, -5.0, -7.0, 0.5,
+        ).unwrap();
+        let positive_plan = build_shadow_quad_plan(positive, 1000, 800).unwrap();
+        let negative_plan = build_shadow_quad_plan(negative, 1000, 800).unwrap();
+        assert_eq!((positive_plan.dst_x, positive_plan.dst_y), (97, 79));
+        assert_eq!((negative_plan.dst_x, negative_plan.dst_y), (87, 65));
+    }
+
+    #[test]
+    fn shadow_clipping_preserves_local_geometry_at_all_edges() {
+        let cases = [
+            (0.0, 0.0, 0, 0, 10.0, 10.0, 20, 20),
+            (90.0, 0.0, 80, 0, 0.0, 10.0, 20, 20),
+            (0.0, 90.0, 0, 80, 10.0, 0.0, 20, 20),
+            (90.0, 90.0, 80, 80, 0.0, 0.0, 20, 20),
+        ];
+        for (x, y, dst_x, dst_y, local_x, local_y, width, height) in cases {
+            let params = ShadowParams::new(
+                x, y, 10.0, 10.0, 4.0, 10.0, 0.0, 0.0, 0.5,
+            ).unwrap();
+            let plan = build_shadow_quad_plan(params, 100, 100).unwrap();
+            assert_eq!((plan.dst_x, plan.dst_y), (dst_x, dst_y));
+            assert_eq!((plan.local_x, plan.local_y), (local_x, local_y));
+            assert_eq!((plan.width, plan.height), (width, height));
+        }
+    }
+
+    #[test]
+    fn shadow_fully_outside_framebuffer_is_skipped() {
+        let params = ShadowParams::new(
+            200.0, 200.0, 10.0, 10.0, 4.0, 10.0, 0.0, 0.0, 0.5,
+        ).unwrap();
+        assert!(build_shadow_quad_plan(params, 100, 100).is_none());
+    }
+
+    #[test]
+    fn shadow_fractional_bounds_use_floor_ceil_and_preserve_local_origin() {
+        let params = ShadowParams::new(
+            0.25, 1.75, 10.0, 8.0, 4.0, 2.25, 0.5, -0.75, 0.5,
+        ).unwrap();
+        let plan = build_shadow_quad_plan(params, 100, 100).unwrap();
+        assert_eq!((plan.dst_x, plan.dst_y), (0, 0));
+        assert_eq!((plan.width, plan.height), (13, 12));
+        assert_eq!((plan.local_x, plan.local_y), (1.5, 1.25));
+    }
+
+    #[test]
+    fn shadow_radius_is_clamped_to_outer_rectangle() {
+        let params = ShadowParams::new(
+            0.0, 0.0, 100.0, 80.0, 100.0, 8.0, 0.0, 0.0, 0.5,
+        ).unwrap();
+        assert_eq!(params.corner_radius, 40.0);
+    }
+
+    #[test]
+    fn shadow_invalid_extent_or_strength_is_skipped() {
+        assert!(ShadowParams::new(
+            0.0, 0.0, 100.0, 80.0, 8.0, 0.0, 0.0, 0.0, 0.5,
+        ).is_none());
+        assert!(ShadowParams::new(
+            0.0, 0.0, 100.0, 80.0, 8.0, 8.0, 0.0, 0.0, 0.0,
+        ).is_none());
+        assert!(ShadowParams::new(
+            0.0, 0.0, 100.0, 80.0, 8.0, 8.0, 0.0, 0.0, 1.1,
+        ).is_none());
+    }
+
+    #[test]
+    fn shadow_params_are_copy_sized_renderer_values() {
+        let params = ShadowParams::new(
+            0.0, 0.0, 100.0, 80.0, 8.0, 8.0, 0.0, 0.0, 0.5,
+        ).unwrap();
+        let copy = params;
+        assert_eq!(params, copy);
+        assert_eq!(
+            std::mem::size_of::<ShadowParams>(),
+            12 * std::mem::size_of::<f32>()
+        );
+    }
+
+    #[test]
+    fn shadow_shader_contract_places_non_sampling_branch_first() {
+        let source = super::SCENE_FRAGMENT_SHADER;
+        let shadow_branch = source.find("if(shadow_mode!=0)").unwrap();
+        let texture_sample = source.find("vec4 sampled=texture(captured,texcoord)").unwrap();
+        assert!(shadow_branch < texture_sample);
+        assert!(source.contains("shadow_distance"));
+        assert!(source.contains("shadow_strength"));
+        assert!(source.contains("shadow_color"));
+        assert!(source.contains("color=vec4(shadow_color*alpha,alpha)"));
+    }
+
+    #[test]
+    fn shadow_rgb_color_reaches_renderer_as_normalized_rgb() {
+        let color = super::normalized_shadow_color([0x4c, 0x78, 0x99]);
+        assert_eq!(color, [0x4c as f32 / 255.0, 0x78 as f32 / 255.0, 0x99 as f32 / 255.0]);
+    }
 }
 
 const VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nout vec2 texcoord;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; }";
 const FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nout vec4 color;\nuniform sampler2D captured;\nvoid main(){ color=texture(captured,texcoord); }";
 const SCENE_VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nlayout(location=2) in vec2 local_position_in;\nout vec2 texcoord;\nout vec2 local_position;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; local_position=local_position_in; }";
-const SCENE_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D captured;\nuniform float corner_radius;\nuniform vec2 surface_size;\nuniform float border_width;\nuniform vec4 border_color;\nfloat rounded_distance(vec2 point, vec2 size, float radius){ vec2 q=abs(point-size*0.5)-(size*0.5-vec2(radius)); return length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; }\nfloat coverage(float distance){ float aa=max(fwidth(distance),0.0001); return 1.0-smoothstep(-aa,aa,distance); }\nvoid main(){ vec4 sampled=texture(captured,texcoord); float outer_radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); if(border_width<=0.0){ if(corner_radius<=0.0){ color=sampled; return; } color=sampled*coverage(rounded_distance(local_position,surface_size,outer_radius)); return; } float width=min(border_width,min(surface_size.x,surface_size.y)*0.5); float outer=coverage(rounded_distance(local_position,surface_size,outer_radius)); vec2 inner_size=max(surface_size-vec2(2.0*width),vec2(0.0)); float inner_radius=max(outer_radius-width,0.0); float inner=inner_size.x>0.0 && inner_size.y>0.0 ? coverage(rounded_distance(local_position-vec2(width),inner_size,inner_radius)) : 0.0; float border=clamp(outer-inner,0.0,1.0); vec4 premultiplied_border=vec4(border_color.rgb*border_color.a,border_color.a)*border; color=sampled*inner+premultiplied_border; }";
+const SCENE_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D captured;\nuniform int shadow_mode;\nuniform float shadow_extent;\nuniform float shadow_strength;\nuniform vec3 shadow_color;\nuniform float corner_radius;\nuniform vec2 surface_size;\nuniform float border_width;\nuniform vec4 border_color;\nfloat rounded_distance(vec2 point, vec2 size, float radius){ vec2 q=abs(point-size*0.5)-(size*0.5-vec2(radius)); return length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; }\nfloat coverage(float distance){ float aa=max(fwidth(distance),0.0001); return 1.0-smoothstep(-aa,aa,distance); }\nvoid main(){ float outer_radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); if(shadow_mode!=0){ vec2 shadow_point=local_position-vec2(shadow_extent); float shadow_distance=rounded_distance(shadow_point,surface_size,outer_radius); float edge=coverage(-shadow_distance); float falloff=1.0-smoothstep(0.0,max(shadow_extent,0.0001),max(shadow_distance,0.0)); float alpha=shadow_strength*edge*falloff; color=vec4(shadow_color*alpha,alpha); return; } vec4 sampled=texture(captured,texcoord); if(border_width<=0.0){ if(corner_radius<=0.0){ color=sampled; return; } color=sampled*coverage(rounded_distance(local_position,surface_size,outer_radius)); return; } float width=min(border_width,min(surface_size.x,surface_size.y)*0.5); float outer=coverage(rounded_distance(local_position,surface_size,outer_radius)); vec2 inner_size=max(surface_size-vec2(2.0*width),vec2(0.0)); float inner_radius=max(outer_radius-width,0.0); float inner=inner_size.x>0.0 && inner_size.y>0.0 ? coverage(rounded_distance(local_position-vec2(width),inner_size,inner_radius)) : 0.0; float border=clamp(outer-inner,0.0,1.0); vec4 premultiplied_border=vec4(border_color.rgb*border_color.a,border_color.a)*border; color=sampled*inner+premultiplied_border; }";

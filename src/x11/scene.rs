@@ -49,12 +49,14 @@ struct VisualAtoms {
     wm_hints: xproto::Atom,
     net_wm_state: xproto::Atom,
     demands_attention: xproto::Atom,
+    fullscreen: xproto::Atom,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct CachedUrgency {
+struct CachedClientVisualState {
     wm_hints: bool,
     demands_attention: bool,
+    fullscreen: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +92,8 @@ struct SurfaceEntry {
     stacking_index: usize,
     backend: BackendCompatibility,
     visual_class: SurfaceVisualClass,
+    fullscreen: bool,
+    shadow_eligible: bool,
     resolved_border_color: [u32; 4],
 }
 
@@ -527,6 +531,8 @@ fn eligible_surface(
         stacking_index,
         backend,
         visual_class: classify_surface_visual_class(metadata.window_type.as_deref()),
+        fullscreen: false,
+        shadow_eligible: false,
         resolved_border_color: [0.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits()],
     })
 }
@@ -556,6 +562,49 @@ fn apply_surface_visual_policy(
     plan.corner_radius = effective_corner_radius(config.corner_radius, plan.width, plan.height);
     plan.border_width = effective_border_width(config.border.width, plan.width, plan.height);
     plan.border_color = config.border.inactive_color;
+}
+
+fn shadow_eligible_for_entry(
+    style: crate::config::ShadowConfig,
+    entry: &SurfaceEntry,
+) -> bool {
+    style.enabled
+        && entry.semantic_client_xid.is_some()
+        && !entry.fullscreen
+        && matches!(entry.visual_class, SurfaceVisualClass::Normal)
+}
+
+fn shadow_params_from_plan(
+    style: crate::config::ShadowConfig,
+    plan: &RenderQuadPlan,
+) -> Option<crate::graphics::renderer::ShadowParams> {
+    let mut params = crate::graphics::renderer::ShadowParams::new(
+        plan.outer_x as f32,
+        plan.outer_y as f32,
+        plan.outer_width as f32,
+        plan.outer_height as f32,
+        plan.corner_radius,
+        style.extent,
+        style.offset_x,
+        style.offset_y,
+        style.strength,
+    )?;
+    params.color = crate::graphics::renderer::normalized_shadow_color(style.color);
+    Some(params)
+}
+
+fn resolve_snapshot_fullscreen(
+    snapshot: &mut SceneSnapshot,
+    urgency: &HashMap<Window, CachedClientVisualState>,
+    style: crate::config::ShadowConfig,
+) {
+    for entry in &mut snapshot.entries {
+        entry.fullscreen = entry
+            .semantic_client_xid
+            .and_then(|client| urgency.get(&client))
+            .is_some_and(|state| state.fullscreen);
+        entry.shadow_eligible = shadow_eligible_for_entry(style, entry);
+    }
 }
 
 fn println_surface(entry: &SurfaceEntry) {
@@ -697,6 +746,129 @@ impl Drop for DamageLease<'_> {
     }
 }
 
+#[derive(Debug)]
+enum NamedSurfacePixmapAcquireError {
+    StaleGeometry,
+    StaleX11(Box<dyn Error>),
+    Other(Box<dyn Error>),
+}
+
+impl fmt::Display for NamedSurfacePixmapAcquireError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleGeometry => write!(formatter, "named pixmap geometry is stale"),
+            Self::StaleX11(error) => write!(formatter, "named pixmap drawable became stale: {error}"),
+            Self::Other(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl Error for NamedSurfacePixmapAcquireError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::StaleGeometry => None,
+            Self::StaleX11(error) | Self::Other(error) => Some(&**error),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RawPixmapOwnership {
+    owned: bool,
+}
+
+impl RawPixmapOwnership {
+    fn new() -> Self {
+        Self { owned: true }
+    }
+
+    fn transfer(&mut self) {
+        self.owned = false;
+    }
+
+    #[cfg(test)]
+    fn is_owned(self) -> bool {
+        self.owned
+    }
+}
+
+struct NamedPixmapGuard<'a> {
+    connection: &'a X11Connection,
+    pixmap_xid: u32,
+    ownership: RawPixmapOwnership,
+}
+
+impl<'a> NamedPixmapGuard<'a> {
+    fn new(connection: &'a X11Connection, pixmap_xid: u32) -> Self {
+        Self {
+            connection,
+            pixmap_xid,
+            ownership: RawPixmapOwnership::new(),
+        }
+    }
+
+    fn transfer(&mut self) {
+        self.ownership.transfer();
+    }
+}
+
+impl Drop for NamedPixmapGuard<'_> {
+    fn drop(&mut self) {
+        if self.ownership.owned {
+            let _ = self.connection.inner.free_pixmap(self.pixmap_xid);
+        }
+    }
+}
+
+fn stale_pixmap_reply(error: &ReplyError) -> bool {
+    matches!(
+        error,
+        ReplyError::X11Error(error)
+            if matches!(
+                error.error_kind,
+                ErrorKind::Drawable | ErrorKind::Match | ErrorKind::Pixmap | ErrorKind::Window
+            )
+    )
+}
+
+fn named_pixmap_dimensions_match(window: WindowGeometry, pixmap: PixmapGeometry) -> bool {
+    let Some(expected_width) = u32::from(window.width)
+        .checked_add(u32::from(window.border_width) * 2)
+    else {
+        return false;
+    };
+    let Some(expected_height) = u32::from(window.height)
+        .checked_add(u32::from(window.border_width) * 2)
+    else {
+        return false;
+    };
+    pixmap.width != 0
+        && pixmap.height != 0
+        && u32::from(pixmap.width) == expected_width
+        && u32::from(pixmap.height) == expected_height
+}
+
+fn validate_named_pixmap_dimensions(
+    window: WindowGeometry,
+    pixmap: PixmapGeometry,
+) -> Result<(), NamedSurfacePixmapAcquireError> {
+    named_pixmap_dimensions_match(window, pixmap)
+        .then_some(())
+        .ok_or(NamedSurfacePixmapAcquireError::StaleGeometry)
+}
+
+fn translate_named_pixmap_acquire_error(
+    error: NamedSurfacePixmapAcquireError,
+) -> Box<dyn Error> {
+    match error {
+        NamedSurfacePixmapAcquireError::StaleGeometry
+        | NamedSurfacePixmapAcquireError::StaleX11(_) => {
+            Box::new(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
+        }
+        NamedSurfacePixmapAcquireError::Other(error) => error,
+    }
+}
+
 fn classify_damage_destroy_error(error: &(dyn Error + 'static)) -> DamageDestroyClassification {
     match error.downcast_ref::<ReplyError>() {
         Some(ReplyError::X11Error(error))
@@ -760,33 +932,52 @@ impl<'a> NamedSurfacePixmap<'a> {
         entry: &SurfaceEntry,
         root_window: Window,
         _root: RootGeometry,
-    ) -> Result<Self, Box<dyn Error>> {
-        let pixmap_xid = connection.inner.generate_id()?;
+    ) -> Result<Self, NamedSurfacePixmapAcquireError> {
+        let pixmap_xid = connection
+            .inner
+            .generate_id()
+            .map_err(|error| NamedSurfacePixmapAcquireError::Other(Box::new(error)))?;
         connection
             .inner
-            .composite_name_window_pixmap(entry.surface_xid, pixmap_xid)?
+            .composite_name_window_pixmap(entry.surface_xid, pixmap_xid)
+            .map_err(|error| NamedSurfacePixmapAcquireError::Other(Box::new(error)))?
             .check()
             .map_err(|error| {
-                format!(
-                    "NameWindowPixmap failed for selected surface 0x{:08x}: {error}",
-                    entry.surface_xid
-                )
+                if stale_pixmap_reply(&error) {
+                    NamedSurfacePixmapAcquireError::StaleX11(Box::new(error))
+                } else {
+                    NamedSurfacePixmapAcquireError::Other(Box::new(error))
+                }
             })?;
-        let geometry = connection.inner.get_geometry(pixmap_xid)?.reply()?;
+        let mut guard = NamedPixmapGuard::new(connection, pixmap_xid);
+        let geometry = connection
+            .inner
+            .get_geometry(pixmap_xid)
+            .map_err(|error| NamedSurfacePixmapAcquireError::Other(Box::new(error)))?
+            .reply()
+            .map_err(|error| {
+                if stale_pixmap_reply(&error) {
+                    NamedSurfacePixmapAcquireError::StaleX11(Box::new(error))
+                } else {
+                    NamedSurfacePixmapAcquireError::Other(Box::new(error))
+                }
+            })?;
+        let pixmap_geometry = PixmapGeometry {
+            root: geometry.root,
+            x: geometry.x,
+            y: geometry.y,
+            width: geometry.width,
+            height: geometry.height,
+            border_width: geometry.border_width,
+            depth: geometry.depth,
+        };
         let expected_width = u32::from(entry.geometry.width)
-            .checked_add(u32::from(entry.geometry.border_width) * 2)
-            .ok_or("expected named pixmap width overflow")?;
+            + u32::from(entry.geometry.border_width) * 2;
         let expected_height = u32::from(entry.geometry.height)
-            .checked_add(u32::from(entry.geometry.border_width) * 2)
-            .ok_or("expected named pixmap height overflow")?;
-        if geometry.root != root_window
-            || geometry.depth != entry.depth
-            || geometry.width == 0
-            || geometry.height == 0
-            || u32::from(geometry.width) != expected_width
-            || u32::from(geometry.height) != expected_height
-        {
-            return Err(format!(
+            + u32::from(entry.geometry.border_width) * 2;
+        validate_named_pixmap_dimensions(entry.geometry, pixmap_geometry)?;
+        if geometry.root != root_window || geometry.depth != entry.depth {
+            return Err(NamedSurfacePixmapAcquireError::Other(format!(
                 "named pixmap geometry mismatch surface=0x{:08x} window={}x{}+{}+{} border={} pixmap=0x{:08x} root=0x{:08x} geometry={}x{}+{}+{} border={} depth={} expected={}x{} root=0x{:08x} depth={}",
                 entry.surface_xid,
                 entry.geometry.width,
@@ -806,8 +997,7 @@ impl<'a> NamedSurfacePixmap<'a> {
                 expected_height,
                 root_window,
                 entry.depth,
-            )
-            .into());
+            ).into()));
         }
         println!(
             "NamedSurfacePixmap: surface=0x{:08x} pixmap=0x{:08x} geometry={}x{}+{}+{} depth={} root=0x{:08x}",
@@ -822,22 +1012,16 @@ impl<'a> NamedSurfacePixmap<'a> {
         );
         let state = Cell::new(PixmapState::Inactive);
         state.set(PixmapState::Active);
-        Ok(Self {
+        let surface = Self {
             connection,
             surface_xid: entry.surface_xid,
             pixmap_xid,
             window_geometry: entry.geometry,
-            geometry: PixmapGeometry {
-                root: geometry.root,
-                x: geometry.x,
-                y: geometry.y,
-                width: geometry.width,
-                height: geometry.height,
-                border_width: geometry.border_width,
-                depth: geometry.depth,
-            },
+            geometry: pixmap_geometry,
             state,
-        })
+        };
+        guard.transfer();
+        Ok(surface)
     }
 
     fn free(&self) -> Result<(), Box<dyn Error>> {
@@ -895,6 +1079,10 @@ pub(crate) struct RenderQuadPlan {
     pub(crate) dst_y: i32,
     pub(crate) width: i32,
     pub(crate) height: i32,
+    pub(crate) outer_x: i32,
+    pub(crate) outer_y: i32,
+    pub(crate) outer_width: i32,
+    pub(crate) outer_height: i32,
     pub(crate) src_x: i32,
     pub(crate) src_y: i32,
     pub(crate) src_width: i32,
@@ -947,6 +1135,10 @@ fn build_render_quad_plan(
         dst_y,
         width,
         height,
+        outer_x: i32::from(window.x) - border,
+        outer_y: i32::from(window.y) - border,
+        outer_width: i32::from(pixmap.width),
+        outer_height: i32::from(pixmap.height),
         src_x,
         src_y,
         src_width: width,
@@ -1203,13 +1395,14 @@ struct SceneSession<'a> {
     visual_atoms: VisualAtoms,
     active_window: Option<Window>,
     active_window_initialized: bool,
-    urgency: HashMap<Window, CachedUrgency>,
+    urgency: HashMap<Window, CachedClientVisualState>,
     pending_visual_state: bool,
     signal: SignalWake,
     scheduler: FrameScheduler,
     present: Option<PresentClock>,
     state: SceneState,
     _config: CompositorConfig,
+    shadow_style: crate::config::ShadowConfig,
 }
 
 struct SceneCandidate<'a> {
@@ -1448,6 +1641,7 @@ impl<'a> SceneSession<'a> {
             present,
             state: SceneState::PlaceholderReady,
             _config: config,
+            shadow_style: config.visuals.shadow,
         };
         session.state = SceneState::ManualActive;
         Ok(session)
@@ -1488,7 +1682,7 @@ impl<'a> SceneSession<'a> {
             }
             let cached = match read_client_urgency(self.connection, client, self.visual_atoms) {
                 Ok(cached) => cached,
-                Err(error) if super::capture::is_bad_window_error(error.as_ref()) => CachedUrgency::default(),
+                Err(error) if super::capture::is_bad_window_error(error.as_ref()) => CachedClientVisualState::default(),
                 Err(error) => return Err(error),
             };
             self.urgency.insert(client, cached);
@@ -1515,13 +1709,15 @@ impl<'a> SceneSession<'a> {
         )?;
         self.initialize_visual_state(&snapshot)?;
         resolve_snapshot_border_colors(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
+        resolve_snapshot_fullscreen(&mut snapshot, &self.urgency, self.shadow_style);
         self.state = SceneState::SceneSnapshotReady;
         let mut pixmaps = Vec::new();
         let mut damage_leases = Vec::new();
         let mut damage_registry = HashMap::new();
         let mut egl_surfaces = HashMap::new();
         let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
-        for entry in &snapshot.entries {
+        for index in 0..snapshot.entries.len() {
+            let entry = snapshot.entries[index].clone();
             let semantics = self.visual_formats.semantics(entry.visual, entry.depth);
             let importable = semantics != EglPixelSemantics::Unsupported;
             if importable {
@@ -1530,12 +1726,15 @@ impl<'a> SceneSession<'a> {
                 damage_registry.insert(damage.damage_xid, entry.surface_xid);
                 damage_leases.push(damage);
             }
-            let pixmap = NamedSurfacePixmap::acquire(
+            let pixmap = match NamedSurfacePixmap::acquire(
                 self.connection,
-                entry,
+                &entry,
                 self.root,
                 root_geometry,
-            )?;
+            ) {
+                Ok(pixmap) => pixmap,
+                Err(error) => return Err(translate_named_pixmap_acquire_error(error)),
+            };
             if !importable {
                 println!(
                     "EGL import unsupported by capability policy: canonical surface=0x{:08x} depth={} visual=0x{:08x}",
@@ -2115,9 +2314,9 @@ impl<'a> SceneSession<'a> {
                 }
                 Err(error) => return Err(error),
             };
-            CachedUrgency { wm_hints, ..old }
+            CachedClientVisualState { wm_hints, ..old }
         } else if property.atom == self.visual_atoms.net_wm_state {
-            let demands_attention = match read_demands_attention(self.connection, property.window, self.visual_atoms) {
+            let state = match read_client_net_wm_state(self.connection, property.window, self.visual_atoms) {
                 Ok(value) => value,
                 Err(error) if super::capture::is_bad_window_error(error.as_ref()) => {
                     self.urgency.remove(&property.window);
@@ -2125,17 +2324,31 @@ impl<'a> SceneSession<'a> {
                 }
                 Err(error) => return Err(error),
             };
-            CachedUrgency { demands_attention, ..old }
+            CachedClientVisualState {
+                demands_attention: state.demands_attention,
+                fullscreen: state.fullscreen,
+                ..old
+            }
         } else {
             return Ok(None);
         };
+        let fullscreen_changed = old.fullscreen != updated.fullscreen;
         self.urgency.insert(property.window, updated);
+        if property.atom == self.visual_atoms.net_wm_state {
+            let shadow_style = self.shadow_style;
+            if let Some(entry) = self.current_snapshot_mut().entries.iter_mut()
+                .find(|candidate| candidate.semantic_client_xid == Some(property.window))
+            {
+                entry.fullscreen = updated.fullscreen;
+                entry.shadow_eligible = shadow_eligible_for_entry(shadow_style, entry);
+            }
+        }
         let before = entry.resolved_border_color;
         let changed = self.refresh_resolved_border_colors(&[Some(property.window)]);
         let after = self.current_snapshot().entries.iter()
             .find(|candidate| candidate.semantic_client_xid == Some(property.window))
             .map_or(before, |candidate| candidate.resolved_border_color);
-        if changed && before != after {
+        if (changed && before != after) || fullscreen_changed {
             Ok(Some(SceneInvalidation::VisualState))
         } else {
             Ok(None)
@@ -2227,6 +2440,11 @@ impl<'a> SceneSession<'a> {
                 .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
             apply_surface_visual_policy(&mut plan, &self._config.visuals, entry.visual_class);
             plan.border_color = entry.resolved_border_color.map(f32::from_bits);
+            if entry.shadow_eligible {
+                if let Some(shadow) = shadow_params_from_plan(self.shadow_style, &plan) {
+                    egl.render_shadow(shadow)?;
+                }
+            }
             egl.render_surface(
                 surface.texture,
                 plan,
@@ -2239,6 +2457,12 @@ impl<'a> SceneSession<'a> {
     fn current_snapshot(&self) -> &SceneSnapshot {
         self.snapshot
             .as_ref()
+            .expect("published scene snapshot must exist while live")
+    }
+
+    fn current_snapshot_mut(&mut self) -> &mut SceneSnapshot {
+        self.snapshot
+            .as_mut()
             .expect("published scene snapshot must exist while live")
     }
 
@@ -2603,6 +2827,7 @@ fn acquire_visual_atoms(connection: &X11Connection) -> Result<VisualAtoms, Box<d
         wm_hints: intern(b"WM_HINTS")?,
         net_wm_state: intern(b"_NET_WM_STATE")?,
         demands_attention: intern(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
+        fullscreen: intern(b"_NET_WM_STATE_FULLSCREEN")?,
     })
 }
 
@@ -2615,13 +2840,13 @@ fn read_client_urgency(
     connection: &X11Connection,
     client: Window,
     atoms: VisualAtoms,
-) -> Result<CachedUrgency, Box<dyn Error>> {
+) -> Result<CachedClientVisualState, Box<dyn Error>> {
     let hints = connection.inner.get_property(false, client, atoms.wm_hints, xproto::AtomEnum::ANY, 0, 9)?.reply()?;
     let wm_hints_urgent = wm_hints_urgency(hints.value32().and_then(|mut values| values.next()));
     let state = connection.inner.get_property(false, client, atoms.net_wm_state, xproto::AtomEnum::ATOM, 0, u32::MAX)?.reply()?;
-    Ok(CachedUrgency {
+    Ok(CachedClientVisualState {
         wm_hints: wm_hints_urgent,
-        demands_attention: state_demands_attention(state.value32(), atoms.demands_attention),
+        ..read_net_wm_state(state.value32(), atoms)
     })
 }
 
@@ -2634,27 +2859,42 @@ fn read_wm_hints_urgency(
     Ok(wm_hints_urgency(hints.value32().and_then(|mut values| values.next())))
 }
 
-fn read_demands_attention(
+fn read_client_net_wm_state(
     connection: &X11Connection,
     client: Window,
     atoms: VisualAtoms,
-) -> Result<bool, Box<dyn Error>> {
+) -> Result<CachedClientVisualState, Box<dyn Error>> {
     let state = connection.inner.get_property(false, client, atoms.net_wm_state, xproto::AtomEnum::ATOM, 0, u32::MAX)?.reply()?;
-    Ok(state_demands_attention(state.value32(), atoms.demands_attention))
+    Ok(read_net_wm_state(state.value32(), atoms))
 }
 
 fn wm_hints_urgency(flags: Option<u32>) -> bool {
     flags.is_some_and(|flags| flags & (1 << 8) != 0)
 }
 
+#[cfg(test)]
 fn state_demands_attention(values: Option<impl Iterator<Item = u32>>, atom: xproto::Atom) -> bool {
     values.is_some_and(|mut values| values.any(|value| value == atom))
+}
+
+fn read_net_wm_state(
+    values: Option<impl Iterator<Item = u32>>,
+    atoms: VisualAtoms,
+) -> CachedClientVisualState {
+    let mut state = CachedClientVisualState::default();
+    if let Some(values) = values {
+        for value in values {
+            state.demands_attention |= value == atoms.demands_attention;
+            state.fullscreen |= value == atoms.fullscreen;
+        }
+    }
+    state
 }
 
 fn border_visual_state(
     entry: &SurfaceEntry,
     active_window: Option<Window>,
-    urgency: &HashMap<Window, CachedUrgency>,
+    urgency: &HashMap<Window, CachedClientVisualState>,
 ) -> BorderVisualState {
     if matches!(entry.visual_class, SurfaceVisualClass::Dock | SurfaceVisualClass::Desktop) {
         return BorderVisualState::Inactive;
@@ -2680,7 +2920,7 @@ fn rendered_border_color(
     visuals: &crate::config::VisualConfig,
     entry: &SurfaceEntry,
     active_window: Option<Window>,
-    urgency: &HashMap<Window, CachedUrgency>,
+    urgency: &HashMap<Window, CachedClientVisualState>,
 ) -> Option<[f32; 4]> {
     if matches!(entry.visual_class, SurfaceVisualClass::Dock | SurfaceVisualClass::Desktop)
         || effective_border_width(visuals.border.width, i32::from(entry.geometry.width), i32::from(entry.geometry.height)) == 0.0
@@ -2694,7 +2934,7 @@ fn resolved_border_color(
     visuals: &crate::config::VisualConfig,
     entry: &SurfaceEntry,
     active_window: Option<Window>,
-    urgency: &HashMap<Window, CachedUrgency>,
+    urgency: &HashMap<Window, CachedClientVisualState>,
 ) -> [f32; 4] {
     rendered_border_color(visuals, entry, active_window, urgency)
         .unwrap_or([0.0, 0.0, 0.0, 1.0])
@@ -2704,7 +2944,7 @@ fn resolve_snapshot_border_colors(
     snapshot: &mut SceneSnapshot,
     visuals: &crate::config::VisualConfig,
     active_window: Option<Window>,
-    urgency: &HashMap<Window, CachedUrgency>,
+    urgency: &HashMap<Window, CachedClientVisualState>,
 ) {
     for entry in &mut snapshot.entries {
         entry.resolved_border_color = resolved_border_color(visuals, entry, active_window, urgency).map(f32::to_bits);
@@ -2805,6 +3045,10 @@ fn build_background_render_quad_plan(pixmap: PixmapGeometry, root: RootGeometry)
         dst_y: 0,
         width: i32::from(root.width),
         height: i32::from(root.height),
+        outer_x: 0,
+        outer_y: 0,
+        outer_width: i32::from(root.width),
+        outer_height: i32::from(root.height),
         src_x: 0,
         src_y: 0,
         src_width: i32::from(root.width),
@@ -3060,7 +3304,7 @@ mod tests {
         effective_corner_radius,
         effective_border_width,
         classify_surface_visual_class, apply_surface_visual_policy, border_visual_state,
-        rendered_border_color, BorderVisualState, CachedUrgency, SurfaceVisualClass,
+        rendered_border_color, BorderVisualState, CachedClientVisualState, SurfaceVisualClass,
         wm_hints_urgency, state_demands_attention,
         is_background_property_notify, BackgroundAtoms, BackgroundCandidate, BackgroundPixmap,
         classify_event, coordinator_requires_cleanup, eligible_surface,
@@ -3082,7 +3326,9 @@ mod tests {
         structural_generation_state, StructuralGenerationState,
         FrameScheduler, FrameSchedulerState,
         classify_retired_damage_destroy, DamageDestroyClassification, DamageReleaseOutcome,
-        DamageState,
+        DamageState, shadow_eligible_for_entry, shadow_params_from_plan, read_net_wm_state, VisualAtoms,
+        NamedSurfacePixmapAcquireError, RawPixmapOwnership, named_pixmap_dimensions_match,
+        validate_named_pixmap_dimensions, translate_named_pixmap_acquire_error,
     };
     use crate::x11::capture::WindowGeometry;
     use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
@@ -3923,6 +4169,69 @@ mod tests {
     }
 
     #[test]
+    fn named_pixmap_size_change_is_typed_stale_geometry() {
+        let snapshot = WindowGeometry { x: 933, y: 25, width: 27, height: 1050, border_width: 0 };
+        let pixmap = PixmapGeometry { root: 1, x: 0, y: 0, width: 284, height: 1040, border_width: 0, depth: 24 };
+        assert!(matches!(
+            validate_named_pixmap_dimensions(snapshot, pixmap),
+            Err(NamedSurfacePixmapAcquireError::StaleGeometry)
+        ));
+        let translated = translate_named_pixmap_acquire_error(NamedSurfacePixmapAcquireError::StaleGeometry);
+        assert!(matches!(
+            translated.downcast_ref::<CandidateBuildError>(),
+            Some(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
+        ));
+    }
+
+    #[test]
+    fn matching_named_pixmap_dimensions_are_accepted() {
+        let snapshot = WindowGeometry { x: 10, y: 30, width: 950, height: 1040, border_width: 0 };
+        let pixmap = PixmapGeometry { root: 1, x: 0, y: 0, width: 950, height: 1040, border_width: 0, depth: 24 };
+        assert!(named_pixmap_dimensions_match(snapshot, pixmap));
+    }
+
+    #[test]
+    fn named_pixmap_border_is_included_in_expected_dimensions() {
+        let snapshot = WindowGeometry { x: 0, y: 0, width: 27, height: 1050, border_width: 2 };
+        let pixmap = PixmapGeometry { root: 1, x: 0, y: 0, width: 31, height: 1054, border_width: 0, depth: 24 };
+        assert!(named_pixmap_dimensions_match(snapshot, pixmap));
+    }
+
+    #[test]
+    fn zero_named_pixmap_dimension_is_stale() {
+        let snapshot = WindowGeometry { x: 0, y: 0, width: 27, height: 1050, border_width: 0 };
+        let pixmap = PixmapGeometry { root: 1, x: 0, y: 0, width: 0, height: 1050, border_width: 0, depth: 24 };
+        assert!(matches!(
+            validate_named_pixmap_dimensions(snapshot, pixmap),
+            Err(NamedSurfacePixmapAcquireError::StaleGeometry)
+        ));
+    }
+
+    #[test]
+    fn stale_x11_observation_translates_but_other_error_stays_fatal() {
+        let stale = translate_named_pixmap_acquire_error(NamedSurfacePixmapAcquireError::StaleX11("window disappeared".into()));
+        assert!(stale.downcast_ref::<CandidateBuildError>().is_some());
+        let other = translate_named_pixmap_acquire_error(NamedSurfacePixmapAcquireError::Other("backend incompatibility".into()));
+        assert!(other.downcast_ref::<CandidateBuildError>().is_none());
+    }
+
+    #[test]
+    fn raw_pixmap_ownership_transfers_once() {
+        let mut ownership = RawPixmapOwnership::new();
+        assert!(ownership.is_owned());
+        ownership.transfer();
+        assert!(!ownership.is_owned());
+        ownership.transfer();
+        assert!(!ownership.is_owned());
+    }
+
+    #[test]
+    fn bounded_retry_accepts_only_first_stale_attempt() {
+        assert!(retry_allowed(0));
+        assert!(!retry_allowed(1));
+    }
+
+    #[test]
     fn gate_shutdown_and_guards_prevent_retry() {
         assert_eq!(
             gate_decision_after_batch(
@@ -3968,7 +4277,7 @@ mod tests {
         let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
         assert_eq!(border_visual_state(&entry, None, &HashMap::new()), BorderVisualState::Inactive);
         assert_eq!(border_visual_state(&entry, Some(20), &HashMap::new()), BorderVisualState::Focused);
-        assert_eq!(border_visual_state(&entry, Some(20), &HashMap::from([(20, CachedUrgency { wm_hints: true, demands_attention: false })])), BorderVisualState::Urgent);
+        assert_eq!(border_visual_state(&entry, Some(20), &HashMap::from([(20, CachedClientVisualState { wm_hints: true, demands_attention: false, ..CachedClientVisualState::default() })])), BorderVisualState::Urgent);
         assert_eq!(entry.surface_xid, 10);
         assert_eq!(entry.lifecycle_xid, 10);
     }
@@ -4027,9 +4336,9 @@ mod tests {
     #[test]
     fn clearing_one_urgency_source_does_not_dirty_when_other_remains() {
         let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
-        let mut urgency = HashMap::from([(20, CachedUrgency { wm_hints: true, demands_attention: true })]);
+        let mut urgency = HashMap::from([(20, CachedClientVisualState { wm_hints: true, demands_attention: true, ..CachedClientVisualState::default() })]);
         let before = border_visual_state(&entry, Some(20), &urgency);
-        urgency.insert(20, CachedUrgency { wm_hints: false, demands_attention: true });
+        urgency.insert(20, CachedClientVisualState { wm_hints: false, demands_attention: true, ..CachedClientVisualState::default() });
         let after = border_visual_state(&entry, Some(20), &urgency);
         assert_eq!(before, BorderVisualState::Urgent);
         assert_eq!(after, before);
@@ -4037,7 +4346,7 @@ mod tests {
 
     #[test]
     fn removed_client_is_purged_from_visual_cache() {
-        let mut urgency = HashMap::from([(20, CachedUrgency { wm_hints: true, demands_attention: false })]);
+        let mut urgency = HashMap::from([(20, CachedClientVisualState { wm_hints: true, demands_attention: false, ..CachedClientVisualState::default() })]);
         let live = HashSet::from([30]);
         urgency.retain(|client, _| live.contains(client));
         assert!(urgency.is_empty());
@@ -4049,7 +4358,7 @@ mod tests {
             let mut source = metadata();
             source.window_type = Some(kind.to_owned());
             let entry = eligible_surface(&source, Some(20), root(), 10, 0).unwrap();
-            assert_eq!(border_visual_state(&entry, Some(20), &HashMap::from([(20, CachedUrgency { wm_hints: true, demands_attention: true })])), BorderVisualState::Inactive);
+            assert_eq!(border_visual_state(&entry, Some(20), &HashMap::from([(20, CachedClientVisualState { wm_hints: true, demands_attention: true, ..CachedClientVisualState::default() })])), BorderVisualState::Inactive);
         }
     }
 
@@ -4477,6 +4786,156 @@ mod tests {
             assert_eq!(excluded.corner_radius, 0.0);
             assert_eq!(excluded.border_width, 0.0);
         }
+    }
+
+    #[test]
+    fn shadow_policy_uses_active_visual_quad_and_excludes_non_normal_surfaces() {
+        let mut config = crate::config::CompositorConfig::defaults();
+        config.visuals.corner_radius = 18.0;
+        config.visuals.border.width = 7.0;
+        config.visuals.shadow = crate::config::ShadowConfig {
+            enabled: true,
+            color: [0, 0, 0],
+            offset_x: 0.0,
+            offset_y: 0.0,
+            extent: 12.0,
+            strength: 0.35,
+        };
+        let normal = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let visual_quad = pixmap(20, 15);
+        let mut plan = build_render_quad_plan(normal.geometry, visual_quad, root()).unwrap();
+        apply_surface_visual_policy(&mut plan, &config.visuals, normal.visual_class);
+        let style = config.visuals.shadow;
+        let shadow = shadow_params_from_plan(style, &plan).unwrap();
+        assert_eq!(shadow.outer_x, plan.outer_x as f32);
+        assert_eq!(shadow.outer_y, plan.outer_y as f32);
+        assert_eq!(shadow.outer_width, plan.outer_width as f32);
+        assert_eq!(shadow.outer_height, plan.outer_height as f32);
+        assert_eq!(shadow.corner_radius, plan.corner_radius);
+
+        for visual_class in [SurfaceVisualClass::Dock, SurfaceVisualClass::Desktop] {
+            let mut excluded = normal.clone();
+            excluded.visual_class = visual_class;
+            assert!(!shadow_eligible_for_entry(style, &excluded));
+        }
+        let mut override_redirect = normal.clone();
+        override_redirect.override_redirect = true;
+        assert!(shadow_eligible_for_entry(style, &override_redirect));
+        let mut managed_surface = normal.clone();
+        managed_surface.override_redirect = false;
+        assert!(shadow_eligible_for_entry(style, &managed_surface));
+        let mut no_client = normal.clone();
+        no_client.semantic_client_xid = None;
+        assert!(!shadow_eligible_for_entry(style, &no_client));
+        let mut fullscreen = normal;
+        fullscreen.fullscreen = true;
+        assert!(!shadow_eligible_for_entry(style, &fullscreen));
+    }
+
+    #[test]
+    fn shadow_outer_quad_is_independent_of_internal_border_width() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let mut first = crate::config::CompositorConfig::defaults();
+        first.visuals.shadow = crate::config::ShadowConfig { enabled: true, extent: 8.0, strength: 0.25, ..crate::config::ShadowConfig::default() };
+        let mut second = first;
+        second.visuals.border.width = 9.0;
+        let visual_quad = pixmap(20, 15);
+        let mut first_plan = build_render_quad_plan(entry.geometry, visual_quad, root()).unwrap();
+        apply_surface_visual_policy(&mut first_plan, &first.visuals, entry.visual_class);
+        let mut second_plan = build_render_quad_plan(entry.geometry, visual_quad, root()).unwrap();
+        apply_surface_visual_policy(&mut second_plan, &second.visuals, entry.visual_class);
+        assert_eq!(shadow_params_from_plan(first.visuals.shadow, &first_plan).unwrap().outer_width,
+            shadow_params_from_plan(second.visuals.shadow, &second_plan).unwrap().outer_width);
+        assert_eq!(shadow_params_from_plan(first.visuals.shadow, &first_plan).unwrap().outer_height,
+            shadow_params_from_plan(second.visuals.shadow, &second_plan).unwrap().outer_height);
+    }
+
+    #[test]
+    fn shadow_uses_root_destination_when_pixmap_geometry_is_local() {
+        let mut config = crate::config::CompositorConfig::defaults();
+        config.visuals.shadow = crate::config::ShadowConfig { enabled: true, extent: 8.0, strength: 0.25, ..crate::config::ShadowConfig::default() };
+        let first = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let mut first = first;
+        first.geometry.x = 10;
+        first.geometry.y = 30;
+        let local_pixmap = pixmap(20, 15);
+        let first_plan = build_render_quad_plan(first.geometry, local_pixmap, root()).unwrap();
+        let first_shadow = shadow_params_from_plan(config.visuals.shadow, &first_plan).unwrap();
+        assert_eq!((first_shadow.outer_x, first_shadow.outer_y), (10.0, 30.0));
+
+        let mut second = first.clone();
+        second.geometry.x = 55;
+        second.geometry.y = 5;
+        let second_plan = build_render_quad_plan(second.geometry, local_pixmap, root()).unwrap();
+        let second_shadow = shadow_params_from_plan(config.visuals.shadow, &second_plan).unwrap();
+        assert_eq!((second_shadow.outer_x, second_shadow.outer_y), (55.0, 5.0));
+    }
+
+    #[test]
+    fn fullscreen_transition_removes_and_restores_shadow_policy() {
+        let mut config = crate::config::CompositorConfig::defaults();
+        config.visuals.shadow = crate::config::ShadowConfig { enabled: true, extent: 8.0, strength: 0.25, ..crate::config::ShadowConfig::default() };
+        let mut entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        assert!(shadow_eligible_for_entry(config.visuals.shadow, &entry));
+        entry.fullscreen = true;
+        assert!(!shadow_eligible_for_entry(config.visuals.shadow, &entry));
+        entry.fullscreen = false;
+        assert!(shadow_eligible_for_entry(config.visuals.shadow, &entry));
+    }
+
+    #[test]
+    fn shadow_geometry_tracks_active_radius_and_surface_geometry() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let mut config = crate::config::CompositorConfig::defaults();
+        config.visuals.shadow = crate::config::ShadowConfig { enabled: true, extent: 8.0, strength: 0.25, ..crate::config::ShadowConfig::default() };
+        config.visuals.corner_radius = 4.0;
+        let visual_quad = pixmap(20, 15);
+        let mut first_plan = build_render_quad_plan(entry.geometry, visual_quad, root()).unwrap();
+        apply_surface_visual_policy(&mut first_plan, &config.visuals, entry.visual_class);
+        let first = shadow_params_from_plan(config.visuals.shadow, &first_plan).unwrap();
+        config.visuals.corner_radius = 16.0;
+        let mut second_plan = build_render_quad_plan(entry.geometry, visual_quad, root()).unwrap();
+        apply_surface_visual_policy(&mut second_plan, &config.visuals, entry.visual_class);
+        let second = shadow_params_from_plan(config.visuals.shadow, &second_plan).unwrap();
+        assert_ne!(first.corner_radius, second.corner_radius);
+        let mut moved = entry;
+        moved.geometry.x += 11;
+        moved.geometry.y += 13;
+        let moved_quad = PixmapGeometry { x: visual_quad.x + 11, y: visual_quad.y + 13, ..visual_quad };
+        let mut moved_plan = build_render_quad_plan(moved.geometry, moved_quad, root()).unwrap();
+        apply_surface_visual_policy(&mut moved_plan, &config.visuals, moved.visual_class);
+        let moved_shadow = shadow_params_from_plan(config.visuals.shadow, &moved_plan).unwrap();
+        assert_eq!(moved_shadow.outer_x - second.outer_x, 11.0);
+        assert_eq!(moved_shadow.outer_y - second.outer_y, 13.0);
+    }
+
+    #[test]
+    fn disabled_shadow_and_non_positive_settings_produce_no_params() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let config = crate::config::CompositorConfig::defaults();
+        let visual_quad = pixmap(20, 15);
+        let plan = build_render_quad_plan(entry.geometry, visual_quad, root()).unwrap();
+        assert!(!shadow_eligible_for_entry(config.visuals.shadow, &entry));
+        let mut enabled = config;
+        enabled.visuals.shadow.enabled = true;
+        assert!(shadow_params_from_plan(enabled.visuals.shadow, &plan).is_none());
+    }
+
+    #[test]
+    fn one_net_wm_state_snapshot_resolves_urgency_and_fullscreen() {
+        let atoms = VisualAtoms {
+            active_window: 1,
+            wm_hints: 2,
+            net_wm_state: 3,
+            demands_attention: 42,
+            fullscreen: 43,
+        };
+        let state = read_net_wm_state(Some([7, 43, 42].into_iter()), atoms);
+        assert!(state.demands_attention);
+        assert!(state.fullscreen);
+        let state = read_net_wm_state(Some([7].into_iter()), atoms);
+        assert!(!state.demands_attention);
+        assert!(!state.fullscreen);
     }
 
     #[test]
