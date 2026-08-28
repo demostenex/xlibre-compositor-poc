@@ -845,6 +845,40 @@ impl EglSceneRenderer {
         Ok(())
     }
 
+    pub fn capture_and_blur_background(
+        &mut self,
+        owner_x: i32,
+        owner_y: i32,
+        owner_width: i32,
+        owner_height: i32,
+        radius: f32,
+    ) -> Result<u32, Box<dyn Error>> {
+        self.scene_renderer
+            .as_mut()
+            .ok_or("EGL scene renderer is unavailable")?
+            .capture_and_blur_background(
+                owner_x,
+                owner_y,
+                owner_width,
+                owner_height,
+                radius,
+                self.width as i32,
+                self.height as i32,
+            )
+    }
+
+    pub fn draw_blurred_backdrop(
+        &mut self,
+        texture: u32,
+        params: crate::graphics::renderer::BackdropParams,
+        corner_radius: f32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer
+            .as_mut()
+            .ok_or("EGL scene renderer is unavailable")?
+            .draw_blurred_backdrop(texture, params, corner_radius)
+    }
+
     pub fn swap(&self) -> Result<(), Box<dyn Error>> {
         self.instance.swap_buffers(self.display, self.surface)?;
         Ok(())

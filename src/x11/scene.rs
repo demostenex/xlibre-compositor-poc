@@ -28,6 +28,8 @@ use super::overlay::OverlayLease;
 use super::shutdown::{wait_for_event_or_shutdown, SignalWake, WaitResult};
 use super::tree::{BindingStatus, HierarchySnapshot};
 
+const BACKGROUND_BLUR_RADIUS_PX: f32 = 12.0;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RootGeometry {
     width: u16,
@@ -50,13 +52,49 @@ struct VisualAtoms {
     net_wm_state: xproto::Atom,
     demands_attention: xproto::Atom,
     fullscreen: xproto::Atom,
+    blur_behind_region: xproto::Atom,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// One `x, y, width, height` group from a `_KDE_NET_WM_BLUR_BEHIND_REGION`
+/// payload, retained exactly as parsed (client-local coordinate space,
+/// unconverted). Phase 2A only parses and caches this data; nothing in
+/// this codebase yet interprets or renders it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlurRegionRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// A semantic client's parsed background-blur request, per
+/// `_KDE_NET_WM_BLUR_BEHIND_REGION`. This is the client's REQUEST only —
+/// it is never derived from transparency capability (visual class, depth,
+/// opacity) and does not by itself imply anything is rendered.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum BlurRequest {
+    /// Property absent, malformed, or rejected (wrong type/format, or a
+    /// payload length that is not a multiple of 4).
+    #[default]
+    None,
+    /// Property present with either a zero-length payload, or exactly one
+    /// degenerate (width == 0 && height == 0) rectangle — both are the
+    /// confirmed "blur the whole window" shape (the latter is the exact
+    /// payload the reference client, Ghostty, emits).
+    FullWindow,
+    /// Property present with one or more non-degenerate groups, retained
+    /// verbatim (including any degenerate rectangle mixed into a
+    /// multi-rectangle payload — Phase 2A does not filter or reinterpret
+    /// mixed payloads; see the parser's own documentation).
+    Regions(Vec<BlurRegionRect>),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CachedClientVisualState {
     wm_hints: bool,
     demands_attention: bool,
     fullscreen: bool,
+    blur_requested: BlurRequest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +120,7 @@ enum BackgroundCandidate {
 struct SurfaceEntry {
     surface_xid: Window,
     semantic_client_xid: Option<Window>,
+    client_root_geometry: Option<ClientRootGeometry>,
     lifecycle_xid: Window,
     geometry: WindowGeometry,
     depth: u8,
@@ -96,6 +135,24 @@ struct SurfaceEntry {
     shadow_eligible: bool,
     resolved_border_color: [u32; 4],
     resolved_opacity_bits: u32,
+    /// This entry's owned blur request, resolved from the cached,
+    /// per-semantic-client `BlurRequest` (Phase 2A) via the structural
+    /// `semantic_client_xid` relationship only (Phase 2B owner audit) —
+    /// never from WM_CLASS, override_redirect, visual_class, opacity, or
+    /// fullscreen. `None` for a surface with no semantic client (e.g. a
+    /// popup/helper) or whose client has no active request. Preserves
+    /// the full protocol shape (None/FullWindow/Regions) rather than
+    /// collapsing to a boolean; Phase 2B2b consumes only FullWindow while
+    /// Regions remains intentionally deferred.
+    resolved_blur_request: BlurRequest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClientRootGeometry {
+    root_x: i32,
+    root_y: i32,
+    width: i32,
+    height: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -536,6 +593,8 @@ fn eligible_surface(
         shadow_eligible: false,
         resolved_border_color: [0.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits()],
         resolved_opacity_bits: 1.0f32.to_bits(),
+        client_root_geometry: None,
+        resolved_blur_request: BlurRequest::None,
     })
 }
 
@@ -595,6 +654,120 @@ fn shadow_params_from_plan(
     Some(params)
 }
 
+fn client_bounds_from_hierarchy(
+    hierarchy: &HierarchySnapshot,
+) -> HashMap<Window, (i32, i32)> {
+    let mut bounds = HashMap::new();
+    for binding in &hierarchy.children {
+        let BindingStatus::SingleClient(client) = binding.semantic_client else {
+            continue;
+        };
+        let metadata = if client == binding.root_child_xid {
+            binding.surface_candidate.as_ref()
+        } else {
+            binding.descendants.iter().find(|metadata| metadata.window == client)
+        };
+        if let Some(metadata) = metadata {
+            bounds.entry(client).or_insert((
+                i32::from(metadata.geometry.width),
+                i32::from(metadata.geometry.height),
+            ));
+        }
+    }
+    bounds
+}
+
+fn translate_coordinates_reply_error(error: ReplyError) -> Box<dyn Error> {
+    if matches!(
+        error,
+        ReplyError::X11Error(ref error) if error.error_kind == ErrorKind::Window
+    ) {
+        Box::new(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
+    } else {
+        Box::new(error)
+    }
+}
+
+fn region_request_requires_client_origin(request: &BlurRequest, client: Option<Window>) -> bool {
+    client.is_some() && matches!(request, BlurRequest::Regions(_))
+}
+
+fn client_root_geometry_from_translation(
+    root_x: i16,
+    root_y: i16,
+    width: i32,
+    height: i32,
+) -> ClientRootGeometry {
+    ClientRootGeometry {
+        root_x: i32::from(root_x),
+        root_y: i32::from(root_y),
+        width,
+        height,
+    }
+}
+
+fn resolve_regions_client_geometry(
+    connection: &X11Connection,
+    root: Window,
+    snapshot: &mut SceneSnapshot,
+    client_bounds: &HashMap<Window, (i32, i32)>,
+    urgency: &HashMap<Window, CachedClientVisualState>,
+) -> Result<(), Box<dyn Error>> {
+    let mut translated = HashMap::new();
+    for entry in &snapshot.entries {
+        let Some(client) = entry.semantic_client_xid else {
+            continue;
+        };
+        let Some(state) = urgency.get(&client) else {
+            continue;
+        };
+        if !region_request_requires_client_origin(&state.blur_requested, Some(client)) {
+            continue;
+        }
+        if translated.contains_key(&client) {
+            continue;
+        }
+        let Some(&(width, height)) = client_bounds.get(&client) else {
+            return Err(Box::new(CandidateBuildError::Stale(SceneInvalidation::Hierarchy)));
+        };
+        let reply = connection
+            .inner
+            .translate_coordinates(client, root, 0, 0)?
+            .reply()
+            .map_err(translate_coordinates_reply_error)?;
+        translated.insert(
+            client,
+            client_root_geometry_from_translation(reply.dst_x, reply.dst_y, width, height),
+        );
+    }
+    for entry in &mut snapshot.entries {
+        if let Some(client) = entry.semantic_client_xid {
+            entry.client_root_geometry = translated.get(&client).copied();
+        }
+    }
+    Ok(())
+}
+
+/// Resolves `entry`'s blur-request OWNERSHIP from its already-resolved
+/// `semantic_client_xid` and the already-cached, per-client
+/// `BlurRequest` (Phase 2A). Structural only — see the Phase 2B owner
+/// audit: no WM_CLASS, PID, override_redirect, visual_class, opacity, or
+/// fullscreen check. A `semantic_client_xid` of `None` (a popup/helper
+/// surface, per the audit's directly observed cases) always resolves to
+/// `BlurRequest::None` — never a fallback or inherited request from any
+/// other client. The full protocol shape is preserved verbatim
+/// (None/FullWindow/Regions), not collapsed to a boolean.
+fn resolved_blur_request(
+    entry: &SurfaceEntry,
+    urgency: &HashMap<Window, CachedClientVisualState>,
+) -> BlurRequest {
+    entry
+        .semantic_client_xid
+        .and_then(|client| urgency.get(&client))
+        .map(|state| state.blur_requested.clone())
+        .unwrap_or(BlurRequest::None)
+}
+
 fn resolve_snapshot_fullscreen(
     snapshot: &mut SceneSnapshot,
     urgency: &HashMap<Window, CachedClientVisualState>,
@@ -606,6 +779,7 @@ fn resolve_snapshot_fullscreen(
             .and_then(|client| urgency.get(&client))
             .is_some_and(|state| state.fullscreen);
         entry.shadow_eligible = shadow_eligible_for_entry(style, entry);
+        entry.resolved_blur_request = resolved_blur_request(entry, urgency);
     }
 }
 
@@ -1906,6 +2080,7 @@ impl<'a> SceneSession<'a> {
         let generation = self.structural_generation;
         let root_geometry = read_root_geometry(self.connection, self.root)?;
         let hierarchy = self.connection.snapshot_hierarchy()?;
+        let client_bounds = client_bounds_from_hierarchy(&hierarchy);
         let watch_ids = snapshot_watch_ids(&hierarchy);
         let overlay = self.overlay.as_ref().ok_or("overlay is unavailable")?.overlay;
         let owner = self
@@ -1920,6 +2095,13 @@ impl<'a> SceneSession<'a> {
             owner,
         )?;
         self.initialize_visual_state(&snapshot)?;
+        resolve_regions_client_geometry(
+            self.connection,
+            self.root,
+            &mut snapshot,
+            &client_bounds,
+            &self.urgency,
+        )?;
         resolve_snapshot_border_colors(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
         resolve_snapshot_fullscreen(&mut snapshot, &self.urgency, self.shadow_style);
         resolve_snapshot_opacity(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
@@ -2459,8 +2641,20 @@ impl<'a> SceneSession<'a> {
             .ok_or_else(|| format!("current DamageLease is unavailable: 0x{damage_id:08x}").into())
     }
 
-    fn full_recompose_current(&self) -> Result<(), Box<dyn Error>> {
-        self.render_egl_scene(self.current_snapshot(), &self.egl_surfaces, &self.pixmaps)
+    fn full_recompose_current(&mut self) -> Result<(), Box<dyn Error>> {
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .expect("published scene snapshot must exist while live");
+        let surfaces = &self.egl_surfaces;
+        let pixmaps = &self.pixmaps;
+        let background = self.background.as_ref();
+        let shadow_style = self.shadow_style;
+        let visuals = &self._config.visuals;
+        let egl = self.egl.as_mut().ok_or("EGL scene renderer is unavailable")?;
+        render_egl_scene_parts(
+            egl, background, shadow_style, visuals, snapshot, surfaces, pixmaps,
+        )
     }
 
     fn classify_session_event(
@@ -2519,9 +2713,11 @@ impl<'a> SceneSession<'a> {
         let Some(entry) = entries.iter().find(|entry| entry.semantic_client_xid == Some(property.window)) else {
             return Ok(None);
         };
-        let Some(old) = self.urgency.get(&property.window).copied() else {
+        let Some(old) = self.urgency.get(&property.window).cloned() else {
             return Ok(None);
         };
+        let old_fullscreen = old.fullscreen;
+        let old_blur_requested = old.blur_requested.clone();
         let updated = if property.atom == self.visual_atoms.wm_hints {
             let wm_hints = match read_wm_hints_urgency(self.connection, property.window, self.visual_atoms.wm_hints) {
                 Ok(value) => value,
@@ -2546,18 +2742,52 @@ impl<'a> SceneSession<'a> {
                 fullscreen: state.fullscreen,
                 ..old
             }
+        } else if property.atom == self.visual_atoms.blur_behind_region {
+            // Covers property creation, payload change, AND deletion: a
+            // re-query after the client removes the property returns
+            // "absent" (BlurRequest::None), which is a real change from
+            // any prior non-None cached value — no branching on
+            // `property.state` (Newvalue vs Deleted) is needed, matching
+            // how wm_hints/net_wm_state already re-query unconditionally
+            // above. Phase 2A only updates the cache here; nothing reads
+            // the resolved request for rendering here; the render loop
+            // consumes the already-resolved SurfaceEntry value later.
+            let blur_requested = match read_client_blur_request(self.connection, property.window, self.visual_atoms) {
+                Ok(value) => value,
+                Err(error) if super::capture::is_bad_window_error(error.as_ref()) => {
+                    self.urgency.remove(&property.window);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            CachedClientVisualState { blur_requested, ..old }
         } else {
             return Ok(None);
         };
-        let fullscreen_changed = old.fullscreen != updated.fullscreen;
+        let updated_fullscreen = updated.fullscreen;
+        let updated_blur_requested = updated.blur_requested.clone();
+        let fullscreen_changed = old_fullscreen != updated_fullscreen;
+        let blur_requested_changed = old_blur_requested != updated_blur_requested;
         self.urgency.insert(property.window, updated);
         if property.atom == self.visual_atoms.net_wm_state {
             let shadow_style = self.shadow_style;
             if let Some(entry) = self.current_snapshot_mut().entries.iter_mut()
                 .find(|candidate| candidate.semantic_client_xid == Some(property.window))
             {
-                entry.fullscreen = updated.fullscreen;
+                entry.fullscreen = updated_fullscreen;
                 entry.shadow_eligible = shadow_eligible_for_entry(shadow_style, entry);
+            }
+        }
+        if property.atom == self.visual_atoms.blur_behind_region {
+            // Blur-only change: keep the live, already-published snapshot's
+            // resolved request in sync without waiting for the next full
+            // candidate rebuild — mirrors the net_wm_state block above
+            // exactly, but touches only `resolved_blur_request` (blur has
+            // no effect on fullscreen/shadow_eligible).
+            if let Some(entry) = self.current_snapshot_mut().entries.iter_mut()
+                .find(|candidate| candidate.semantic_client_xid == Some(property.window))
+            {
+                entry.resolved_blur_request = updated_blur_requested.clone();
             }
         }
         let before = (entry.resolved_border_color, entry.resolved_opacity_bits);
@@ -2565,7 +2795,7 @@ impl<'a> SceneSession<'a> {
         let after = self.current_snapshot().entries.iter()
             .find(|candidate| candidate.semantic_client_xid == Some(property.window))
             .map_or(before, |candidate| (candidate.resolved_border_color, candidate.resolved_opacity_bits));
-        if (changed && before != after) || fullscreen_changed {
+        if (changed && before != after) || fullscreen_changed || blur_requested_changed {
             Ok(Some(SceneInvalidation::VisualState))
         } else {
             Ok(None)
@@ -2636,46 +2866,20 @@ impl<'a> SceneSession<'a> {
     }
 
     fn render_egl_scene(
-        &self,
+        &mut self,
         snapshot: &SceneSnapshot,
         surfaces: &HashMap<Window, EglImportedSurface>,
         pixmaps: &[NamedSurfacePixmap<'a>],
     ) -> Result<(), Box<dyn Error>> {
-        let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
-        egl.clear()?;
-        if let Some(background) = &self.background {
-            if let Some(plan) = build_background_render_quad_plan(background.source.geometry, snapshot.root_geometry) {
-                egl.render_surface(background.surface.texture, plan, background.surface.pixel_semantics)?;
-            }
-        }
-        for entry in &snapshot.entries {
-            let Some(surface) = surfaces.get(&entry.surface_xid) else {
-                continue;
-            };
-            let pixmap = pixmaps
-                .iter()
-                .find(|pixmap| pixmap.surface_xid == entry.surface_xid)
-                .ok_or_else(|| format!("missing pixmap for EGL surface 0x{:08x}", entry.surface_xid))?;
-            let mut plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
-                .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
-            apply_surface_visual_policy(&mut plan, &self._config.visuals, entry.visual_class);
-            plan.border_color = entry.resolved_border_color.map(f32::from_bits);
-            if entry.shadow_eligible {
-                if let Some(shadow) = shadow_params_from_plan(self.shadow_style, &plan) {
-                    egl.render_shadow(shadow)?;
-                }
-            }
-            let opacity = crate::graphics::renderer::SurfaceOpacity::new(
-                f32::from_bits(entry.resolved_opacity_bits),
-            ).expect("resolved surface opacity must be valid");
-            egl.render_surface_with_opacity(
-                surface.texture,
-                plan,
-                surface.pixel_semantics,
-                opacity,
-            )?;
-        }
-        Ok(())
+        render_egl_scene_parts(
+            self.egl.as_mut().ok_or("EGL scene renderer is unavailable")?,
+            self.background.as_ref(),
+            self.shadow_style,
+            &self._config.visuals,
+            snapshot,
+            surfaces,
+            pixmaps,
+        )
     }
 
     fn current_snapshot(&self) -> &SceneSnapshot {
@@ -2857,6 +3061,241 @@ impl<'a> SceneSession<'a> {
             ownership.disarm_cleanup();
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RegionRenderPlan {
+    visible: Vec<RootRect>,
+    capture: RootRect,
+}
+
+fn intersect_root_rect(a: (i64, i64, i64, i64), b: (i64, i64, i64, i64)) -> Option<RootRect> {
+    let left = a.0.max(b.0);
+    let top = a.1.max(b.1);
+    let right = (a.0 + a.2).min(b.0 + b.2);
+    let bottom = (a.1 + a.3).min(b.1 + b.3);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(RootRect {
+        x: i32::try_from(left).ok()?,
+        y: i32::try_from(top).ok()?,
+        width: i32::try_from(right - left).ok()?,
+        height: i32::try_from(bottom - top).ok()?,
+    })
+}
+
+fn subtract_root_rect(rect: RootRect, covered: RootRect) -> Vec<RootRect> {
+    let Some(intersection) = intersect_root_rect(
+        (i64::from(rect.x), i64::from(rect.y), i64::from(rect.width), i64::from(rect.height)),
+        (i64::from(covered.x), i64::from(covered.y), i64::from(covered.width), i64::from(covered.height)),
+    ) else {
+        return vec![rect];
+    };
+    let rect_right = rect.x + rect.width;
+    let rect_bottom = rect.y + rect.height;
+    let intersection_right = intersection.x + intersection.width;
+    let intersection_bottom = intersection.y + intersection.height;
+    let mut fragments = Vec::with_capacity(4);
+    if intersection.x > rect.x {
+        fragments.push(RootRect { x: rect.x, y: rect.y, width: intersection.x - rect.x, height: rect.height });
+    }
+    if intersection_right < rect_right {
+        fragments.push(RootRect { x: intersection_right, y: rect.y, width: rect_right - intersection_right, height: rect.height });
+    }
+    if intersection.y > rect.y {
+        fragments.push(RootRect { x: intersection.x, y: rect.y, width: intersection.width, height: intersection.y - rect.y });
+    }
+    if intersection_bottom < rect_bottom {
+        fragments.push(RootRect { x: intersection.x, y: intersection_bottom, width: intersection.width, height: rect_bottom - intersection_bottom });
+    }
+    fragments
+}
+
+fn normalize_non_overlapping_rects(rects: &[RootRect]) -> Vec<RootRect> {
+    let mut normalized = Vec::new();
+    for &rect in rects {
+        let mut fragments = vec![rect];
+        for &covered in &normalized {
+            let mut remaining = Vec::new();
+            for fragment in fragments {
+                remaining.extend(subtract_root_rect(fragment, covered));
+            }
+            fragments = remaining;
+            if fragments.is_empty() {
+                break;
+            }
+        }
+        normalized.extend(fragments);
+    }
+    normalized
+}
+
+fn plan_region_backdrop(
+    regions: &[BlurRegionRect],
+    client: ClientRootGeometry,
+    owner: RootRect,
+    root: RootGeometry,
+) -> Option<RegionRenderPlan> {
+    let client_bounds = (i64::from(client.root_x), i64::from(client.root_y),
+        i64::from(client.width), i64::from(client.height));
+    let owner_bounds = (i64::from(owner.x), i64::from(owner.y),
+        i64::from(owner.width), i64::from(owner.height));
+    let root_bounds = (0_i64, 0_i64, i64::from(root.width), i64::from(root.height));
+    let mut visible = Vec::new();
+    for region in regions {
+        if region.width <= 0 || region.height <= 0 {
+            continue;
+        }
+        let translated = (
+            i64::from(client.root_x).checked_add(i64::from(region.x))?,
+            i64::from(client.root_y).checked_add(i64::from(region.y))?,
+            i64::from(region.width),
+            i64::from(region.height),
+        );
+        if let Some(clipped) = intersect_root_rect(translated, client_bounds)
+            .and_then(|rect| intersect_root_rect((i64::from(rect.x), i64::from(rect.y),
+                i64::from(rect.width), i64::from(rect.height)), owner_bounds))
+            .and_then(|rect| intersect_root_rect((i64::from(rect.x), i64::from(rect.y),
+                i64::from(rect.width), i64::from(rect.height)), root_bounds))
+        {
+            visible.push(clipped);
+        }
+    }
+    let visible = normalize_non_overlapping_rects(&visible);
+    let first = *visible.first()?;
+    let mut left = first.x;
+    let mut top = first.y;
+    let mut right = first.x + first.width;
+    let mut bottom = first.y + first.height;
+    for rect in &visible[1..] {
+        left = left.min(rect.x);
+        top = top.min(rect.y);
+        right = right.max(rect.x + rect.width);
+        bottom = bottom.max(rect.y + rect.height);
+    }
+    Some(RegionRenderPlan {
+        visible,
+        capture: RootRect { x: left, y: top, width: right - left, height: bottom - top },
+    })
+}
+
+fn render_egl_scene_parts<'a>(
+    egl: &mut EglSceneRenderer,
+    background: Option<&ImportedBackground>,
+    shadow_style: crate::config::ShadowConfig,
+    visuals: &crate::config::VisualConfig,
+    snapshot: &SceneSnapshot,
+    surfaces: &HashMap<Window, EglImportedSurface>,
+    pixmaps: &[NamedSurfacePixmap<'a>],
+) -> Result<(), Box<dyn Error>> {
+    egl.clear()?;
+    if let Some(background) = background {
+        if let Some(plan) = build_background_render_quad_plan(background.source.geometry, snapshot.root_geometry) {
+            egl.render_surface(background.surface.texture, plan, background.surface.pixel_semantics)?;
+        }
+    }
+    for entry in &snapshot.entries {
+        let Some(surface) = surfaces.get(&entry.surface_xid) else {
+            continue;
+        };
+        let pixmap = pixmaps
+            .iter()
+            .find(|pixmap| pixmap.surface_xid == entry.surface_xid)
+            .ok_or_else(|| format!("missing pixmap for EGL surface 0x{:08x}", entry.surface_xid))?;
+        let mut plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
+            .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
+        apply_surface_visual_policy(&mut plan, visuals, entry.visual_class);
+        plan.border_color = entry.resolved_border_color.map(f32::from_bits);
+
+        let region_plan = match &entry.resolved_blur_request {
+            BlurRequest::Regions(regions) => entry.client_root_geometry.and_then(|client| {
+                plan_region_backdrop(
+                    regions,
+                    client,
+                    RootRect {
+                        x: plan.outer_x,
+                        y: plan.outer_y,
+                        width: plan.outer_width,
+                        height: plan.outer_height,
+                    },
+                    snapshot.root_geometry,
+                )
+            }),
+            BlurRequest::None | BlurRequest::FullWindow => None,
+        };
+        let blurred_texture = match entry.resolved_blur_request {
+            BlurRequest::FullWindow => Some(egl.capture_and_blur_background(
+                plan.outer_x,
+                plan.outer_y,
+                plan.outer_width,
+                plan.outer_height,
+                BACKGROUND_BLUR_RADIUS_PX,
+            )?),
+            BlurRequest::Regions(_) => region_plan.as_ref().map(|region| {
+                egl.capture_and_blur_background(
+                    region.capture.x,
+                    region.capture.y,
+                    region.capture.width,
+                    region.capture.height,
+                    BACKGROUND_BLUR_RADIUS_PX,
+                )
+            }).transpose()?,
+            BlurRequest::None => None,
+        };
+        if entry.shadow_eligible {
+            if let Some(shadow) = shadow_params_from_plan(shadow_style, &plan) {
+                egl.render_shadow(shadow)?;
+            }
+        }
+        if let Some(blurred_texture) = blurred_texture {
+            if let Some(region_plan) = region_plan {
+                for region in region_plan.visible {
+                    let backdrop_params = crate::graphics::renderer::BackdropParams::new_region(
+                        plan.outer_x,
+                        plan.outer_y,
+                        plan.outer_width,
+                        plan.outer_height,
+                        region.x,
+                        region.y,
+                        region.width,
+                        region.height,
+                        i32::from(snapshot.root_geometry.width),
+                        i32::from(snapshot.root_geometry.height),
+                    ).ok_or("invalid Regions backdrop geometry")?;
+                    egl.draw_blurred_backdrop(blurred_texture, backdrop_params, plan.corner_radius)?;
+                }
+            } else {
+            let backdrop_params = crate::graphics::renderer::BackdropParams::new(
+                plan.outer_x,
+                plan.outer_y,
+                plan.outer_width,
+                plan.outer_height,
+                i32::from(snapshot.root_geometry.width),
+                i32::from(snapshot.root_geometry.height),
+            ).ok_or("invalid FullWindow backdrop geometry")?;
+            egl.draw_blurred_backdrop(blurred_texture, backdrop_params, plan.corner_radius)?;
+            }
+        }
+        let opacity = crate::graphics::renderer::SurfaceOpacity::new(
+            f32::from_bits(entry.resolved_opacity_bits),
+        ).expect("resolved surface opacity must be valid");
+        egl.render_surface_with_opacity(
+            surface.texture,
+            plan,
+            surface.pixel_semantics,
+            opacity,
+        )?;
+    }
+    Ok(())
 }
 
 fn egl_scene_is_renderable(entry_count: usize, egl_surface_count: usize) -> bool {
@@ -3052,6 +3491,7 @@ fn acquire_visual_atoms(connection: &X11Connection) -> Result<VisualAtoms, Box<d
         net_wm_state: intern(b"_NET_WM_STATE")?,
         demands_attention: intern(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
         fullscreen: intern(b"_NET_WM_STATE_FULLSCREEN")?,
+        blur_behind_region: intern(b"_KDE_NET_WM_BLUR_BEHIND_REGION")?,
     })
 }
 
@@ -3068,8 +3508,10 @@ fn read_client_urgency(
     let hints = connection.inner.get_property(false, client, atoms.wm_hints, xproto::AtomEnum::ANY, 0, 9)?.reply()?;
     let wm_hints_urgent = wm_hints_urgency(hints.value32().and_then(|mut values| values.next()));
     let state = connection.inner.get_property(false, client, atoms.net_wm_state, xproto::AtomEnum::ATOM, 0, u32::MAX)?.reply()?;
+    let blur_requested = read_client_blur_request(connection, client, atoms)?;
     Ok(CachedClientVisualState {
         wm_hints: wm_hints_urgent,
+        blur_requested,
         ..read_net_wm_state(state.value32(), atoms)
     })
 }
@@ -3090,6 +3532,80 @@ fn read_client_net_wm_state(
 ) -> Result<CachedClientVisualState, Box<dyn Error>> {
     let state = connection.inner.get_property(false, client, atoms.net_wm_state, xproto::AtomEnum::ATOM, 0, u32::MAX)?.reply()?;
     Ok(read_net_wm_state(state.value32(), atoms))
+}
+
+/// Reads and parses `_KDE_NET_WM_BLUR_BEHIND_REGION` on `client` (never on
+/// a redirected surface/frame XID — see `parse_blur_behind_region` for the
+/// parsing contract). Requesting with `type = CARDINAL` means a
+/// wrong-type property is rejected by the server itself (an empty reply,
+/// `value32()` sees nothing to iterate) — the same convention already
+/// used for `_NET_WM_STATE`'s `type = ATOM` filter, not a new mechanism.
+fn read_client_blur_request(
+    connection: &X11Connection,
+    client: Window,
+    atoms: VisualAtoms,
+) -> Result<BlurRequest, Box<dyn Error>> {
+    let reply = connection
+        .inner
+        .get_property(false, client, atoms.blur_behind_region, xproto::AtomEnum::CARDINAL, 0, u32::MAX)?
+        .reply()?;
+    Ok(parse_blur_behind_region(reply.value32()))
+}
+
+/// Pure parser for a `_KDE_NET_WM_BLUR_BEHIND_REGION` payload, already
+/// reduced to `Option<impl Iterator<Item = u32>>` by the caller (mirrors
+/// `read_net_wm_state`'s split between I/O and parsing). `values ==
+/// None` covers both "property absent" and "wrong format" (format != 32,
+/// per `GetPropertyReply::value32`'s own contract) — both reject to
+/// `BlurRequest::None`, matching "do not silently accept malformed data"
+/// by never treating a rejected read as a request.
+///
+/// A payload length not divisible by 4 is rejected outright (`None`), not
+/// truncated to the nearest complete group — silently accepting a
+/// malformed group count would itself be a form of accepting malformed
+/// data.
+///
+/// A zero-length payload, or a payload consisting of exactly one
+/// degenerate (width == 0 && height == 0) rectangle, is the confirmed
+/// "blur the whole window" shape (the latter is the exact payload the
+/// reference client, Ghostty, emits for `background-blur = true`) and
+/// parses to `BlurRequest::FullWindow`.
+///
+/// Any other payload — one or more non-degenerate rectangles, or a MIX of
+/// degenerate and non-degenerate rectangles — parses to
+/// `BlurRequest::Regions(...)`, retained verbatim, including any
+/// degenerate entries. Phase 2A deliberately does not filter, coalesce,
+/// or reinterpret a degenerate rectangle found WITHIN a multi-rectangle
+/// payload as anything special: only the single-rectangle-and-degenerate
+/// case has a confirmed, evidenced interpretation (FullWindow); how a
+/// degenerate entry inside a larger region list should be treated is an
+/// open question left to whichever future phase renders `Regions(...)`.
+fn parse_blur_behind_region(values: Option<impl Iterator<Item = u32>>) -> BlurRequest {
+    let Some(values) = values else {
+        return BlurRequest::None;
+    };
+    let raw: Vec<u32> = values.collect();
+    if raw.is_empty() {
+        return BlurRequest::FullWindow;
+    }
+    if raw.len() % 4 != 0 {
+        return BlurRequest::None;
+    }
+    let regions: Vec<BlurRegionRect> = raw
+        .chunks_exact(4)
+        .map(|group| BlurRegionRect {
+            x: group[0] as i32,
+            y: group[1] as i32,
+            width: group[2] as i32,
+            height: group[3] as i32,
+        })
+        .collect();
+    if let [only] = regions.as_slice() {
+        if only.width == 0 && only.height == 0 {
+            return BlurRequest::FullWindow;
+        }
+    }
+    BlurRequest::Regions(regions)
 }
 
 fn wm_hints_urgency(flags: Option<u32>) -> bool {
@@ -3323,7 +3839,9 @@ fn is_visual_property_notify(
     }
     snapshot.entries.iter().any(|entry| {
         entry.semantic_client_xid == Some(event.window)
-            && (event.atom == atoms.wm_hints || event.atom == atoms.net_wm_state)
+            && (event.atom == atoms.wm_hints
+                || event.atom == atoms.net_wm_state
+                || event.atom == atoms.blur_behind_region)
     })
 }
 
@@ -3545,6 +4063,7 @@ mod tests {
         RENDER_CLIENT_MAJOR, RENDER_CLIENT_MINOR,
         root_live_event_mask, canonical_live_event_mask, snapshot_watch_ids, SceneState,
         ShutdownReason, SurfaceEntry, MAX_CANDIDATE_RETRIES, MAX_EVENTS_PER_BATCH,
+        BACKGROUND_BLUR_RADIUS_PX,
         observe_structural_generation,
         batch_damage_requires_subtraction,
         structural_generation_state, StructuralGenerationState,
@@ -3557,6 +4076,11 @@ mod tests {
         DamageLeaseAcquireError, stale_damage_create_reply, translate_damage_lease_acquire_error,
         rect_intersects_root, surface_quad_intersects_root, shadow_bounds_intersect_root,
         entry_has_visible_contribution, prune_invisible_entries,
+        BlurRequest, BlurRegionRect, parse_blur_behind_region, is_visual_property_notify,
+        resolved_blur_request, resolve_snapshot_fullscreen,
+        ClientRootGeometry, client_root_geometry_from_translation,
+        region_request_requires_client_origin, translate_coordinates_reply_error,
+        RootRect, intersect_root_rect, plan_region_backdrop,
     };
     use crate::x11::capture::WindowGeometry;
     use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
@@ -3576,6 +4100,350 @@ mod tests {
             depth: 24,
             visual: 0x21,
         }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BlurRenderAction {
+        CaptureBlur,
+        Shadow,
+        Backdrop,
+        Surface,
+    }
+
+    fn modeled_blur_actions(request: &BlurRequest, shadow: bool) -> Vec<BlurRenderAction> {
+        let mut actions = Vec::new();
+        if matches!(request, BlurRequest::FullWindow) {
+            actions.push(BlurRenderAction::CaptureBlur);
+        }
+        if shadow {
+            actions.push(BlurRenderAction::Shadow);
+        }
+        if matches!(request, BlurRequest::FullWindow) {
+            actions.push(BlurRenderAction::Backdrop);
+        }
+        actions.push(BlurRenderAction::Surface);
+        actions
+    }
+
+    fn modeled_blur_selected(request: &BlurRequest, _fullscreen: bool, _depth: u8, _opacity: f32) -> bool {
+        matches!(request, BlurRequest::FullWindow)
+    }
+
+    #[test]
+    fn blur_model_none_has_no_blur_actions() {
+        assert_eq!(modeled_blur_actions(&BlurRequest::None, true), vec![BlurRenderAction::Shadow, BlurRenderAction::Surface]);
+    }
+
+    #[test]
+    fn blur_model_regions_has_no_blur_actions_and_preserves_request() {
+        let request = BlurRequest::Regions(vec![BlurRegionRect { x: 1, y: 2, width: 3, height: 4 }]);
+        assert_eq!(modeled_blur_actions(&request, false), vec![BlurRenderAction::Surface]);
+        assert!(matches!(request, BlurRequest::Regions(_)));
+    }
+
+    #[test]
+    fn blur_model_full_window_with_shadow_is_ordered() {
+        assert_eq!(
+            modeled_blur_actions(&BlurRequest::FullWindow, true),
+            vec![BlurRenderAction::CaptureBlur, BlurRenderAction::Shadow, BlurRenderAction::Backdrop, BlurRenderAction::Surface],
+        );
+    }
+
+    #[test]
+    fn blur_model_full_window_without_shadow_is_ordered() {
+        assert_eq!(
+            modeled_blur_actions(&BlurRequest::FullWindow, false),
+            vec![BlurRenderAction::CaptureBlur, BlurRenderAction::Backdrop, BlurRenderAction::Surface],
+        );
+    }
+
+    fn client_geometry() -> ClientRootGeometry {
+        ClientRootGeometry { root_x: 20, root_y: 10, width: 60, height: 40 }
+    }
+
+    fn owner_geometry() -> RootRect {
+        RootRect { x: 10, y: 5, width: 80, height: 60 }
+    }
+
+    #[test]
+    fn regions_translate_client_local_coordinates_to_root_space() {
+        let plan = plan_region_backdrop(
+            &[BlurRegionRect { x: 7, y: 9, width: 11, height: 13 }],
+            client_geometry(), owner_geometry(), root(),
+        ).unwrap();
+        assert_eq!(plan.visible, vec![RootRect { x: 27, y: 19, width: 11, height: 13 }]);
+    }
+
+    #[test]
+    fn regions_clip_against_client_bounds_before_owner_and_root() {
+        let plan = plan_region_backdrop(
+            &[BlurRegionRect { x: 55, y: 35, width: 20, height: 20 }],
+            client_geometry(), owner_geometry(), root(),
+        ).unwrap();
+        assert_eq!(plan.visible, vec![RootRect { x: 75, y: 45, width: 5, height: 5 }]);
+    }
+
+    #[test]
+    fn regions_partially_outside_client_are_clipped_not_rebased() {
+        let plan = plan_region_backdrop(
+            &[BlurRegionRect { x: -5, y: -4, width: 15, height: 14 }],
+            client_geometry(), owner_geometry(), root(),
+        ).unwrap();
+        assert_eq!(plan.visible, vec![RootRect { x: 20, y: 10, width: 10, height: 10 }]);
+    }
+
+    #[test]
+    fn regions_preserve_disjoint_rectangles_and_compute_union_capture() {
+        let plan = plan_region_backdrop(
+            &[
+                BlurRegionRect { x: 0, y: 0, width: 5, height: 5 },
+                BlurRegionRect { x: 30, y: 20, width: 5, height: 5 },
+            ], client_geometry(), owner_geometry(), root(),
+        ).unwrap();
+        assert_eq!(plan.visible.len(), 2);
+        assert_eq!(plan.capture, RootRect { x: 20, y: 10, width: 35, height: 25 });
+    }
+
+    #[test]
+    fn regions_normalize_overlaps_without_expanding_visible_mask() {
+        let plan = plan_region_backdrop(
+            &[
+                BlurRegionRect { x: 0, y: 0, width: 10, height: 10 },
+                BlurRegionRect { x: 5, y: 5, width: 10, height: 10 },
+            ], client_geometry(), owner_geometry(), root(),
+        ).unwrap();
+        assert_eq!(plan.visible.len(), 3);
+        assert_eq!(plan.capture, RootRect { x: 20, y: 10, width: 15, height: 15 });
+        assert!(plan.visible.iter().enumerate().all(|(index, left)| {
+            plan.visible[index + 1..].iter().all(|right| {
+                intersect_root_rect(
+                    (i64::from(left.x), i64::from(left.y), i64::from(left.width), i64::from(left.height)),
+                    (i64::from(right.x), i64::from(right.y), i64::from(right.width), i64::from(right.height)),
+                ).is_none()
+            })
+        }));
+    }
+
+    #[test]
+    fn duplicate_regions_normalize_to_one_rectangle() {
+        let request = [BlurRegionRect { x: 4, y: 6, width: 12, height: 10 }];
+        let single = plan_region_backdrop(&request, client_geometry(), owner_geometry(), root()).unwrap();
+        let duplicate = plan_region_backdrop(&[request[0], request[0]], client_geometry(), owner_geometry(), root()).unwrap();
+        assert_eq!(duplicate, single);
+    }
+
+    #[test]
+    fn nested_region_adds_no_visible_coverage() {
+        let plan = plan_region_backdrop(
+            &[
+                BlurRegionRect { x: 0, y: 0, width: 30, height: 30 },
+                BlurRegionRect { x: 5, y: 5, width: 10, height: 10 },
+            ], client_geometry(), owner_geometry(), root(),
+        ).unwrap();
+        assert_eq!(plan.visible, vec![RootRect { x: 20, y: 10, width: 30, height: 30 }]);
+    }
+
+    #[test]
+    fn overlapping_regions_at_rounded_owner_corner_are_emitted_once() {
+        let owner = RootRect { x: 20, y: 10, width: 60, height: 40 };
+        let plan = plan_region_backdrop(
+            &[
+                BlurRegionRect { x: 0, y: 0, width: 30, height: 20 },
+                BlurRegionRect { x: 0, y: 0, width: 20, height: 30 },
+            ], client_geometry(), owner, root(),
+        ).unwrap();
+        assert!(plan.visible.iter().enumerate().all(|(index, left)| {
+            plan.visible[index + 1..].iter().all(|right| {
+                intersect_root_rect(
+                    (i64::from(left.x), i64::from(left.y), i64::from(left.width), i64::from(left.height)),
+                    (i64::from(right.x), i64::from(right.y), i64::from(right.width), i64::from(right.height)),
+                ).is_none()
+            })
+        }));
+    }
+
+    #[test]
+    fn cross_overlap_decomposes_to_non_overlapping_union() {
+        let plan = plan_region_backdrop(
+            &[
+                BlurRegionRect { x: 0, y: 12, width: 40, height: 6 },
+                BlurRegionRect { x: 17, y: 0, width: 6, height: 40 },
+            ], client_geometry(), owner_geometry(), root(),
+        ).unwrap();
+        let area: i32 = plan.visible.iter().map(|rect| rect.width * rect.height).sum();
+        assert_eq!(area, 40 * 6 + 6 * 40 - 6 * 6);
+        assert!(plan.visible.iter().enumerate().all(|(index, left)| {
+            plan.visible[index + 1..].iter().all(|right| {
+                intersect_root_rect(
+                    (i64::from(left.x), i64::from(left.y), i64::from(left.width), i64::from(left.height)),
+                    (i64::from(right.x), i64::from(right.y), i64::from(right.width), i64::from(right.height)),
+                ).is_none()
+            })
+        }));
+    }
+
+    #[test]
+    fn regions_clip_against_owner_and_root_edges() {
+        let client = ClientRootGeometry { root_x: -20, root_y: -10, width: 40, height: 40 };
+        let owner = RootRect { x: -10, y: -5, width: 30, height: 30 };
+        let plan = plan_region_backdrop(
+            &[BlurRegionRect { x: 0, y: 0, width: 40, height: 40 }],
+            client, owner, root(),
+        ).unwrap();
+        assert_eq!(plan.visible, vec![RootRect { x: 0, y: 0, width: 20, height: 25 }]);
+    }
+
+    #[test]
+    fn regions_with_no_surviving_rectangles_do_no_work() {
+        assert!(plan_region_backdrop(
+            &[BlurRegionRect { x: 0, y: 0, width: 0, height: 20 }],
+            client_geometry(), owner_geometry(), root(),
+        ).is_none());
+        assert!(plan_region_backdrop(
+            &[BlurRegionRect { x: 100, y: 100, width: 2, height: 2 }],
+            client_geometry(), owner_geometry(), root(),
+        ).is_none());
+    }
+
+    #[test]
+    fn region_planning_handles_large_signed_offsets_without_integer_wrap() {
+        assert!(plan_region_backdrop(
+            &[BlurRegionRect { x: i32::MAX, y: i32::MIN, width: 1, height: 1 }],
+            client_geometry(), owner_geometry(), root(),
+        ).is_none());
+    }
+
+    #[test]
+    fn region_capture_is_union_only_and_expansion_is_deferred_to_blur_primitive() {
+        let plan = plan_region_backdrop(
+            &[BlurRegionRect { x: 2, y: 3, width: 4, height: 5 }],
+            client_geometry(), owner_geometry(), root(),
+        ).unwrap();
+        assert_eq!(plan.capture, plan.visible[0]);
+        let source = include_str!("../graphics/renderer.rs");
+        assert!(source.contains("BlurCaptureRegion::new("));
+    }
+
+    #[test]
+    fn regions_production_path_captures_once_then_composites_each_visible_rect() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = source[start..].find("\nfn egl_scene_is_renderable").unwrap() + start;
+        let body = &source[start..end];
+        assert_eq!(body.matches("BlurRequest::Regions(regions)").count(), 1);
+        assert!(body.contains("for region in region_plan.visible"));
+        assert!(body.contains("new_region("));
+    }
+
+    #[test]
+    fn none_and_full_window_do_not_require_client_origin() {
+        assert!(!region_request_requires_client_origin(&BlurRequest::None, Some(7)));
+        assert!(!region_request_requires_client_origin(&BlurRequest::FullWindow, Some(7)));
+        assert!(!region_request_requires_client_origin(&BlurRequest::Regions(Vec::new()), None));
+    }
+
+    #[test]
+    fn regions_require_a_semantic_client_origin() {
+        let request = BlurRequest::Regions(vec![BlurRegionRect { x: 0, y: 0, width: 10, height: 20 }]);
+        assert!(region_request_requires_client_origin(&request, Some(7)));
+    }
+
+    #[test]
+    fn translated_client_geometry_preserves_root_origin_and_client_bounds() {
+        assert_eq!(
+            client_root_geometry_from_translation(-12, 34, 948, 518),
+            ClientRootGeometry { root_x: -12, root_y: 34, width: 948, height: 518 },
+        );
+    }
+
+    #[test]
+    fn missing_semantic_client_cannot_fabricate_region_mapping() {
+        let request = BlurRequest::Regions(vec![BlurRegionRect { x: 0, y: 0, width: 1, height: 1 }]);
+        assert!(!region_request_requires_client_origin(&request, None));
+    }
+
+    #[test]
+    fn translate_coordinates_bad_window_is_a_stale_hierarchy_observation() {
+        let error = translate_coordinates_reply_error(damage_create_x11_error(ErrorKind::Window));
+        assert!(matches!(
+            error.downcast_ref::<CandidateBuildError>(),
+            Some(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
+        ));
+    }
+
+    #[test]
+    fn translate_coordinates_non_window_error_remains_fatal() {
+        let error = translate_coordinates_reply_error(damage_create_x11_error(ErrorKind::Match));
+        assert!(error.downcast_ref::<CandidateBuildError>().is_none());
+    }
+
+    #[test]
+    fn region_origin_query_does_not_change_candidate_retry_budget() {
+        assert_eq!(MAX_CANDIDATE_RETRIES, 1);
+    }
+
+    #[test]
+    fn blur_model_two_full_window_owners_complete_before_next_capture() {
+        let mut actions = modeled_blur_actions(&BlurRequest::FullWindow, true);
+        actions.extend(modeled_blur_actions(&BlurRequest::FullWindow, false));
+        assert_eq!(actions.iter().filter(|action| **action == BlurRenderAction::CaptureBlur).count(), 2);
+        assert!(actions[..4].contains(&BlurRenderAction::Surface));
+        assert_eq!(actions[4], BlurRenderAction::CaptureBlur);
+    }
+
+    #[test]
+    fn blur_model_full_window_selection_is_independent_of_fullscreen_depth_and_opacity() {
+        for fullscreen in [false, true] {
+            for depth in [24_u8, 32_u8] {
+                for opacity in [0.25_f32, 1.0_f32] {
+                    assert!(modeled_blur_selected(&BlurRequest::FullWindow, fullscreen, depth, opacity));
+                }
+            }
+        }
+        assert!(!modeled_blur_selected(&BlurRequest::Regions(Vec::new()), true, 32, 0.25));
+        assert_eq!(modeled_blur_actions(&BlurRequest::None, false), vec![BlurRenderAction::Surface]);
+    }
+
+    #[test]
+    fn blur_model_transparent_non_requesting_surface_stays_inert() {
+        assert!(!modeled_blur_selected(&BlurRequest::None, false, 32, 0.25));
+        assert_eq!(modeled_blur_actions(&BlurRequest::None, false), vec![BlurRenderAction::Surface]);
+    }
+
+    #[test]
+    fn blur_gaussian_radius_is_named_and_distinct_from_corner_radius() {
+        assert_eq!(BACKGROUND_BLUR_RADIUS_PX, 12.0);
+        let source = include_str!("scene.rs");
+        assert!(source.contains("capture_and_blur_background("));
+        assert!(source.contains("BACKGROUND_BLUR_RADIUS_PX"));
+        assert!(source.contains("draw_blurred_backdrop(blurred_texture, backdrop_params, plan.corner_radius)"));
+    }
+
+    #[test]
+    fn blur_wiring_has_no_new_gl_resources_or_renderer_x11_queries() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = start + source[start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let wiring = &source[start..end];
+        assert!(!wiring.contains("GenTextures"));
+        assert!(!wiring.contains("GenFramebuffers"));
+        assert!(!wiring.contains("CreateProgram"));
+        assert!(!wiring.contains("GetUniformLocation"));
+        assert!(!wiring.contains("intern_atom"));
+    }
+
+    #[test]
+    fn blur_wiring_uses_full_window_only_and_forwards_both_primitives() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = start + source[start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let wiring = &source[start..end];
+        assert!(wiring.contains("BlurRequest::FullWindow"));
+        assert!(wiring.contains("BlurRequest::None => None"));
+        assert!(wiring.contains("capture_and_blur_background("));
+        assert!(wiring.contains("draw_blurred_backdrop(blurred_texture, backdrop_params, plan.corner_radius)"));
+        assert!(wiring.contains("BACKGROUND_BLUR_RADIUS_PX"));
+        assert!(!wiring.contains("BlurRequest::Regions(_) => Some"));
     }
 
     fn pixmap(width: u16, height: u16) -> PixmapGeometry {
@@ -4574,7 +5442,9 @@ mod tests {
             fullscreen: false,
             shadow_eligible,
             resolved_border_color: [0, 0, 0, 1.0f32.to_bits()],
-            resolved_opacity_bits: 1.0f32.to_bits(),
+        resolved_opacity_bits: 1.0f32.to_bits(),
+        client_root_geometry: None,
+        resolved_blur_request: BlurRequest::None,
         }
     }
 
@@ -5433,7 +6303,7 @@ mod tests {
         urgency.insert(20, CachedClientVisualState::default());
         assert_eq!(resolved_surface_opacity(&config.visuals, &entry, Some(30), &urgency), 0.92);
         assert_eq!(resolved_surface_opacity(&config.visuals, &entry, Some(20), &urgency), 0.80);
-        urgency.insert(20, CachedClientVisualState { wm_hints: false, demands_attention: true, fullscreen: false });
+        urgency.insert(20, CachedClientVisualState { wm_hints: false, demands_attention: true, fullscreen: false, ..CachedClientVisualState::default() });
         assert_eq!(resolved_surface_opacity(&config.visuals, &entry, Some(20), &urgency), 0.70);
     }
 
@@ -5556,6 +6426,7 @@ mod tests {
             net_wm_state: 3,
             demands_attention: 42,
             fullscreen: 43,
+            blur_behind_region: 44,
         };
         let state = read_net_wm_state(Some([7, 43, 42].into_iter()), atoms);
         assert!(state.demands_attention);
@@ -5563,6 +6434,352 @@ mod tests {
         let state = read_net_wm_state(Some([7].into_iter()), atoms);
         assert!(!state.demands_attention);
         assert!(!state.fullscreen);
+    }
+
+    // ========================================================
+    // 3a3f7 Phase 2A — _KDE_NET_WM_BLUR_BEHIND_REGION request parsing,
+    // caching, and invalidation. No GPU call, no backdrop composite: the
+    // renderer's blur primitive remains completely uncalled by anything
+    // added here (see phase_2a_does_not_call_the_blur_primitive).
+    // ========================================================
+
+    #[test]
+    fn blur_property_absent_is_no_request() {
+        assert_eq!(parse_blur_behind_region(None::<std::iter::Empty<u32>>), BlurRequest::None);
+    }
+
+    #[test]
+    fn blur_property_empty_payload_is_full_window() {
+        assert_eq!(parse_blur_behind_region(Some(Vec::<u32>::new().into_iter())), BlurRequest::FullWindow);
+    }
+
+    #[test]
+    fn blur_property_single_degenerate_rectangle_is_full_window() {
+        // The exact payload the reference client (Ghostty 1.3.1,
+        // background-blur=true) emits.
+        assert_eq!(parse_blur_behind_region(Some([0u32, 0, 0, 0].into_iter())), BlurRequest::FullWindow);
+    }
+
+    #[test]
+    fn blur_property_single_rectangle_is_regions() {
+        assert_eq!(
+            parse_blur_behind_region(Some([10u32, 20, 300, 400].into_iter())),
+            BlurRequest::Regions(vec![BlurRegionRect { x: 10, y: 20, width: 300, height: 400 }])
+        );
+    }
+
+    #[test]
+    fn blur_property_multiple_rectangles_preserve_order_and_data() {
+        assert_eq!(
+            parse_blur_behind_region(Some([1u32, 2, 3, 4, 5, 6, 7, 8].into_iter())),
+            BlurRequest::Regions(vec![
+                BlurRegionRect { x: 1, y: 2, width: 3, height: 4 },
+                BlurRegionRect { x: 5, y: 6, width: 7, height: 8 },
+            ])
+        );
+    }
+
+    #[test]
+    fn blur_property_mixed_degenerate_and_valid_rectangles_is_not_coerced_to_full_window() {
+        // A degenerate rectangle MIXED into a multi-rectangle payload must
+        // not collapse the whole request to FullWindow, and must not be
+        // silently dropped — only the single-rectangle-and-degenerate
+        // shape has a confirmed FullWindow interpretation.
+        assert_eq!(
+            parse_blur_behind_region(Some([0u32, 0, 0, 0, 10, 10, 100, 100].into_iter())),
+            BlurRequest::Regions(vec![
+                BlurRegionRect { x: 0, y: 0, width: 0, height: 0 },
+                BlurRegionRect { x: 10, y: 10, width: 100, height: 100 },
+            ])
+        );
+    }
+
+    #[test]
+    fn blur_property_malformed_count_is_rejected() {
+        for len in [1, 2, 3, 5, 6, 7] {
+            let payload: Vec<u32> = (0..len).collect();
+            assert_eq!(
+                parse_blur_behind_region(Some(payload.into_iter())),
+                BlurRequest::None,
+                "payload length {len} (not a multiple of 4) must be rejected, not truncated"
+            );
+        }
+    }
+
+    #[test]
+    fn blur_property_wrong_format_is_rejected_like_absent() {
+        // GetPropertyReply::value32() (x11rb) returns None whenever the
+        // server-reported format isn't 32 — the same `None` input this
+        // parser already treats as "absent". No separate code path exists
+        // for "wrong format" versus "absent"; both are safely rejected by
+        // the same branch.
+        assert_eq!(parse_blur_behind_region(None::<std::iter::Empty<u32>>), BlurRequest::None);
+    }
+
+    #[test]
+    fn blur_property_read_filters_by_cardinal_type() {
+        // A wrong-type property is rejected by the server itself (an
+        // effectively empty reply) because the request filters by
+        // `type = CARDINAL` — the same convention _NET_WM_STATE already
+        // uses with `type = ATOM`, not a new mechanism. Source-contract
+        // check since this requires a live connection to observe
+        // end-to-end.
+        let source = include_str!("scene.rs");
+        let start = source.find("fn read_client_blur_request(").expect("read_client_blur_request exists");
+        let end = start + source[start..].find("\n}\n").expect("function body ends");
+        let body = &source[start..end];
+        assert!(body.contains("xproto::AtomEnum::CARDINAL"));
+    }
+
+    #[test]
+    fn blur_behind_region_property_notify_is_visual_state_scoped() {
+        let atoms = VisualAtoms {
+            active_window: 1, wm_hints: 2, net_wm_state: 3,
+            demands_attention: 42, fullscreen: 43, blur_behind_region: 44,
+        };
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
+        let created = Event::PropertyNotify(xproto::PropertyNotifyEvent {
+            response_type: 28, sequence: 0, window: 20, atom: 44, time: 0,
+            state: xproto::Property::NEW_VALUE,
+        });
+        assert!(is_visual_property_notify(&created, 1, atoms, &snapshot));
+        let deleted = Event::PropertyNotify(xproto::PropertyNotifyEvent {
+            response_type: 28, sequence: 0, window: 20, atom: 44, time: 0,
+            state: xproto::Property::DELETE,
+        });
+        assert!(is_visual_property_notify(&deleted, 1, atoms, &snapshot));
+        let unrelated_atom = Event::PropertyNotify(xproto::PropertyNotifyEvent {
+            response_type: 28, sequence: 0, window: 20, atom: 99, time: 0,
+            state: xproto::Property::NEW_VALUE,
+        });
+        assert!(!is_visual_property_notify(&unrelated_atom, 1, atoms, &snapshot));
+        let unrelated_window = Event::PropertyNotify(xproto::PropertyNotifyEvent {
+            response_type: 28, sequence: 0, window: 999, atom: 44, time: 0,
+            state: xproto::Property::NEW_VALUE,
+        });
+        assert!(!is_visual_property_notify(&unrelated_window, 1, atoms, &snapshot));
+    }
+
+    #[test]
+    fn blur_visual_state_invalidation_preserves_pending_pixel_damage() {
+        // Same InvalidationBatch machinery a blur PropertyNotify already
+        // routes through (SceneInvalidation::VisualState) — proves the
+        // pending-PixelDamage-never-lost invariant holds regardless of
+        // which VisualState source triggered it.
+        let mut batch = InvalidationBatch::default();
+        batch.push(SceneInvalidation::PixelDamage(7));
+        batch.push(SceneInvalidation::VisualState);
+        assert_eq!(batch.decision(), SceneInvalidation::VisualState);
+        assert!(batch.pixel_damage().contains(&7));
+        assert!(batch_damage_requires_subtraction(SceneInvalidation::VisualState, batch.pixel_damage()));
+    }
+
+    #[test]
+    fn initialize_visual_state_dedups_by_semantic_client() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn initialize_visual_state(").expect("initialize_visual_state exists");
+        let end = start + source[start..].find("\n    fn build_candidate").expect("function body ends before build_candidate");
+        let body = &source[start..end];
+        assert!(body.contains("self.urgency.contains_key(&client)"));
+        assert!(body.contains("read_client_urgency"));
+        let dedup_index = body.find("self.urgency.contains_key(&client)").unwrap();
+        let query_index = body.find("read_client_urgency(").unwrap();
+        assert!(dedup_index < query_index, "the dedup check must precede the query");
+    }
+
+    #[test]
+    fn semantic_client_none_is_excluded_from_blur_query_iteration() {
+        let with_client = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let without_client = eligible_surface(&metadata(), None, root(), 10, 1).unwrap();
+        let entries = vec![with_client, without_client];
+        let clients: Vec<xproto::Window> = entries.iter().filter_map(|entry| entry.semantic_client_xid).collect();
+        assert_eq!(clients, vec![20]);
+    }
+
+    #[test]
+    fn fullscreen_does_not_erase_cached_blur_request() {
+        // Mirrors fullscreen_transition_removes_and_restores_shadow_policy:
+        // the raw cached request must survive a fullscreen transition
+        // unmodified. Phase 2A adds no resolved-eligibility field at all
+        // (deliberately — see module docs), so there is nothing yet that
+        // COULD suppress it; this test locks in that the cache itself is
+        // never touched by fullscreen state.
+        let mut cache = HashMap::new();
+        cache.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
+        let mut entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        entry.fullscreen = true;
+        assert!(entry.fullscreen);
+        assert_eq!(cache.get(&20).unwrap().blur_requested, BlurRequest::FullWindow, "toggling fullscreen must not touch the cached request");
+        entry.fullscreen = false;
+        assert!(!entry.fullscreen);
+        assert_eq!(cache.get(&20).unwrap().blur_requested, BlurRequest::FullWindow);
+    }
+
+    #[test]
+    fn phase_2a_property_update_does_not_call_the_blur_primitive() {
+        // Phase 2A still only caches/invalidates the request. Rendering is
+        // performed later from the resolved snapshot by Phase 2B2b.
+        let source = include_str!("scene.rs");
+        let start = source.find("fn update_visual_state(").expect("update_visual_state exists");
+        let end = start + source[start..].find("\n    fn refresh_resolved_visual_state").expect("function body ends");
+        assert!(!source[start..end].contains("capture_and_blur_background"));
+    }
+
+    // ========================================================
+    // 3a3f7 Phase 2B1 — resolved per-SurfaceEntry blur-request ownership.
+    // Structural ownership (semantic_client_xid -> cached BlurRequest) is
+    // unchanged; rendering consumes only the resolved FullWindow variant.
+    // ========================================================
+
+    #[test]
+    fn resolved_blur_request_is_none_when_semantic_client_is_none() {
+        let entry = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        let urgency = HashMap::new();
+        assert_eq!(resolved_blur_request(&entry, &urgency), BlurRequest::None);
+    }
+
+    #[test]
+    fn resolved_blur_request_reflects_cached_none() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState::default());
+        assert_eq!(resolved_blur_request(&entry, &urgency), BlurRequest::None);
+    }
+
+    #[test]
+    fn resolved_blur_request_reflects_cached_full_window() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
+        assert_eq!(resolved_blur_request(&entry, &urgency), BlurRequest::FullWindow);
+    }
+
+    #[test]
+    fn resolved_blur_request_preserves_exact_regions() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let regions = vec![BlurRegionRect { x: 5, y: 6, width: 7, height: 8 }];
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::Regions(regions.clone()), ..CachedClientVisualState::default() });
+        assert_eq!(resolved_blur_request(&entry, &urgency), BlurRequest::Regions(regions));
+    }
+
+    #[test]
+    fn resolved_blur_request_isolates_distinct_clients() {
+        let entry_a = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let entry_b = eligible_surface(&metadata(), Some(30), root(), 10, 1).unwrap();
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
+        // client 30 has no cache entry at all yet.
+        assert_eq!(resolved_blur_request(&entry_a, &urgency), BlurRequest::FullWindow);
+        assert_eq!(resolved_blur_request(&entry_b, &urgency), BlurRequest::None);
+    }
+
+    #[test]
+    fn resolve_snapshot_fullscreen_resolves_independent_owners_for_two_clients() {
+        // Models the task's own two-top-level-clients scenario: surface A
+        // -> C1 -> FullWindow, surface B -> C2 -> None; then C2 gaining a
+        // Regions request must affect B only.
+        let entry_a = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let entry_b = eligible_surface(&metadata(), Some(30), root(), 10, 1).unwrap();
+        let mut snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry_a, entry_b] };
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
+        urgency.insert(30, CachedClientVisualState::default());
+        let style = crate::config::CompositorConfig::defaults().visuals.shadow;
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::FullWindow);
+        assert_eq!(snapshot.entries[1].resolved_blur_request, BlurRequest::None);
+
+        let regions = vec![BlurRegionRect { x: 1, y: 1, width: 2, height: 2 }];
+        urgency.insert(30, CachedClientVisualState { blur_requested: BlurRequest::Regions(regions.clone()), ..CachedClientVisualState::default() });
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::FullWindow, "C1's owner must be unaffected by C2's change");
+        assert_eq!(snapshot.entries[1].resolved_blur_request, BlurRequest::Regions(regions));
+    }
+
+    #[test]
+    fn property_delete_transitions_full_window_to_none_on_rebuild() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let mut snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
+        let style = crate::config::CompositorConfig::defaults().visuals.shadow;
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::FullWindow);
+        // Client deletes the property; Phase 2A's re-query (unchanged)
+        // caches None for it.
+        urgency.insert(20, CachedClientVisualState::default());
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::None);
+    }
+
+    #[test]
+    fn blur_only_visual_state_updates_resolved_entry_without_full_rebuild() {
+        // The incremental (PropertyNotify-triggered, no full candidate
+        // rebuild) path: source-contract, since exercising it end-to-end
+        // requires a live connection. Proves the new blur branch exists
+        // and writes `resolved_blur_request` strictly AFTER the cache
+        // itself is updated (so the synced value is never stale).
+        let source = include_str!("scene.rs");
+        let start = source.find("fn update_visual_state(").expect("update_visual_state exists");
+        let end = start + source[start..].find("\n    fn refresh_resolved_visual_state").expect("function body ends");
+        let body = &source[start..end];
+        assert!(body.contains("if property.atom == self.visual_atoms.blur_behind_region {"));
+        assert!(body.contains("entry.resolved_blur_request = updated_blur_requested"));
+        let insert_index = body.find("self.urgency.insert(property.window, updated);").expect("cache insert exists");
+        let entry_update_index = body.find("entry.resolved_blur_request = updated_blur_requested").expect("live entry sync exists");
+        assert!(insert_index < entry_update_index, "cache must be updated before the live entry is synced");
+    }
+
+    #[test]
+    fn fullscreen_does_not_erase_resolved_blur_request() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let style = crate::config::CompositorConfig::defaults().visuals.shadow;
+        let mut snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, fullscreen: false, ..CachedClientVisualState::default() });
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::FullWindow);
+        assert!(!snapshot.entries[0].fullscreen);
+
+        urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, fullscreen: true, ..CachedClientVisualState::default() });
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::FullWindow, "request identity must survive a fullscreen transition");
+        assert!(snapshot.entries[0].fullscreen);
+    }
+
+    #[test]
+    fn opacity_or_transparency_never_creates_a_blur_request() {
+        let mut entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        entry.resolved_opacity_bits = 0.25f32.to_bits();
+        entry.depth = 32;
+        let urgency = HashMap::new();
+        assert_eq!(resolved_blur_request(&entry, &urgency), BlurRequest::None);
+    }
+
+    #[test]
+    fn resolved_blur_request_never_reads_opacity_or_visual_signals() {
+        // Structural-only proof (Phase 2B owner audit, sections 3/8/16):
+        // the resolver's only inputs are semantic_client_xid and the
+        // cache — no WM_CLASS/PID/override_redirect/visual_class/opacity/
+        // fullscreen shortcut.
+        let source = include_str!("scene.rs");
+        let start = source.find("fn resolved_blur_request(").expect("resolved_blur_request exists");
+        let end = start + source[start..].find("\n}\n").expect("function body ends");
+        let body = &source[start..end];
+        for forbidden in ["resolved_opacity_bits", "visual_class", ".depth", "override_redirect", "WM_CLASS", ".fullscreen"] {
+            assert!(!body.contains(forbidden), "resolved_blur_request must not reference {forbidden}");
+        }
+    }
+
+    #[test]
+    fn popup_helper_with_no_semantic_client_never_inherits_another_clients_request() {
+        let popup = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        let mut urgency = HashMap::new();
+        // Some OTHER client has an active FullWindow request.
+        urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
+        assert_eq!(resolved_blur_request(&popup, &urgency), BlurRequest::None);
     }
 
     #[test]

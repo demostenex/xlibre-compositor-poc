@@ -18,6 +18,88 @@ pub struct SceneRenderer {
     shadow_strength_uniform: i32,
     shadow_color_uniform: i32,
     surface_opacity_uniform: i32,
+    #[allow(dead_code)]
+    background_blur: Option<BackgroundBlurResources>,
+    backdrop_program: Option<BackdropProgram>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackdropParams {
+    pub(crate) owner_x: i32,
+    pub(crate) owner_y: i32,
+    pub(crate) owner_width: i32,
+    pub(crate) owner_height: i32,
+    pub(crate) draw_x: i32,
+    pub(crate) draw_y: i32,
+    pub(crate) draw_width: i32,
+    pub(crate) draw_height: i32,
+    pub(crate) root_width: i32,
+    pub(crate) root_height: i32,
+}
+
+impl BackdropParams {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        owner_x: i32,
+        owner_y: i32,
+        owner_width: i32,
+        owner_height: i32,
+        root_width: i32,
+        root_height: i32,
+    ) -> Option<Self> {
+        (owner_width > 0 && owner_height > 0 && root_width > 0 && root_height > 0).then_some(Self {
+            owner_x, owner_y, owner_width, owner_height,
+            draw_x: owner_x, draw_y: owner_y, draw_width: owner_width, draw_height: owner_height,
+            root_width, root_height,
+        })
+    }
+
+    pub(crate) fn new_region(
+        owner_x: i32,
+        owner_y: i32,
+        owner_width: i32,
+        owner_height: i32,
+        draw_x: i32,
+        draw_y: i32,
+        draw_width: i32,
+        draw_height: i32,
+        root_width: i32,
+        root_height: i32,
+    ) -> Option<Self> {
+        (owner_width > 0 && owner_height > 0 && draw_width > 0 && draw_height > 0
+            && root_width > 0 && root_height > 0).then_some(Self {
+            owner_x, owner_y, owner_width, owner_height,
+            draw_x, draw_y, draw_width, draw_height,
+            root_width, root_height,
+        })
+    }
+}
+
+struct BackdropProgram {
+    program: u32,
+    texture_uniform: i32,
+    surface_size_uniform: i32,
+    corner_radius_uniform: i32,
+}
+
+impl BackdropProgram {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let program = create_program(BACKDROP_VERTEX_SHADER, BACKDROP_FRAGMENT_SHADER)?;
+        let texture_uniform = unsafe { gl::GetUniformLocation(program, b"blurred_root\0".as_ptr().cast()) };
+        let surface_size_uniform = unsafe { gl::GetUniformLocation(program, b"surface_size\0".as_ptr().cast()) };
+        let corner_radius_uniform = unsafe { gl::GetUniformLocation(program, b"corner_radius\0".as_ptr().cast()) };
+        if texture_uniform < 0 || surface_size_uniform < 0 || corner_radius_uniform < 0 {
+            unsafe { gl::DeleteProgram(program); }
+            return Err("backdrop shader uniforms are unavailable".into());
+        }
+        Ok(Self { program, texture_uniform, surface_size_uniform, corner_radius_uniform })
+    }
+}
+
+impl Drop for BackdropProgram {
+    fn drop(&mut self) {
+        unsafe { gl::DeleteProgram(self.program); }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -160,6 +242,435 @@ impl SurfaceOpacity {
 
     fn value(self) -> f32 {
         self.0
+    }
+}
+
+#[allow(dead_code)]
+const BLUR_TAP_RADIUS: f32 = 4.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlurCaptureRegion {
+    pub(crate) root_width: i32,
+    pub(crate) root_height: i32,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) framebuffer_y: i32,
+}
+
+fn root_to_texture_u(root_x: f32, root_width: i32) -> f32 {
+    root_x / root_width as f32
+}
+
+fn root_to_texture_v(root_y: f32, root_height: i32) -> f32 {
+    (root_height as f32 - root_y) / root_height as f32
+}
+
+#[cfg(test)]
+fn backdrop_replacement(rgb: [f32; 3], coverage: f32) -> [f32; 4] {
+    let coverage = coverage.clamp(0.0, 1.0);
+    [rgb[0] * coverage, rgb[1] * coverage, rgb[2] * coverage, coverage]
+}
+
+impl BlurCaptureRegion {
+    pub(crate) fn new(
+        owner_x: i32,
+        owner_y: i32,
+        owner_width: i32,
+        owner_height: i32,
+        radius: f32,
+        root_width: i32,
+        root_height: i32,
+    ) -> Option<Self> {
+        if owner_width <= 0 || owner_height <= 0 || root_width <= 0 || root_height <= 0
+            || !radius.is_finite() || radius <= 0.0
+        {
+            return None;
+        }
+        let reach = radius.ceil();
+        let left = (owner_x as f32 - reach).floor().max(0.0) as i32;
+        let top = (owner_y as f32 - reach).floor().max(0.0) as i32;
+        let right = (owner_x as f32 + owner_width as f32 + reach)
+            .ceil()
+            .min(root_width as f32) as i32;
+        let bottom = (owner_y as f32 + owner_height as f32 + reach)
+            .ceil()
+            .min(root_height as f32) as i32;
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(Self {
+            root_width,
+            root_height,
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+            framebuffer_y: root_height - bottom,
+        })
+    }
+}
+
+#[allow(dead_code)]
+struct BackgroundBlurResources {
+    textures: [u32; 2],
+    framebuffers: [u32; 2],
+    program: u32,
+    vao: u32,
+    buffer: u32,
+    texture_size_uniform: i32,
+    direction_uniform: i32,
+    radius_uniform: i32,
+    width: i32,
+    height: i32,
+}
+
+/// Owns raw GL names created while `BackgroundBlurResources::new` is still
+/// assembling a candidate resource set. `Drop` deletes whatever has been
+/// created so far (GL delete calls silently ignore zero/absent names, so a
+/// partially populated guard cleans up exactly the names that exist).
+/// `std::mem::forget` is used once construction fully succeeds so ownership
+/// passes to `BackgroundBlurResources` without a double free.
+#[allow(dead_code)]
+struct PendingBlurResources {
+    textures: [u32; 2],
+    framebuffers: [u32; 2],
+    program: u32,
+    vao: u32,
+    buffer: u32,
+}
+
+#[allow(dead_code)]
+impl PendingBlurResources {
+    fn empty() -> Self {
+        Self {
+            textures: [0; 2],
+            framebuffers: [0; 2],
+            program: 0,
+            vao: 0,
+            buffer: 0,
+        }
+    }
+}
+
+impl Drop for PendingBlurResources {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteBuffers(1, &self.buffer);
+            gl::DeleteVertexArrays(1, &self.vao);
+            gl::DeleteFramebuffers(2, self.framebuffers.as_ptr());
+            gl::DeleteTextures(2, self.textures.as_ptr());
+            gl::DeleteProgram(self.program);
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl BackgroundBlurResources {
+    fn new(width: i32, height: i32) -> Result<Self, Box<dyn Error>> {
+        if width <= 0 || height <= 0 {
+            return Err("background blur dimensions must be positive".into());
+        }
+
+        let program = create_program(BLUR_VERTEX_SHADER, BLUR_FRAGMENT_SHADER)?;
+        let mut pending = PendingBlurResources {
+            program,
+            ..PendingBlurResources::empty()
+        };
+
+        let texture_size_uniform = unsafe {
+            gl::GetUniformLocation(pending.program, b"texture_size\0".as_ptr().cast())
+        };
+        let direction_uniform = unsafe {
+            gl::GetUniformLocation(pending.program, b"direction\0".as_ptr().cast())
+        };
+        let radius_uniform = unsafe {
+            gl::GetUniformLocation(pending.program, b"radius\0".as_ptr().cast())
+        };
+        if texture_size_uniform < 0 || direction_uniform < 0 || radius_uniform < 0 {
+            return Err("background blur shader uniforms are unavailable".into());
+        }
+
+        unsafe {
+            check_gl_error("before background blur resource generation")?;
+            gl::GenTextures(2, pending.textures.as_mut_ptr());
+            gl::GenFramebuffers(2, pending.framebuffers.as_mut_ptr());
+            check_gl_error("background blur resource generation")?;
+        }
+        if pending.textures.iter().any(|&texture| texture == 0) {
+            return Err("glGenTextures returned a zero texture name".into());
+        }
+        if pending.framebuffers.iter().any(|&framebuffer| framebuffer == 0) {
+            return Err("glGenFramebuffers returned a zero framebuffer name".into());
+        }
+
+        unsafe {
+            for texture in pending.textures {
+                gl::ActiveTexture(gl::TEXTURE0);
+                gl::BindTexture(gl::TEXTURE_2D, texture);
+                gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+                gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+                gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+                gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+                gl::TexImage2D(
+                    gl::TEXTURE_2D,
+                    0,
+                    gl::RGBA8 as i32,
+                    width,
+                    height,
+                    0,
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    std::ptr::null(),
+                );
+                check_gl_error("background blur texture storage allocation")?;
+            }
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+        }
+
+        unsafe {
+            for (framebuffer, texture) in pending.framebuffers.into_iter().zip(pending.textures) {
+                gl::BindFramebuffer(gl::FRAMEBUFFER, framebuffer);
+                gl::FramebufferTexture2D(
+                    gl::FRAMEBUFFER,
+                    gl::COLOR_ATTACHMENT0,
+                    gl::TEXTURE_2D,
+                    texture,
+                    0,
+                );
+                check_gl_error("background blur framebuffer attachment")?;
+                if gl::CheckFramebufferStatus(gl::FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
+                    gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+                    return Err("background blur framebuffer is incomplete".into());
+                }
+            }
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        }
+
+        unsafe {
+            gl::GenVertexArrays(1, &mut pending.vao);
+            gl::GenBuffers(1, &mut pending.buffer);
+            check_gl_error("background blur vertex resource generation")?;
+        }
+        if pending.vao == 0 {
+            return Err("glGenVertexArrays returned a zero name".into());
+        }
+        if pending.buffer == 0 {
+            return Err("glGenBuffers returned a zero name".into());
+        }
+
+        let vertices: [f32; 6] = [-1.0, -1.0, 3.0, -1.0, -1.0, 3.0];
+        unsafe {
+            gl::BindVertexArray(pending.vao);
+            gl::BindBuffer(gl::ARRAY_BUFFER, pending.buffer);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                (vertices.len() * std::mem::size_of::<f32>()) as isize,
+                vertices.as_ptr().cast(),
+                gl::STATIC_DRAW,
+            );
+            gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 8, std::ptr::null());
+            gl::EnableVertexAttribArray(0);
+            gl::BindVertexArray(0);
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+            check_gl_error("background blur vertex buffer setup")?;
+        }
+
+        let resources = Self {
+            textures: pending.textures,
+            framebuffers: pending.framebuffers,
+            program: pending.program,
+            vao: pending.vao,
+            buffer: pending.buffer,
+            texture_size_uniform,
+            direction_uniform,
+            radius_uniform,
+            width,
+            height,
+        };
+        // Ownership of every raw GL name has transferred to `resources`,
+        // whose own `Drop` frees them exactly once; disarm the pending guard
+        // so it does not also delete them.
+        std::mem::forget(pending);
+        Ok(resources)
+    }
+
+    fn ensure_size(&mut self, width: i32, height: i32) -> Result<(), Box<dyn Error>> {
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
+        let replacement = Self::new(width, height)?;
+        let _ = std::mem::replace(self, replacement);
+        Ok(())
+    }
+
+    fn capture_and_blur(
+        &mut self,
+        region: BlurCaptureRegion,
+        radius: f32,
+    ) -> Result<u32, Box<dyn Error>> {
+        if region.root_width != self.width || region.root_height != self.height
+            || !radius.is_finite() || radius <= 0.0
+        {
+            return Err("background blur region does not match resources".into());
+        }
+        unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::ReadBuffer(gl::BACK);
+            gl::ActiveTexture(gl::TEXTURE0);
+            gl::BindTexture(gl::TEXTURE_2D, self.textures[0]);
+            gl::CopyTexSubImage2D(
+                gl::TEXTURE_2D,
+                0,
+                region.x,
+                region.framebuffer_y,
+                region.x,
+                region.framebuffer_y,
+                region.width,
+                region.height,
+            );
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+            gl::UseProgram(self.program);
+            gl::BindVertexArray(self.vao);
+            gl::Disable(gl::BLEND);
+            gl::Enable(gl::SCISSOR_TEST);
+            gl::Uniform2f(self.texture_size_uniform, self.width as f32, self.height as f32);
+            gl::Uniform1f(self.radius_uniform, radius / BLUR_TAP_RADIUS);
+            for (framebuffer, texture, direction) in [
+                (self.framebuffers[1], self.textures[0], [1.0_f32, 0.0_f32]),
+                (self.framebuffers[0], self.textures[1], [0.0_f32, 1.0_f32]),
+            ] {
+                gl::BindFramebuffer(gl::FRAMEBUFFER, framebuffer);
+                gl::Viewport(region.x, region.framebuffer_y, region.width, region.height);
+                gl::Scissor(region.x, region.framebuffer_y, region.width, region.height);
+                gl::Uniform2f(self.direction_uniform, direction[0], direction[1]);
+                gl::BindTexture(gl::TEXTURE_2D, texture);
+                gl::DrawArrays(gl::TRIANGLES, 0, 3);
+            }
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        }
+        Ok(self.textures[0])
+    }
+}
+
+impl Drop for BackgroundBlurResources {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteBuffers(1, &self.buffer);
+            gl::DeleteVertexArrays(1, &self.vao);
+            gl::DeleteFramebuffers(2, self.framebuffers.as_ptr());
+            gl::DeleteTextures(2, self.textures.as_ptr());
+            gl::DeleteProgram(self.program);
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct BlurGlState {
+    framebuffer: i32,
+    read_buffer: i32,
+    viewport: [i32; 4],
+    scissor: [i32; 4],
+    scissor_enabled: bool,
+    blend_enabled: bool,
+    active_texture: i32,
+    active_texture_binding: i32,
+    texture0_binding: i32,
+    vertex_array: i32,
+    array_buffer: i32,
+    program: i32,
+    blend_src_rgb: i32,
+    blend_dst_rgb: i32,
+    blend_src_alpha: i32,
+    blend_dst_alpha: i32,
+    blend_equation_rgb: i32,
+    blend_equation_alpha: i32,
+}
+
+#[allow(dead_code)]
+impl BlurGlState {
+    fn save() -> Self {
+        let mut viewport = [0; 4];
+        let mut scissor = [0; 4];
+        let mut framebuffer = 0;
+        let mut read_buffer = 0;
+        let mut active_texture = 0;
+        let mut active_texture_binding = 0;
+        let mut texture0_binding = 0;
+        let mut vertex_array = 0;
+        let mut array_buffer = 0;
+        let mut program = 0;
+        let mut blend_src_rgb = 0;
+        let mut blend_dst_rgb = 0;
+        let mut blend_src_alpha = 0;
+        let mut blend_dst_alpha = 0;
+        let mut blend_equation_rgb = 0;
+        let mut blend_equation_alpha = 0;
+        unsafe {
+            gl::GetIntegerv(gl::VIEWPORT, viewport.as_mut_ptr());
+            gl::GetIntegerv(gl::SCISSOR_BOX, scissor.as_mut_ptr());
+            gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut framebuffer);
+            gl::GetIntegerv(gl::READ_BUFFER, &mut read_buffer);
+            gl::GetIntegerv(gl::ACTIVE_TEXTURE, &mut active_texture);
+            gl::GetIntegerv(gl::TEXTURE_BINDING_2D, &mut active_texture_binding);
+            gl::ActiveTexture(gl::TEXTURE0);
+            gl::GetIntegerv(gl::TEXTURE_BINDING_2D, &mut texture0_binding);
+            gl::ActiveTexture(active_texture as u32);
+            gl::GetIntegerv(gl::VERTEX_ARRAY_BINDING, &mut vertex_array);
+            gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut array_buffer);
+            gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
+            gl::GetIntegerv(gl::BLEND_SRC_RGB, &mut blend_src_rgb);
+            gl::GetIntegerv(gl::BLEND_DST_RGB, &mut blend_dst_rgb);
+            gl::GetIntegerv(gl::BLEND_SRC_ALPHA, &mut blend_src_alpha);
+            gl::GetIntegerv(gl::BLEND_DST_ALPHA, &mut blend_dst_alpha);
+            gl::GetIntegerv(gl::BLEND_EQUATION_RGB, &mut blend_equation_rgb);
+            gl::GetIntegerv(gl::BLEND_EQUATION_ALPHA, &mut blend_equation_alpha);
+        }
+        Self {
+            framebuffer,
+            read_buffer,
+            viewport,
+            scissor,
+            scissor_enabled: unsafe { gl::IsEnabled(gl::SCISSOR_TEST) == gl::TRUE },
+            blend_enabled: unsafe { gl::IsEnabled(gl::BLEND) == gl::TRUE },
+            active_texture,
+            active_texture_binding,
+            texture0_binding,
+            vertex_array,
+            array_buffer,
+            program,
+            blend_src_rgb, blend_dst_rgb, blend_src_alpha, blend_dst_alpha,
+            blend_equation_rgb, blend_equation_alpha,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl Drop for BlurGlState {
+    fn drop(&mut self) {
+        unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, self.framebuffer as u32);
+            gl::ReadBuffer(self.read_buffer as u32);
+            gl::Viewport(self.viewport[0], self.viewport[1], self.viewport[2], self.viewport[3]);
+            gl::Scissor(self.scissor[0], self.scissor[1], self.scissor[2], self.scissor[3]);
+            if self.scissor_enabled { gl::Enable(gl::SCISSOR_TEST); } else { gl::Disable(gl::SCISSOR_TEST); }
+            if self.blend_enabled { gl::Enable(gl::BLEND); } else { gl::Disable(gl::BLEND); }
+            gl::BlendFuncSeparate(
+                self.blend_src_rgb as u32, self.blend_dst_rgb as u32,
+                self.blend_src_alpha as u32, self.blend_dst_alpha as u32,
+            );
+            gl::BlendEquationSeparate(
+                self.blend_equation_rgb as u32, self.blend_equation_alpha as u32,
+            );
+            gl::BindVertexArray(self.vertex_array as u32);
+            gl::BindBuffer(gl::ARRAY_BUFFER, self.array_buffer as u32);
+            gl::ActiveTexture(gl::TEXTURE0);
+            gl::BindTexture(gl::TEXTURE_2D, self.texture0_binding as u32);
+            gl::ActiveTexture(self.active_texture as u32);
+            gl::BindTexture(gl::TEXTURE_2D, self.active_texture_binding as u32);
+            gl::UseProgram(self.program as u32);
+        }
     }
 }
 
@@ -393,7 +904,120 @@ impl SceneRenderer {
             shadow_extent_uniform, shadow_strength_uniform,
             shadow_color_uniform,
             surface_opacity_uniform,
+            background_blur: None,
+            backdrop_program: None,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn capture_and_blur_background(
+        &mut self,
+        owner_x: i32,
+        owner_y: i32,
+        owner_width: i32,
+        owner_height: i32,
+        radius: f32,
+        root_width: i32,
+        root_height: i32,
+    ) -> Result<u32, Box<dyn Error>> {
+        let region = BlurCaptureRegion::new(
+            owner_x, owner_y, owner_width, owner_height, radius, root_width, root_height,
+        ).ok_or("invalid background blur capture region")?;
+        // Snapshot GL state before any lazy resource allocation touches
+        // bindings, so entry/exit state is preserved even on the first-ever
+        // call, when the resource constructor still has to run.
+        let state = BlurGlState::save();
+        let result = (|| {
+            if self.background_blur.is_none() {
+                self.background_blur = Some(BackgroundBlurResources::new(root_width, root_height)?);
+            }
+            let resources = self.background_blur.as_mut().expect("blur resources exist");
+            resources.ensure_size(root_width, root_height)?;
+            resources.capture_and_blur(region, radius)
+        })();
+        drop(state);
+        result
+    }
+
+    /// Composite an already-blurred root-sized texture through the supplied
+    /// owner mask. This is deliberately a graphics-only primitive: it does
+    /// not capture, consult policy, or draw the owner's client texture.
+    #[allow(dead_code)]
+    pub(crate) fn draw_blurred_backdrop(
+        &mut self,
+        blurred_texture: u32,
+        params: BackdropParams,
+        corner_radius: f32,
+    ) -> Result<(), Box<dyn Error>> {
+        if !corner_radius.is_finite() || corner_radius < 0.0 {
+            return Err("invalid backdrop corner radius".into());
+        }
+        let left = i64::from(params.draw_x).max(0).min(i64::from(params.root_width));
+        let top = i64::from(params.draw_y).max(0).min(i64::from(params.root_height));
+        let right = (i64::from(params.draw_x) + i64::from(params.draw_width))
+            .max(0).min(i64::from(params.root_width));
+        let bottom = (i64::from(params.draw_y) + i64::from(params.draw_height))
+            .max(0).min(i64::from(params.root_height));
+        if right <= left || bottom <= top {
+            return Ok(());
+        }
+        let visible_width = right - left;
+        let visible_height = bottom - top;
+        let ndc_left = left as f32 / params.root_width as f32 * 2.0 - 1.0;
+        let ndc_right = right as f32 / params.root_width as f32 * 2.0 - 1.0;
+        let ndc_top = 1.0 - top as f32 / params.root_height as f32 * 2.0;
+        let ndc_bottom = 1.0 - bottom as f32 / params.root_height as f32 * 2.0;
+        let local_left = (left - i64::from(params.owner_x)) as f32;
+        let local_top = (top - i64::from(params.owner_y)) as f32;
+        let local_right = local_left + visible_width as f32;
+        let local_bottom = local_top + visible_height as f32;
+        let u0 = root_to_texture_u(left as f32, params.root_width);
+        let u1 = root_to_texture_u(right as f32, params.root_width);
+        let v0 = root_to_texture_v(top as f32, params.root_height);
+        let v1 = root_to_texture_v(bottom as f32, params.root_height);
+        let vertices: [f32; 36] = [
+            ndc_left, ndc_bottom, u0, v1, local_left, local_bottom,
+            ndc_right, ndc_bottom, u1, v1, local_right, local_bottom,
+            ndc_right, ndc_top, u1, v0, local_right, local_top,
+            ndc_left, ndc_bottom, u0, v1, local_left, local_bottom,
+            ndc_right, ndc_top, u1, v0, local_right, local_top,
+            ndc_left, ndc_top, u0, v0, local_left, local_top,
+        ];
+
+        let state = BlurGlState::save();
+        let result = (|| {
+            if self.backdrop_program.is_none() {
+                self.backdrop_program = Some(BackdropProgram::new()?);
+            }
+            let backdrop = self.backdrop_program.as_ref().expect("backdrop program exists");
+            unsafe {
+                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+                gl::UseProgram(backdrop.program);
+                gl::ActiveTexture(gl::TEXTURE0);
+                gl::BindTexture(gl::TEXTURE_2D, blurred_texture);
+                gl::BindVertexArray(self.vao);
+                gl::BindBuffer(gl::ARRAY_BUFFER, self.buffer);
+                gl::BufferData(
+                    gl::ARRAY_BUFFER,
+                    (vertices.len() * std::mem::size_of::<f32>()) as isize,
+                    vertices.as_ptr().cast(),
+                    gl::STREAM_DRAW,
+                );
+                gl::Uniform1i(backdrop.texture_uniform, 0);
+                gl::Uniform2f(backdrop.surface_size_uniform, params.owner_width as f32, params.owner_height as f32);
+                gl::Uniform1f(backdrop.corner_radius_uniform, corner_radius);
+                gl::Enable(gl::BLEND);
+                gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
+                gl::BlendEquation(gl::FUNC_ADD);
+                gl::Disable(gl::SCISSOR_TEST);
+                check_gl_error("before backdrop draw")?;
+                gl::DrawArrays(gl::TRIANGLES, 0, 6);
+                check_gl_error("backdrop draw")?;
+            }
+            Ok(())
+        })();
+        drop(state);
+        result
     }
 
     pub fn clear(&self) {
@@ -601,13 +1225,52 @@ fn check_gl_error(operation: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn compile_shader(source: &str, kind: u32) -> Result<u32, Box<dyn Error>> {
-    let shader = unsafe { gl::CreateShader(kind) };
     let source = std::ffi::CString::new(source)?;
+    let shader = unsafe { gl::CreateShader(kind) };
+    if shader == 0 {
+        return Err("glCreateShader returned a zero shader name".into());
+    }
     unsafe { gl::ShaderSource(shader, 1, &source.as_ptr(), std::ptr::null()); gl::CompileShader(shader); }
     let mut status = 0;
     unsafe { gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut status); }
-    if status == 0 { return Err(shader_log(shader).into()); }
+    if status == 0 {
+        let log = shader_log(shader);
+        unsafe { gl::DeleteShader(shader); }
+        return Err(log.into());
+    }
     Ok(shader)
+}
+
+#[allow(dead_code)]
+fn create_program(vertex_source: &str, fragment_source: &str) -> Result<u32, Box<dyn Error>> {
+    let vertex = compile_shader(vertex_source, gl::VERTEX_SHADER)?;
+    let fragment = match compile_shader(fragment_source, gl::FRAGMENT_SHADER) {
+        Ok(fragment) => fragment,
+        Err(error) => {
+            unsafe { gl::DeleteShader(vertex); }
+            return Err(error);
+        }
+    };
+    let program = unsafe { gl::CreateProgram() };
+    if program == 0 {
+        unsafe {
+            gl::DeleteShader(vertex);
+            gl::DeleteShader(fragment);
+        }
+        return Err("glCreateProgram returned a zero program name".into());
+    }
+    unsafe {
+        gl::AttachShader(program, vertex);
+        gl::AttachShader(program, fragment);
+        gl::LinkProgram(program);
+        gl::DeleteShader(vertex);
+        gl::DeleteShader(fragment);
+    }
+    if let Err(error) = check_program(program) {
+        unsafe { gl::DeleteProgram(program); }
+        return Err(error);
+    }
+    Ok(program)
 }
 
 fn check_program(program: u32) -> Result<(), Box<dyn Error>> {
@@ -624,7 +1287,9 @@ fn program_log(program: u32) -> String { let mut length = 0; unsafe { gl::GetPro
 mod tests {
     use super::{
         apply_surface_opacity, blend_state_for, blend_state_for_surface,
-        build_shadow_quad_plan, BlendState, ShadowParams, SurfaceOpacity,
+        backdrop_replacement, build_shadow_quad_plan, root_to_texture_u, root_to_texture_v,
+        BackdropParams, BlurCaptureRegion, BlendState, ShadowParams, SurfaceOpacity,
+        BACKDROP_FRAGMENT_SHADER, BLUR_FRAGMENT_SHADER, BLUR_TAP_RADIUS, BLUR_VERTEX_SHADER,
     };
     use crate::x11::scene::EglPixelSemantics;
 
@@ -892,9 +1557,229 @@ mod tests {
         let color = super::normalized_shadow_color([0x4c, 0x78, 0x99]);
         assert_eq!(color, [0x4c as f32 / 255.0, 0x78 as f32 / 255.0, 0x99 as f32 / 255.0]);
     }
+
+    #[test]
+    fn blur_capture_region_expands_by_effective_kernel_reach() {
+        let region = BlurCaptureRegion::new(100, 80, 200, 100, 8.0, 1000, 800).unwrap();
+        assert_eq!((region.x, region.y, region.width, region.height), (92, 72, 216, 116));
+        assert_eq!(region.framebuffer_y, 612);
+    }
+
+    #[test]
+    fn backdrop_root_x_maps_to_root_relative_u() {
+        assert_eq!(root_to_texture_u(0.0, 100), 0.0);
+        assert_eq!(root_to_texture_u(25.0, 100), 0.25);
+        assert_eq!(root_to_texture_u(100.0, 100), 1.0);
+    }
+
+    #[test]
+    fn backdrop_root_top_and_bottom_map_to_gl_v() {
+        assert_eq!(root_to_texture_v(0.0, 100), 1.0);
+        assert_eq!(root_to_texture_v(100.0, 100), 0.0);
+    }
+
+    #[test]
+    fn backdrop_edge_mapping_and_negative_owner_are_clipped_in_root_space() {
+        let params = BackdropParams::new(-5, -2, 10, 10, 100, 80).unwrap();
+        assert_eq!(root_to_texture_u(0.0, params.root_width), 0.0);
+        assert_eq!(root_to_texture_v(0.0, params.root_height), 1.0);
+        assert_eq!(root_to_texture_u(5.0, params.root_width), 0.05);
+        assert_eq!(root_to_texture_v(8.0, params.root_height), 0.9);
+    }
+
+    #[test]
+    fn backdrop_replacement_outputs_premultiplied_coverage() {
+        assert_eq!(backdrop_replacement([0.8, 0.4, 0.2], 0.0), [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(backdrop_replacement([0.8, 0.4, 0.2], 0.25), [0.2, 0.1, 0.05, 0.25]);
+        assert_eq!(backdrop_replacement([0.8, 0.4, 0.2], 0.5), [0.4, 0.2, 0.1, 0.5]);
+        assert_eq!(backdrop_replacement([0.8, 0.4, 0.2], 1.0), [0.8, 0.4, 0.2, 1.0]);
+    }
+
+    #[test]
+    fn backdrop_shader_contract_uses_runtime_rounded_mask_and_replacement_output() {
+        assert!(BACKDROP_FRAGMENT_SHADER.contains("uniform float corner_radius"));
+        assert!(BACKDROP_FRAGMENT_SHADER.contains("rounded_distance(local_position,surface_size,radius)"));
+        assert!(BACKDROP_FRAGMENT_SHADER.contains("vec4(blurred*c,c)"));
+        assert!(!BACKDROP_FRAGMENT_SHADER.contains("surface_opacity"));
+        assert!(!BACKDROP_FRAGMENT_SHADER.contains("texture(blurred_root,texcoord).a"));
+    }
+
+    #[test]
+    fn backdrop_is_a_lazy_inert_graphics_primitive() {
+        let source = include_str!("renderer.rs");
+        assert!(source.contains("backdrop_program: Option<BackdropProgram>"));
+        assert!(source.contains("if self.backdrop_program.is_none()"));
+        let start = source.find("pub(crate) fn draw_blurred_backdrop(").unwrap();
+        let end = start + source[start..].find("\n    pub fn clear").unwrap();
+        let body = &source[start..end];
+        assert!(!body.contains("capture_and_blur_background("));
+        assert!(source.contains("gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA)"));
+        assert!(source.contains("gl::BlendEquation(gl::FUNC_ADD)"));
+        assert!(source.contains("gl::Disable(gl::SCISSOR_TEST)"));
+        assert!(source.contains("textures: [u32; 2]"));
+        assert!(source.contains("framebuffers: [u32; 2]"));
+    }
+
+    #[test]
+    fn blur_capture_region_clips_at_each_root_edge() {
+        let cases = [
+            (0, 0, 0, 0, 20, 20),
+            (90, 0, 80, 0, 20, 20),
+            (0, 90, 0, 80, 20, 20),
+            (90, 90, 80, 80, 20, 20),
+        ];
+        for (x, y, expected_x, expected_y, expected_width, expected_height) in cases {
+            let region = BlurCaptureRegion::new(x, y, 10, 10, 10.0, 100, 100).unwrap();
+            assert_eq!((region.x, region.y), (expected_x, expected_y));
+            assert_eq!((region.width, region.height), (expected_width, expected_height));
+        }
+    }
+
+    #[test]
+    fn blur_capture_region_rejects_invalid_dimensions_and_radius() {
+        assert!(BlurCaptureRegion::new(0, 0, 0, 10, 4.0, 100, 100).is_none());
+        assert!(BlurCaptureRegion::new(0, 0, 10, 10, 0.0, 100, 100).is_none());
+        assert!(BlurCaptureRegion::new(0, 0, 10, 10, f32::NAN, 100, 100).is_none());
+        assert!(BlurCaptureRegion::new(0, 0, 10, 10, 4.0, 0, 100).is_none());
+    }
+
+    #[test]
+    fn blur_region_uses_root_to_framebuffer_y_conversion() {
+        let region = BlurCaptureRegion::new(20, 30, 40, 50, 4.0, 200, 300).unwrap();
+        assert_eq!((region.y, region.height, region.framebuffer_y), (26, 58, 216));
+        assert_eq!(region.root_height - (region.y + region.height), region.framebuffer_y);
+    }
+
+    #[test]
+    fn blur_shader_contract_is_two_pass_fixed_tap_ping_pong() {
+        assert_eq!(BLUR_TAP_RADIUS, 4.0);
+        assert!(BLUR_VERTEX_SHADER.contains("gl_Position"));
+        assert!(BLUR_FRAGMENT_SHADER.contains("texture(source,texcoord)"));
+        assert!(BLUR_FRAGMENT_SHADER.contains("direction"));
+        assert!(BLUR_FRAGMENT_SHADER.contains("0.22702703"));
+        assert!(BLUR_FRAGMENT_SHADER.contains("0.01621622"));
+    }
+
+    #[test]
+    fn blur_resource_contract_has_two_textures_and_two_framebuffers() {
+        assert_eq!(std::mem::size_of::<[u32; 2]>(), 2 * std::mem::size_of::<u32>());
+        let source = include_str!("renderer.rs");
+        assert!(source.contains("textures: [u32; 2]"));
+        assert!(source.contains("framebuffers: [u32; 2]"));
+        assert!(source.contains("gl::GenTextures(2"));
+        assert!(source.contains("gl::GenFramebuffers(2"));
+        assert!(source.contains("gl::BindFramebuffer(gl::FRAMEBUFFER, 0)"));
+    }
+
+    // The following tests exercise Phase 1 V2's transactional-cleanup and
+    // state-ordering contract via static source inspection. A live GL
+    // context is not available under `cargo test`, so failure-injection
+    // (e.g. a forced glTexImage2D allocation error) cannot be exercised
+    // directly; these assert the required code shape instead, matching the
+    // existing project convention for GL-adjacent contract tests.
+
+    #[test]
+    fn blur_shader_creation_deletes_shader_on_compile_failure() {
+        let source = include_str!("renderer.rs");
+        let start = source.find("fn compile_shader(").expect("compile_shader exists");
+        let end = start + source[start..].find("\n}\n").expect("compile_shader body ends");
+        let body = &source[start..end];
+        assert!(body.contains("if status == 0"));
+        assert!(body.contains("gl::DeleteShader(shader)"));
+        // The shader must be created before the compile-status check so the
+        // delete-on-failure branch has something to delete.
+        assert!(body.find("gl::CreateShader").unwrap() < body.find("status == 0").unwrap());
+    }
+
+    #[test]
+    fn blur_program_creation_deletes_vertex_shader_on_fragment_failure() {
+        let source = include_str!("renderer.rs");
+        let start = source.find("fn create_program(").expect("create_program exists");
+        let end = start + source[start..].find("\n}\n").expect("create_program body ends");
+        let body = &source[start..end];
+        // Fragment compile failure must delete the already-created vertex shader.
+        let fragment_match = body.find("compile_shader(fragment_source").expect("compiles fragment");
+        let vertex_delete = body.find("gl::DeleteShader(vertex);").expect("deletes vertex on failure");
+        assert!(fragment_match < vertex_delete);
+        // glCreateProgram's return value must be checked for zero before use.
+        assert!(body.contains("program == 0"));
+    }
+
+    #[test]
+    fn blur_resource_construction_uses_transactional_pending_guard() {
+        let source = include_str!("renderer.rs");
+        assert!(source.contains("struct PendingBlurResources"));
+        let drop_start = source
+            .find("impl Drop for PendingBlurResources")
+            .expect("PendingBlurResources has a Drop impl");
+        let drop_end = drop_start + source[drop_start..].find("\n}\n").expect("Drop body ends");
+        let drop_body = &source[drop_start..drop_end];
+        assert!(drop_body.contains("gl::DeleteBuffers"));
+        assert!(drop_body.contains("gl::DeleteVertexArrays"));
+        assert!(drop_body.contains("gl::DeleteFramebuffers(2"));
+        assert!(drop_body.contains("gl::DeleteTextures(2"));
+        assert!(drop_body.contains("gl::DeleteProgram"));
+
+        let new_start = source.find("fn new(width: i32, height: i32) -> Result<Self, Box<dyn Error>> {")
+            .expect("BackgroundBlurResources::new exists");
+        let new_end = new_start + source[new_start..].find("\n    fn ensure_size")
+            .expect("new() body ends before ensure_size");
+        let new_body = &source[new_start..new_end];
+        assert!(new_body.contains("let mut pending = PendingBlurResources"));
+        // Ownership only transfers to the committed resource struct once
+        // every fallible step above has already returned `Ok`.
+        let forget_index = new_body.find("std::mem::forget(pending)").expect("disarms the pending guard");
+        let ok_resources_index = new_body.find("Ok(resources)").expect("returns the committed resources");
+        assert!(forget_index < ok_resources_index);
+    }
+
+    #[test]
+    fn blur_resource_construction_checks_gl_errors_and_zero_names() {
+        let source = include_str!("renderer.rs");
+        let new_start = source.find("fn new(width: i32, height: i32) -> Result<Self, Box<dyn Error>> {")
+            .expect("BackgroundBlurResources::new exists");
+        let new_end = new_start + source[new_start..].find("\n    fn ensure_size")
+            .expect("new() body ends before ensure_size");
+        let new_body = &source[new_start..new_end];
+        assert!(new_body.matches("check_gl_error(").count() >= 5);
+        assert!(new_body.contains("texture == 0"));
+        assert!(new_body.contains("framebuffer == 0"));
+        assert!(new_body.contains("pending.vao == 0"));
+        assert!(new_body.contains("pending.buffer == 0"));
+    }
+
+    #[test]
+    fn blur_public_entry_snapshots_state_before_lazy_allocation() {
+        let source = include_str!("renderer.rs");
+        let start = source.find("pub(crate) fn capture_and_blur_background(")
+            .expect("capture_and_blur_background exists");
+        let end = start + source[start..].find("\n    }\n").expect("function body ends");
+        let body = &source[start..end];
+        let save_index = body.find("BlurGlState::save()").expect("saves GL state");
+        let alloc_index = body.find("BackgroundBlurResources::new").expect("lazily allocates resources");
+        assert!(save_index < alloc_index);
+    }
+
+    #[test]
+    fn blur_capture_and_blur_no_longer_saves_state_internally() {
+        // State save/restore is centralized at the public entry point so the
+        // very first (lazy-allocating) call is covered; the inner primitive
+        // must not duplicate it.
+        let source = include_str!("renderer.rs");
+        let start = source.find("fn capture_and_blur(\n").expect("capture_and_blur exists");
+        let end = start + source[start..].find("\n    }\n}\n").expect("capture_and_blur body ends");
+        let body = &source[start..end];
+        assert!(!body.contains("BlurGlState::save()"));
+    }
 }
 
 const VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nout vec2 texcoord;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; }";
 const FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nout vec4 color;\nuniform sampler2D captured;\nvoid main(){ color=texture(captured,texcoord); }";
 const SCENE_VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nlayout(location=2) in vec2 local_position_in;\nout vec2 texcoord;\nout vec2 local_position;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; local_position=local_position_in; }";
 const SCENE_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D captured;\nuniform int shadow_mode;\nuniform float shadow_extent;\nuniform float shadow_strength;\nuniform vec3 shadow_color;\nuniform float surface_opacity;\nuniform float corner_radius;\nuniform vec2 surface_size;\nuniform float border_width;\nuniform vec4 border_color;\nfloat rounded_distance(vec2 point, vec2 size, float radius){ vec2 q=abs(point-size*0.5)-(size*0.5-vec2(radius)); return length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; }\nfloat coverage(float distance){ float aa=max(fwidth(distance),0.0001); return 1.0-smoothstep(-aa,aa,distance); }\nvoid main(){ float outer_radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); if(shadow_mode!=0){ vec2 shadow_point=local_position-vec2(shadow_extent); float shadow_distance=rounded_distance(shadow_point,surface_size,outer_radius); float edge=coverage(-shadow_distance); float falloff=1.0-smoothstep(0.0,max(shadow_extent,0.0001),max(shadow_distance,0.0)); float alpha=shadow_strength*edge*falloff; color=vec4(shadow_color*alpha,alpha); return; } vec4 sampled=texture(captured,texcoord); if(border_width<=0.0){ if(corner_radius<=0.0){ color=sampled*surface_opacity; return; } color=sampled*coverage(rounded_distance(local_position,surface_size,outer_radius))*surface_opacity; return; } float width=min(border_width,min(surface_size.x,surface_size.y)*0.5); float outer=coverage(rounded_distance(local_position,surface_size,outer_radius)); vec2 inner_size=max(surface_size-vec2(2.0*width),vec2(0.0)); float inner_radius=max(outer_radius-width,0.0); float inner=inner_size.x>0.0 && inner_size.y>0.0 ? coverage(rounded_distance(local_position-vec2(width),inner_size,inner_radius)) : 0.0; float border=clamp(outer-inner,0.0,1.0); vec4 premultiplied_border=vec4(border_color.rgb*border_color.a,border_color.a)*border; color=sampled*inner*surface_opacity+premultiplied_border; }";
+#[allow(dead_code)]
+const BLUR_VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); }";
+#[allow(dead_code)]
+const BLUR_FRAGMENT_SHADER: &str = "#version 330 core\nout vec4 color;\nuniform sampler2D source;\nuniform vec2 texture_size;\nuniform vec2 direction;\nuniform float radius;\nvoid main(){ vec2 texcoord=gl_FragCoord.xy/texture_size; vec2 step_uv=direction*radius/texture_size; vec4 result=texture(source,texcoord)*0.22702703; result+=(texture(source,texcoord+step_uv)+texture(source,texcoord-step_uv))*0.19459459; result+=(texture(source,texcoord+2.0*step_uv)+texture(source,texcoord-2.0*step_uv))*0.12162162; result+=(texture(source,texcoord+3.0*step_uv)+texture(source,texcoord-3.0*step_uv))*0.05405405; result+=(texture(source,texcoord+4.0*step_uv)+texture(source,texcoord-4.0*step_uv))*0.01621622; color=result; }";
+const BACKDROP_VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nlayout(location=2) in vec2 local_position_in;\nout vec2 texcoord;\nout vec2 local_position;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; local_position=local_position_in; }";
+const BACKDROP_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D blurred_root;\nuniform vec2 surface_size;\nuniform float corner_radius;\nfloat rounded_distance(vec2 point, vec2 size, float radius){ vec2 q=abs(point-size*0.5)-(size*0.5-vec2(radius)); return length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; }\nfloat coverage(float distance){ float aa=max(fwidth(distance),0.0001); return 1.0-smoothstep(-aa,aa,distance); }\nvoid main(){ float radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); float c=coverage(rounded_distance(local_position,surface_size,radius)); vec3 blurred=texture(blurred_root,texcoord).rgb; color=vec4(blurred*c,c); }";
