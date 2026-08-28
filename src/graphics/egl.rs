@@ -813,6 +813,27 @@ impl EglSceneRenderer {
         Ok(())
     }
 
+    pub fn render_surface_with_opacity(
+        &self,
+        texture: u32,
+        plan: crate::x11::scene::RenderQuadPlan,
+        pixel_semantics: crate::x11::scene::EglPixelSemantics,
+        opacity: renderer::SurfaceOpacity,
+    ) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer
+            .as_ref()
+            .ok_or("EGL scene renderer is unavailable")?
+            .render_surface_with_opacity(
+                texture,
+                plan,
+                pixel_semantics,
+                self.width as i32,
+                self.height as i32,
+                opacity,
+            )?;
+        Ok(())
+    }
+
     pub fn render_shadow(
         &self,
         params: crate::graphics::renderer::ShadowParams,

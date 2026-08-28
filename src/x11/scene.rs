@@ -95,6 +95,7 @@ struct SurfaceEntry {
     fullscreen: bool,
     shadow_eligible: bool,
     resolved_border_color: [u32; 4],
+    resolved_opacity_bits: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,6 +535,7 @@ fn eligible_surface(
         fullscreen: false,
         shadow_eligible: false,
         resolved_border_color: [0.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits()],
+        resolved_opacity_bits: 1.0f32.to_bits(),
     })
 }
 
@@ -604,6 +606,38 @@ fn resolve_snapshot_fullscreen(
             .and_then(|client| urgency.get(&client))
             .is_some_and(|state| state.fullscreen);
         entry.shadow_eligible = shadow_eligible_for_entry(style, entry);
+    }
+}
+
+fn resolved_surface_opacity(
+    visuals: &crate::config::VisualConfig,
+    entry: &SurfaceEntry,
+    active_window: Option<Window>,
+    urgency: &HashMap<Window, CachedClientVisualState>,
+) -> f32 {
+    if entry.fullscreen
+        || entry.semantic_client_xid.is_none()
+        || !matches!(entry.visual_class, SurfaceVisualClass::Normal)
+    {
+        return 1.0;
+    }
+    match border_visual_state(entry, active_window, urgency) {
+        BorderVisualState::Urgent => visuals.opacity.urgent,
+        BorderVisualState::Focused => visuals.opacity.focused,
+        BorderVisualState::Inactive => visuals.opacity.inactive,
+    }
+}
+
+fn resolve_snapshot_opacity(
+    snapshot: &mut SceneSnapshot,
+    visuals: &crate::config::VisualConfig,
+    active_window: Option<Window>,
+    urgency: &HashMap<Window, CachedClientVisualState>,
+) {
+    for entry in &mut snapshot.entries {
+        entry.resolved_opacity_bits = resolved_surface_opacity(
+            visuals, entry, active_window, urgency,
+        ).to_bits();
     }
 }
 
@@ -1710,6 +1744,7 @@ impl<'a> SceneSession<'a> {
         self.initialize_visual_state(&snapshot)?;
         resolve_snapshot_border_colors(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
         resolve_snapshot_fullscreen(&mut snapshot, &self.urgency, self.shadow_style);
+        resolve_snapshot_opacity(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
         self.state = SceneState::SceneSnapshotReady;
         let mut pixmaps = Vec::new();
         let mut damage_leases = Vec::new();
@@ -2296,7 +2331,7 @@ impl<'a> SceneSession<'a> {
                 entry.semantic_client_xid == previous || entry.semantic_client_xid == active_window
             });
             self.active_window = active_window;
-            let changed = affected && self.refresh_resolved_border_colors(&[previous, active_window]);
+            let changed = affected && self.refresh_resolved_visual_state(&[previous, active_window]);
             return Ok(changed.then_some(SceneInvalidation::VisualState));
         }
         let Some(entry) = entries.iter().find(|entry| entry.semantic_client_xid == Some(property.window)) else {
@@ -2343,11 +2378,11 @@ impl<'a> SceneSession<'a> {
                 entry.shadow_eligible = shadow_eligible_for_entry(shadow_style, entry);
             }
         }
-        let before = entry.resolved_border_color;
-        let changed = self.refresh_resolved_border_colors(&[Some(property.window)]);
+        let before = (entry.resolved_border_color, entry.resolved_opacity_bits);
+        let changed = self.refresh_resolved_visual_state(&[Some(property.window)]);
         let after = self.current_snapshot().entries.iter()
             .find(|candidate| candidate.semantic_client_xid == Some(property.window))
-            .map_or(before, |candidate| candidate.resolved_border_color);
+            .map_or(before, |candidate| (candidate.resolved_border_color, candidate.resolved_opacity_bits));
         if (changed && before != after) || fullscreen_changed {
             Ok(Some(SceneInvalidation::VisualState))
         } else {
@@ -2355,7 +2390,7 @@ impl<'a> SceneSession<'a> {
         }
     }
 
-    fn refresh_resolved_border_colors(&mut self, clients: &[Option<Window>]) -> bool {
+    fn refresh_resolved_visual_state(&mut self, clients: &[Option<Window>]) -> bool {
         let active_window = self.active_window;
         let visuals = &self._config.visuals;
         let urgency = &self.urgency;
@@ -2369,6 +2404,9 @@ impl<'a> SceneSession<'a> {
             let color = color.map(f32::to_bits);
             changed |= entry.resolved_border_color != color;
             entry.resolved_border_color = color;
+            let opacity = resolved_surface_opacity(visuals, entry, active_window, urgency).to_bits();
+            changed |= entry.resolved_opacity_bits != opacity;
+            entry.resolved_opacity_bits = opacity;
         }
         changed
     }
@@ -2445,10 +2483,14 @@ impl<'a> SceneSession<'a> {
                     egl.render_shadow(shadow)?;
                 }
             }
-            egl.render_surface(
+            let opacity = crate::graphics::renderer::SurfaceOpacity::new(
+                f32::from_bits(entry.resolved_opacity_bits),
+            ).expect("resolved surface opacity must be valid");
+            egl.render_surface_with_opacity(
                 surface.texture,
                 plan,
                 surface.pixel_semantics,
+                opacity,
             )?;
         }
         Ok(())
@@ -3326,7 +3368,8 @@ mod tests {
         structural_generation_state, StructuralGenerationState,
         FrameScheduler, FrameSchedulerState,
         classify_retired_damage_destroy, DamageDestroyClassification, DamageReleaseOutcome,
-        DamageState, shadow_eligible_for_entry, shadow_params_from_plan, read_net_wm_state, VisualAtoms,
+        DamageState, shadow_eligible_for_entry, shadow_params_from_plan, resolved_surface_opacity,
+        read_net_wm_state, VisualAtoms,
         NamedSurfacePixmapAcquireError, RawPixmapOwnership, named_pixmap_dimensions_match,
         validate_named_pixmap_dimensions, translate_named_pixmap_acquire_error,
     };
@@ -4830,6 +4873,42 @@ mod tests {
         let mut fullscreen = normal;
         fullscreen.fullscreen = true;
         assert!(!shadow_eligible_for_entry(style, &fullscreen));
+    }
+
+    #[test]
+    fn resolved_opacity_reuses_urgent_focused_inactive_precedence() {
+        let config = crate::config::CompositorConfig::defaults()
+            .with_opacity(0.80, 0.92, 0.70)
+            .unwrap();
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState::default());
+        assert_eq!(resolved_surface_opacity(&config.visuals, &entry, Some(30), &urgency), 0.92);
+        assert_eq!(resolved_surface_opacity(&config.visuals, &entry, Some(20), &urgency), 0.80);
+        urgency.insert(20, CachedClientVisualState { wm_hints: false, demands_attention: true, fullscreen: false });
+        assert_eq!(resolved_surface_opacity(&config.visuals, &entry, Some(20), &urgency), 0.70);
+    }
+
+    #[test]
+    fn resolved_opacity_forces_fullscreen_and_special_surfaces_to_one() {
+        let config = crate::config::CompositorConfig::defaults()
+            .with_opacity(0.80, 0.92, 0.70)
+            .unwrap();
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState::default());
+        let mut fullscreen = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        fullscreen.fullscreen = true;
+        assert_eq!(resolved_surface_opacity(&config.visuals, &fullscreen, Some(20), &urgency), 1.0);
+        for visual_class in [SurfaceVisualClass::Dock, SurfaceVisualClass::Desktop] {
+            let mut special = fullscreen.clone();
+            special.fullscreen = false;
+            special.visual_class = visual_class;
+            assert_eq!(resolved_surface_opacity(&config.visuals, &special, Some(20), &urgency), 1.0);
+        }
+        let mut popup = fullscreen;
+        popup.fullscreen = false;
+        popup.semantic_client_xid = None;
+        assert_eq!(resolved_surface_opacity(&config.visuals, &popup, Some(20), &urgency), 1.0);
     }
 
     #[test]

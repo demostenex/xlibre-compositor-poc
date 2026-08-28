@@ -2,6 +2,7 @@ use std::ffi::CStr;
 use std::error::Error;
 use std::ffi::c_void;
 
+
 pub struct CaptureRenderer { program: u32, vao: u32, texture: u32 }
 
 pub struct SceneRenderer {
@@ -16,6 +17,7 @@ pub struct SceneRenderer {
     shadow_extent_uniform: i32,
     shadow_strength_uniform: i32,
     shadow_color_uniform: i32,
+    surface_opacity_uniform: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -146,6 +148,52 @@ fn build_shadow_quad_plan(
 pub(crate) enum BlendState {
     Disabled,
     PremultipliedAlpha,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SurfaceOpacity(f32);
+
+impl SurfaceOpacity {
+    pub(crate) fn new(value: f32) -> Option<Self> {
+        (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(Self(value))
+    }
+
+    fn value(self) -> f32 {
+        self.0
+    }
+}
+
+#[cfg(test)]
+fn apply_surface_opacity(
+    sampled: [f32; 4],
+    rounded_coverage: f32,
+    opacity: SurfaceOpacity,
+) -> [f32; 4] {
+    let factor = rounded_coverage * opacity.value();
+    sampled.map(|component| component * factor)
+}
+
+#[cfg(test)]
+fn compose_surface_fragment(
+    sampled: [f32; 4],
+    coverage: f32,
+    inner: Option<f32>,
+    border: [f32; 4],
+    border_coverage: f32,
+    opacity: SurfaceOpacity,
+) -> [f32; 4] {
+    let client_factor = inner.unwrap_or(coverage) * opacity.value();
+    let client = sampled.map(|component| component * client_factor);
+    if inner.is_none() {
+        return client;
+    }
+    let border = border.map(|component| component * border_coverage);
+    [
+        client[0] + border[0],
+        client[1] + border[1],
+        client[2] + border[2],
+        client[3] + border[3],
+    ]
 }
 
 pub(crate) fn blend_state_for(
@@ -308,6 +356,7 @@ impl SceneRenderer {
         let shadow_extent_uniform = unsafe { gl::GetUniformLocation(program, b"shadow_extent\0".as_ptr().cast()) };
         let shadow_strength_uniform = unsafe { gl::GetUniformLocation(program, b"shadow_strength\0".as_ptr().cast()) };
         let shadow_color_uniform = unsafe { gl::GetUniformLocation(program, b"shadow_color\0".as_ptr().cast()) };
+        let surface_opacity_uniform = unsafe { gl::GetUniformLocation(program, b"surface_opacity\0".as_ptr().cast()) };
         if corner_radius_uniform < 0
             || surface_size_uniform < 0
             || border_width_uniform < 0
@@ -316,6 +365,7 @@ impl SceneRenderer {
             || shadow_extent_uniform < 0
             || shadow_strength_uniform < 0
             || shadow_color_uniform < 0
+            || surface_opacity_uniform < 0
         {
             return Err("rounded-corner shader uniforms are unavailable".into());
         }
@@ -342,6 +392,7 @@ impl SceneRenderer {
             border_width_uniform, border_color_uniform, shadow_mode_uniform,
             shadow_extent_uniform, shadow_strength_uniform,
             shadow_color_uniform,
+            surface_opacity_uniform,
         })
     }
 
@@ -359,6 +410,25 @@ impl SceneRenderer {
         pixel_semantics: crate::x11::scene::EglPixelSemantics,
         root_width: i32,
         root_height: i32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.render_surface_with_opacity(
+            texture,
+            plan,
+            pixel_semantics,
+            root_width,
+            root_height,
+            SurfaceOpacity::new(1.0).expect("constant opacity is valid"),
+        )
+    }
+
+    pub(crate) fn render_surface_with_opacity(
+        &self,
+        texture: u32,
+        plan: crate::x11::scene::RenderQuadPlan,
+        pixel_semantics: crate::x11::scene::EglPixelSemantics,
+        root_width: i32,
+        root_height: i32,
+        opacity: SurfaceOpacity,
     ) -> Result<(), Box<dyn Error>> {
         let x = plan.dst_x;
         let y = plan.dst_y;
@@ -386,7 +456,7 @@ impl SceneRenderer {
             check_gl_error("before scene draw")?;
             gl::UseProgram(self.program);
             gl::Uniform1i(self.shadow_mode_uniform, 0);
-            match blend_state_for_surface(pixel_semantics, plan.corner_radius) {
+            match blend_state_for_surface(pixel_semantics, plan.corner_radius, opacity) {
                 Some(BlendState::Disabled) => gl::Disable(gl::BLEND),
                 Some(BlendState::PremultipliedAlpha) => {
                     gl::Enable(gl::BLEND);
@@ -395,6 +465,7 @@ impl SceneRenderer {
                 None => return Err("unsupported pixel semantics reached GL renderer".into()),
             }
             check_gl_error("blend state")?;
+            gl::Uniform1f(self.surface_opacity_uniform, opacity.value());
             gl::Uniform1f(self.corner_radius_uniform, plan.corner_radius);
             gl::Uniform2f(self.surface_size_uniform, width as f32, height as f32);
             gl::Uniform1f(self.border_width_uniform, plan.border_width);
@@ -482,8 +553,9 @@ impl SceneRenderer {
 fn blend_state_for_surface(
     semantics: crate::x11::scene::EglPixelSemantics,
     corner_radius: f32,
+    opacity: SurfaceOpacity,
 ) -> Option<BlendState> {
-    if corner_radius > 0.0 {
+    if corner_radius > 0.0 || opacity.value() < 1.0 {
         match semantics {
             crate::x11::scene::EglPixelSemantics::Opaque
             | crate::x11::scene::EglPixelSemantics::PremultipliedAlpha => {
@@ -551,10 +623,114 @@ fn program_log(program: u32) -> String { let mut length = 0; unsafe { gl::GetPro
 #[cfg(test)]
 mod tests {
     use super::{
-        blend_state_for, blend_state_for_surface, build_shadow_quad_plan, BlendState,
-        ShadowParams,
+        apply_surface_opacity, blend_state_for, blend_state_for_surface,
+        build_shadow_quad_plan, BlendState, ShadowParams, SurfaceOpacity,
     };
     use crate::x11::scene::EglPixelSemantics;
+
+    fn assert_pixel_close(actual: [f32; 4], expected: [f32; 4]) {
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 0.00001, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn surface_opacity_validation_accepts_only_finite_unit_values() {
+        assert!(SurfaceOpacity::new(0.0).is_some());
+        assert!(SurfaceOpacity::new(0.5).is_some());
+        assert!(SurfaceOpacity::new(1.0).is_some());
+        assert!(SurfaceOpacity::new(-0.01).is_none());
+        assert!(SurfaceOpacity::new(1.01).is_none());
+        assert!(SurfaceOpacity::new(f32::NAN).is_none());
+        assert!(SurfaceOpacity::new(f32::INFINITY).is_none());
+        assert!(SurfaceOpacity::new(f32::NEG_INFINITY).is_none());
+    }
+
+    #[test]
+    fn surface_opacity_scales_opaque_and_premultiplied_pixels() {
+        let half = SurfaceOpacity::new(0.5).unwrap();
+        assert_pixel_close(
+            apply_surface_opacity([1.0, 1.0, 1.0, 1.0], 1.0, half),
+            [0.5, 0.5, 0.5, 0.5],
+        );
+        assert_pixel_close(
+            apply_surface_opacity([0.4, 0.2, 0.1, 0.5], 1.0, half),
+            [0.2, 0.1, 0.05, 0.25],
+        );
+        assert_pixel_close(
+            apply_surface_opacity([0.0, 0.0, 0.0, 0.0], 1.0, half),
+            [0.0, 0.0, 0.0, 0.0],
+        );
+        assert_pixel_close(
+            apply_surface_opacity([0.4, 0.2, 0.1, 0.5], 1.0, SurfaceOpacity::new(1.0).unwrap()),
+            [0.4, 0.2, 0.1, 0.5],
+        );
+        assert_pixel_close(
+            apply_surface_opacity([0.4, 0.2, 0.1, 0.5], 1.0, SurfaceOpacity::new(0.0).unwrap()),
+            [0.0, 0.0, 0.0, 0.0],
+        );
+    }
+
+    #[test]
+    fn surface_opacity_multiplies_rounded_coverage_once() {
+        let result = apply_surface_opacity(
+            [1.0, 0.8, 0.4, 1.0],
+            0.5,
+            SurfaceOpacity::new(0.5).unwrap(),
+        );
+        assert_pixel_close(result, [0.25, 0.2, 0.1, 0.25]);
+    }
+
+    #[test]
+    fn surface_shader_branch_model_keeps_border_independent() {
+        let opacity = SurfaceOpacity::new(0.5).unwrap();
+        assert_pixel_close(
+            super::compose_surface_fragment(
+                [1.0, 0.8, 0.4, 1.0], 1.0, None, [0.0; 4], 0.0, opacity,
+            ),
+            [0.5, 0.4, 0.2, 0.5],
+        );
+        assert_pixel_close(
+            super::compose_surface_fragment(
+                [1.0, 0.8, 0.4, 1.0], 0.5, None, [0.0; 4], 0.0, opacity,
+            ),
+            [0.25, 0.2, 0.1, 0.25],
+        );
+        let border = [0.2, 0.3, 0.4, 1.0];
+        assert_pixel_close(
+            super::compose_surface_fragment(
+                [1.0, 0.8, 0.4, 1.0], 1.0, Some(0.5), border, 0.75, opacity,
+            ),
+            [0.4, 0.425, 0.4, 1.0],
+        );
+        assert_pixel_close(
+            super::compose_surface_fragment(
+                [1.0, 0.8, 0.4, 1.0], 1.0, Some(0.5), border, 0.75,
+                SurfaceOpacity::new(0.0).unwrap(),
+            ),
+            [0.15, 0.225, 0.3, 0.75],
+        );
+    }
+
+    #[test]
+    fn opacity_requires_blending_for_translucent_opaque_surfaces() {
+        let opaque = SurfaceOpacity::new(1.0).unwrap();
+        let half = SurfaceOpacity::new(0.5).unwrap();
+        assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 0.0, opaque), Some(BlendState::Disabled));
+        assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 0.0, half), Some(BlendState::PremultipliedAlpha));
+        assert_eq!(blend_state_for_surface(EglPixelSemantics::PremultipliedAlpha, 0.0, opaque), Some(BlendState::PremultipliedAlpha));
+        assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 8.0, opaque), Some(BlendState::PremultipliedAlpha));
+    }
+
+    #[test]
+    fn opacity_shader_scales_client_only_and_keeps_border_independent() {
+        let source = super::SCENE_FRAGMENT_SHADER;
+        assert!(source.contains("uniform float surface_opacity"));
+        assert!(source.contains("sampled*surface_opacity"));
+        assert!(source.contains("sampled*inner*surface_opacity+premultiplied_border"));
+        assert!(source.contains("premultiplied_border=vec4(border_color.rgb*border_color.a,border_color.a)*border"));
+        assert!(!source.contains("premultiplied_border*surface_opacity"));
+    }
 
     #[test]
     fn opaque_and_premultiplied_blend_policies_are_explicit() {
@@ -581,8 +757,9 @@ mod tests {
 
     #[test]
     fn opaque_surfaces_enable_blending_only_when_corner_masked() {
-        assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 0.0), Some(BlendState::Disabled));
-        assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 8.0), Some(BlendState::PremultipliedAlpha));
+        let opaque = SurfaceOpacity::new(1.0).unwrap();
+        assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 0.0, opaque), Some(BlendState::Disabled));
+        assert_eq!(blend_state_for_surface(EglPixelSemantics::Opaque, 8.0, opaque), Some(BlendState::PremultipliedAlpha));
     }
 
     #[test]
@@ -720,4 +897,4 @@ mod tests {
 const VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nout vec2 texcoord;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; }";
 const FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nout vec4 color;\nuniform sampler2D captured;\nvoid main(){ color=texture(captured,texcoord); }";
 const SCENE_VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nlayout(location=2) in vec2 local_position_in;\nout vec2 texcoord;\nout vec2 local_position;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; local_position=local_position_in; }";
-const SCENE_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D captured;\nuniform int shadow_mode;\nuniform float shadow_extent;\nuniform float shadow_strength;\nuniform vec3 shadow_color;\nuniform float corner_radius;\nuniform vec2 surface_size;\nuniform float border_width;\nuniform vec4 border_color;\nfloat rounded_distance(vec2 point, vec2 size, float radius){ vec2 q=abs(point-size*0.5)-(size*0.5-vec2(radius)); return length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; }\nfloat coverage(float distance){ float aa=max(fwidth(distance),0.0001); return 1.0-smoothstep(-aa,aa,distance); }\nvoid main(){ float outer_radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); if(shadow_mode!=0){ vec2 shadow_point=local_position-vec2(shadow_extent); float shadow_distance=rounded_distance(shadow_point,surface_size,outer_radius); float edge=coverage(-shadow_distance); float falloff=1.0-smoothstep(0.0,max(shadow_extent,0.0001),max(shadow_distance,0.0)); float alpha=shadow_strength*edge*falloff; color=vec4(shadow_color*alpha,alpha); return; } vec4 sampled=texture(captured,texcoord); if(border_width<=0.0){ if(corner_radius<=0.0){ color=sampled; return; } color=sampled*coverage(rounded_distance(local_position,surface_size,outer_radius)); return; } float width=min(border_width,min(surface_size.x,surface_size.y)*0.5); float outer=coverage(rounded_distance(local_position,surface_size,outer_radius)); vec2 inner_size=max(surface_size-vec2(2.0*width),vec2(0.0)); float inner_radius=max(outer_radius-width,0.0); float inner=inner_size.x>0.0 && inner_size.y>0.0 ? coverage(rounded_distance(local_position-vec2(width),inner_size,inner_radius)) : 0.0; float border=clamp(outer-inner,0.0,1.0); vec4 premultiplied_border=vec4(border_color.rgb*border_color.a,border_color.a)*border; color=sampled*inner+premultiplied_border; }";
+const SCENE_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D captured;\nuniform int shadow_mode;\nuniform float shadow_extent;\nuniform float shadow_strength;\nuniform vec3 shadow_color;\nuniform float surface_opacity;\nuniform float corner_radius;\nuniform vec2 surface_size;\nuniform float border_width;\nuniform vec4 border_color;\nfloat rounded_distance(vec2 point, vec2 size, float radius){ vec2 q=abs(point-size*0.5)-(size*0.5-vec2(radius)); return length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; }\nfloat coverage(float distance){ float aa=max(fwidth(distance),0.0001); return 1.0-smoothstep(-aa,aa,distance); }\nvoid main(){ float outer_radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); if(shadow_mode!=0){ vec2 shadow_point=local_position-vec2(shadow_extent); float shadow_distance=rounded_distance(shadow_point,surface_size,outer_radius); float edge=coverage(-shadow_distance); float falloff=1.0-smoothstep(0.0,max(shadow_extent,0.0001),max(shadow_distance,0.0)); float alpha=shadow_strength*edge*falloff; color=vec4(shadow_color*alpha,alpha); return; } vec4 sampled=texture(captured,texcoord); if(border_width<=0.0){ if(corner_radius<=0.0){ color=sampled*surface_opacity; return; } color=sampled*coverage(rounded_distance(local_position,surface_size,outer_radius))*surface_opacity; return; } float width=min(border_width,min(surface_size.x,surface_size.y)*0.5); float outer=coverage(rounded_distance(local_position,surface_size,outer_radius)); vec2 inner_size=max(surface_size-vec2(2.0*width),vec2(0.0)); float inner_radius=max(outer_radius-width,0.0); float inner=inner_size.x>0.0 && inner_size.y>0.0 ? coverage(rounded_distance(local_position-vec2(width),inner_size,inner_radius)) : 0.0; float border=clamp(outer-inner,0.0,1.0); vec4 premultiplied_border=vec4(border_color.rgb*border_color.a,border_color.a)*border; color=sampled*inner*surface_opacity+premultiplied_border; }";

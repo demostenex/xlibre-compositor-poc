@@ -15,6 +15,58 @@ struct ShadowCliArgs {
     strength: Option<f32>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct OpacityCliArgs {
+    focused: Option<f32>,
+    inactive: Option<f32>,
+    urgent: Option<f32>,
+}
+
+fn parse_opacity_arguments(args: &[String]) -> Result<OpacityCliArgs, Box<dyn Error>> {
+    let mut parsed = OpacityCliArgs { focused: None, inactive: None, urgent: None };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--compositor-opacity-focused" => {
+                index += 1;
+                parsed.focused = Some(args.get(index).ok_or(
+                    "--compositor-opacity-focused requires FLOAT",
+                )?.parse::<f32>()?);
+            }
+            "--compositor-opacity-inactive" => {
+                index += 1;
+                parsed.inactive = Some(args.get(index).ok_or(
+                    "--compositor-opacity-inactive requires FLOAT",
+                )?.parse::<f32>()?);
+            }
+            "--compositor-opacity-urgent" => {
+                index += 1;
+                parsed.urgent = Some(args.get(index).ok_or(
+                    "--compositor-opacity-urgent requires FLOAT",
+                )?.parse::<f32>()?);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+fn apply_opacity_config(
+    config: config::CompositorConfig,
+    args: &OpacityCliArgs,
+) -> Result<config::CompositorConfig, Box<dyn Error>> {
+    if args.focused.is_none() && args.inactive.is_none() && args.urgent.is_none() {
+        return Ok(config);
+    }
+    let defaults = config.visuals.opacity;
+    Ok(config.with_opacity(
+        args.focused.unwrap_or(defaults.focused),
+        args.inactive.unwrap_or(defaults.inactive),
+        args.urgent.unwrap_or(defaults.urgent),
+    )?)
+}
+
 fn parse_shadow_arguments(args: &[String]) -> Result<ShadowCliArgs, Box<dyn Error>> {
     let mut parsed = ShadowCliArgs {
         enabled: false,
@@ -99,6 +151,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let shadow_args = parse_shadow_arguments(&raw_args)?;
+    let opacity_args = parse_opacity_arguments(&raw_args)?;
     let mut args = raw_args.into_iter();
     let mut diagnostics_only = false;
     let mut capture_window = None;
@@ -216,6 +269,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "--compositor-shadow-strength requires FLOAT",
                 )?.parse::<f32>()?);
             }
+            "--compositor-opacity-focused"
+            | "--compositor-opacity-inactive"
+            | "--compositor-opacity-urgent" => {
+                let _ = args.next().ok_or("opacity option requires FLOAT")?;
+            }
             "--capture" => {
                 capture_window = Some(args.next().ok_or("--capture requires WINDOW_ID")?)
             }
@@ -229,7 +287,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         || compositor_border_urgent_color.is_some() || compositor_shadow_enabled
         || compositor_shadow_color.is_some() || compositor_shadow_extent.is_some()
         || compositor_shadow_offset_x.is_some() || compositor_shadow_offset_y.is_some()
-        || compositor_shadow_strength.is_some())
+        || compositor_shadow_strength.is_some() || opacity_args.focused.is_some()
+        || opacity_args.inactive.is_some() || opacity_args.urgent.is_some())
         && compositor_scene_x11_probe.is_none()
     {
         return Err("visual overrides require --compositor-scene-x11-probe".into());
@@ -283,6 +342,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             config = apply_shadow_config(config, &shadow_args)?;
         }
+        config = apply_opacity_config(config, &opacity_args)?;
         return x11::scene::run(&connection, &value, config);
     }
 
@@ -599,7 +659,7 @@ fn cleanup_compositor_capture(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_shadow_config, parse_shadow_arguments};
+    use super::{apply_opacity_config, apply_shadow_config, parse_opacity_arguments, parse_shadow_arguments};
     use crate::config::CompositorConfig;
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -665,6 +725,38 @@ mod tests {
         ] {
             let parsed = parse_shadow_arguments(&args(&values)).unwrap();
             assert!(apply_shadow_config(CompositorConfig::defaults(), &parsed).is_err());
+        }
+    }
+
+    #[test]
+    fn opacity_cli_parser_and_config_use_the_real_flag_names() {
+        let parsed = parse_opacity_arguments(&args(&[
+            "program", "--compositor-opacity-focused", "1.0",
+            "--compositor-opacity-inactive", "0.92", "--compositor-opacity-urgent", "1.0",
+        ])).unwrap();
+        assert_eq!(parsed.focused, Some(1.0));
+        assert_eq!(parsed.inactive, Some(0.92));
+        assert_eq!(parsed.urgent, Some(1.0));
+        let config = apply_opacity_config(CompositorConfig::defaults(), &parsed).unwrap();
+        assert_eq!(config.visuals.opacity.focused, 1.0);
+        assert_eq!(config.visuals.opacity.inactive, 0.92);
+        assert_eq!(config.visuals.opacity.urgent, 1.0);
+    }
+
+    #[test]
+    fn opacity_cli_defaults_are_neutral_and_values_are_validated() {
+        let defaults = apply_opacity_config(
+            CompositorConfig::defaults(),
+            &parse_opacity_arguments(&args(&["program"])).unwrap(),
+        ).unwrap();
+        assert_eq!(defaults.visuals.opacity.focused, 1.0);
+        assert_eq!(defaults.visuals.opacity.inactive, 1.0);
+        assert_eq!(defaults.visuals.opacity.urgent, 1.0);
+        for value in ["-0.1", "1.1", "NaN", "inf"] {
+            let parsed = parse_opacity_arguments(&args(&[
+                "program", "--compositor-opacity-inactive", value,
+            ])).unwrap();
+            assert!(apply_opacity_config(CompositorConfig::defaults(), &parsed).is_err());
         }
     }
 }

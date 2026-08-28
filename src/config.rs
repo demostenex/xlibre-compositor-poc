@@ -8,6 +8,7 @@ pub(crate) struct VisualConfig {
     pub(crate) corner_radius: f32,
     pub(crate) border: BorderConfig,
     pub(crate) shadow: ShadowConfig,
+    pub(crate) opacity: OpacityConfig,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,6 +29,13 @@ pub(crate) struct ShadowConfig {
     pub(crate) strength: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OpacityConfig {
+    pub(crate) focused: f32,
+    pub(crate) inactive: f32,
+    pub(crate) urgent: f32,
+}
+
 impl Default for CompositorConfig {
     fn default() -> Self {
         Self {
@@ -42,6 +50,7 @@ impl Default for VisualConfig {
             corner_radius: 0.0,
             border: BorderConfig::default(),
             shadow: ShadowConfig::default(),
+            opacity: OpacityConfig::default(),
         }
     }
 }
@@ -67,6 +76,12 @@ impl Default for ShadowConfig {
             extent: 0.0,
             strength: 0.0,
         }
+    }
+}
+
+impl Default for OpacityConfig {
+    fn default() -> Self {
+        Self { focused: 1.0, inactive: 1.0, urgent: 1.0 }
     }
 }
 
@@ -138,6 +153,20 @@ impl CompositorConfig {
         Ok(self)
     }
 
+    pub(crate) fn with_opacity(
+        mut self,
+        focused: f32,
+        inactive: f32,
+        urgent: f32,
+    ) -> Result<Self, &'static str> {
+        let values = [focused, inactive, urgent];
+        if values.iter().any(|value| !value.is_finite() || *value < 0.0 || *value > 1.0) {
+            return Err("focused, inactive, and urgent opacity must be finite and within range");
+        }
+        self.visuals.opacity = OpacityConfig { focused, inactive, urgent };
+        Ok(self)
+    }
+
     pub(crate) fn parse_rgb_color(value: &str) -> Result<[u8; 3], &'static str> {
         let hex = value.strip_prefix('#').unwrap_or(value);
         if hex.len() != 6 {
@@ -178,6 +207,7 @@ mod tests {
         assert_eq!(shadow.offset_y, 0.0);
         assert_eq!(shadow.extent, 0.0);
         assert_eq!(shadow.strength, 0.0);
+        assert_eq!(visuals.opacity, super::OpacityConfig { focused: 1.0, inactive: 1.0, urgent: 1.0 });
     }
 
     #[test]
@@ -233,6 +263,19 @@ mod tests {
         assert!(CompositorConfig::defaults().with_shadow(true, [0, 0, 0], 18.0, 0.0, 0.0, 0.0).is_err());
         assert!(CompositorConfig::defaults().with_shadow(true, [0, 0, 0], 18.0, 0.0, 0.0, 1.01).is_err());
         assert!(CompositorConfig::defaults().with_shadow(true, [0, 0, 0], f32::NAN, 0.0, 0.0, 0.28).is_err());
+    }
+
+    #[test]
+    fn visual_opacity_defaults_and_validation_are_deterministic() {
+        let config = CompositorConfig::defaults()
+            .with_opacity(1.0, 0.92, 1.0)
+            .unwrap();
+        assert_eq!(config.visuals.opacity.focused, 1.0);
+        assert_eq!(config.visuals.opacity.inactive, 0.92);
+        assert_eq!(config.visuals.opacity.urgent, 1.0);
+        for value in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
+            assert!(CompositorConfig::defaults().with_opacity(value, 1.0, 1.0).is_err());
+        }
     }
 
 }
