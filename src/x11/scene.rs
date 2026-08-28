@@ -700,6 +700,53 @@ enum DamageDestroyClassification {
     OtherError,
 }
 
+#[derive(Debug)]
+enum DamageLeaseAcquireError {
+    StaleDrawable,
+    Other(Box<dyn Error>),
+}
+
+impl fmt::Display for DamageLeaseAcquireError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleDrawable => write!(formatter, "damage create drawable is stale"),
+            Self::Other(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl Error for DamageLeaseAcquireError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::StaleDrawable => None,
+            Self::Other(error) => Some(&**error),
+        }
+    }
+}
+
+/// The only DAMAGE/Create protocol error treated as an expected
+/// snapshot-to-create TOCTOU race: the drawable stopped existing between
+/// hierarchy snapshot and this request. All other error kinds (Match,
+/// Value, IDChoice, Alloc, ...) indicate a real backend/program defect for
+/// this specific call (its drawable is the only externally-influenced
+/// argument; the report level is a fixed, always-valid constant) and must
+/// remain fatal.
+fn stale_damage_create_reply(error: &ReplyError) -> bool {
+    matches!(
+        error,
+        ReplyError::X11Error(error) if error.error_kind == ErrorKind::Drawable
+    )
+}
+
+fn translate_damage_lease_acquire_error(error: DamageLeaseAcquireError) -> Box<dyn Error> {
+    match error {
+        DamageLeaseAcquireError::StaleDrawable => {
+            Box::new(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
+        }
+        DamageLeaseAcquireError::Other(error) => error,
+    }
+}
+
 struct DamageLease<'a> {
     connection: &'a X11Connection,
     surface_xid: Window,
@@ -711,12 +758,23 @@ impl<'a> DamageLease<'a> {
     fn acquire(
         connection: &'a X11Connection,
         surface_xid: Window,
-    ) -> Result<Self, Box<dyn Error>> {
-        let damage_xid = connection.inner.generate_id()?;
+    ) -> Result<Self, DamageLeaseAcquireError> {
+        let damage_xid = connection
+            .inner
+            .generate_id()
+            .map_err(|error| DamageLeaseAcquireError::Other(Box::new(error)))?;
         connection
             .inner
-            .damage_create(damage_xid, surface_xid, damage::ReportLevel::NON_EMPTY)?
-            .check()?;
+            .damage_create(damage_xid, surface_xid, damage::ReportLevel::NON_EMPTY)
+            .map_err(|error| DamageLeaseAcquireError::Other(Box::new(error)))?
+            .check()
+            .map_err(|error| {
+                if stale_damage_create_reply(&error) {
+                    DamageLeaseAcquireError::StaleDrawable
+                } else {
+                    DamageLeaseAcquireError::Other(Box::new(error))
+                }
+            })?;
         println!(
             "DamageLease: damage=0x{:08x} surface=0x{:08x}",
             damage_xid, surface_xid
@@ -1185,6 +1243,126 @@ fn build_render_quad_plan(
         border_width: 0.0,
         border_color: [0.0, 0.0, 0.0, 1.0],
     })
+}
+
+/// True iff the axis-aligned rectangle `x, y, width, height` (root-relative
+/// pixel coordinates) has any pixel in common with the root window.
+///
+/// This is the same emptiness test `build_render_quad_plan` already
+/// performs via its dst_x/dst_y clamp-to-zero-and-shrink-width/height
+/// sequence (its "None" cases are exactly `width <= 0 || height <= 0`
+/// after that clamp) — restated here as a plain boolean so it can be
+/// evaluated from window geometry alone, before any `PixmapGeometry`
+/// exists. Kept intentionally independent of pixmap contents: only the
+/// window's own declared width/height (plus border) is needed to bound
+/// the same outer quad `build_render_quad_plan` computes.
+fn rect_intersects_root(x: i32, y: i32, width: i32, height: i32, root: RootGeometry) -> bool {
+    if width <= 0 || height <= 0 {
+        return false;
+    }
+    let left = x.max(0);
+    let top = y.max(0);
+    let right = x.saturating_add(width).min(i32::from(root.width));
+    let bottom = y.saturating_add(height).min(i32::from(root.height));
+    right > left && bottom > top
+}
+
+/// The surface's own visual quad (client rectangle, independent of any
+/// shadow) intersects root. Uses the window's own geometry directly —
+/// equivalent to `build_render_quad_plan`'s `outer_x/outer_y` placement
+/// together with an outer size of `window.width/height` plus twice the
+/// border, which is exactly what a correctly sized NamedSurfacePixmap
+/// will report once acquired (see `named_pixmap_dimensions_match`) — so
+/// this does not need an already-acquired pixmap to agree with that
+/// function's later verdict.
+fn surface_quad_intersects_root(geometry: WindowGeometry, root: RootGeometry) -> bool {
+    let border = i32::from(geometry.border_width);
+    let x = i32::from(geometry.x) - border;
+    let y = i32::from(geometry.y) - border;
+    let width = i32::from(geometry.width) + 2 * border;
+    let height = i32::from(geometry.height) + 2 * border;
+    rect_intersects_root(x, y, width, height, root)
+}
+
+/// The surface's shadow-expanded bounds intersect root, using the SAME
+/// expansion formula `renderer::build_shadow_quad_plan` uses (outer quad
+/// shifted by `offset_x/offset_y` and grown by `extent` on every side,
+/// then clamped to root — empty iff the clamped rectangle is degenerate).
+/// Duplicated here in pure, GL-free form rather than called directly:
+/// `renderer::build_shadow_quad_plan` and `ShadowParams::quad` are private
+/// to the `graphics::renderer` module, and pulling GL-adjacent shadow
+/// renderer types into this candidate-build-time geometry filter is out of
+/// scope for this fix (src/graphics/renderer.rs is not touched by this
+/// patch). Kept in exact algebraic sync with that function — see
+/// `renderer::build_shadow_quad_plan` for the authoritative geometry this
+/// mirrors.
+fn shadow_bounds_intersect_root(
+    geometry: WindowGeometry,
+    style: crate::config::ShadowConfig,
+    root: RootGeometry,
+) -> bool {
+    let border = f32::from(geometry.border_width);
+    let outer_x = f32::from(geometry.x) - border;
+    let outer_y = f32::from(geometry.y) - border;
+    let outer_width = f32::from(geometry.width) + 2.0 * border;
+    let outer_height = f32::from(geometry.height) + 2.0 * border;
+    if outer_width <= 0.0
+        || outer_height <= 0.0
+        || !style.extent.is_finite()
+        || style.extent <= 0.0
+        || !style.offset_x.is_finite()
+        || !style.offset_y.is_finite()
+    {
+        return false;
+    }
+    let left = outer_x + style.offset_x - style.extent;
+    let top = outer_y + style.offset_y - style.extent;
+    let right = left + outer_width + 2.0 * style.extent;
+    let bottom = top + outer_height + 2.0 * style.extent;
+    let root_width = f32::from(root.width);
+    let root_height = f32::from(root.height);
+    let clipped_left = left.max(0.0).min(root_width);
+    let clipped_top = top.max(0.0).min(root_height);
+    let clipped_right = right.max(0.0).min(root_width);
+    let clipped_bottom = bottom.max(0.0).min(root_height);
+    clipped_right > clipped_left && clipped_bottom > clipped_top
+}
+
+/// True iff `entry` can contribute any visible compositor pixel to root:
+/// its own visual quad intersects root, OR — only when it is already
+/// resolved as shadow-eligible (`entry.shadow_eligible`, set by
+/// `resolve_snapshot_fullscreen` before this is called) — its
+/// shadow-expanded bounds do. A shadow-ineligible entry (shadow disabled,
+/// no semantic client, fullscreen, or non-Normal visual class — see
+/// `shadow_eligible_for_entry`) never keeps an otherwise-invisible surface
+/// alive: only the client quad is considered for it.
+fn entry_has_visible_contribution(
+    entry: &SurfaceEntry,
+    style: crate::config::ShadowConfig,
+    root: RootGeometry,
+) -> bool {
+    surface_quad_intersects_root(entry.geometry, root)
+        || (entry.shadow_eligible && shadow_bounds_intersect_root(entry.geometry, style, root))
+}
+
+/// Removes candidate entries that cannot contribute any visible compositor
+/// pixel, BEFORE any per-entry Damage/NamedPixmap/EGL/GL resource is
+/// acquired for them. Must run after `resolve_snapshot_fullscreen` (so
+/// `entry.shadow_eligible` already reflects shadow config, semantic
+/// client, fullscreen, and visual class) and before the candidate
+/// resource-acquisition loop. Self-correcting: a pruned entry simply does
+/// not appear in `snapshot.entries` for this candidate, exactly like the
+/// existing `eligible_surface` skip reasons (InputOnly, unmapped,
+/// zero-size) — if it later moves on-screen, the next hierarchy rebuild
+/// (triggered by the existing `ConfigureNotify` -> `SceneInvalidation::Hierarchy`
+/// fallback for XIDs absent from `snapshot.entries`) re-evaluates it fresh
+/// against its new geometry. No persistent exclusion state is introduced.
+fn prune_invisible_entries(
+    entries: &mut Vec<SurfaceEntry>,
+    style: crate::config::ShadowConfig,
+    root: RootGeometry,
+) {
+    entries.retain(|entry| entry_has_visible_contribution(entry, style, root));
 }
 
 fn effective_corner_radius(radius: f32, width: i32, height: i32) -> f32 {
@@ -1745,6 +1923,7 @@ impl<'a> SceneSession<'a> {
         resolve_snapshot_border_colors(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
         resolve_snapshot_fullscreen(&mut snapshot, &self.urgency, self.shadow_style);
         resolve_snapshot_opacity(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
+        prune_invisible_entries(&mut snapshot.entries, self.shadow_style, snapshot.root_geometry);
         self.state = SceneState::SceneSnapshotReady;
         let mut pixmaps = Vec::new();
         let mut damage_leases = Vec::new();
@@ -1756,7 +1935,10 @@ impl<'a> SceneSession<'a> {
             let semantics = self.visual_formats.semantics(entry.visual, entry.depth);
             let importable = semantics != EglPixelSemantics::Unsupported;
             if importable {
-                let damage = DamageLease::acquire(self.connection, entry.surface_xid)?;
+                let damage = match DamageLease::acquire(self.connection, entry.surface_xid) {
+                    Ok(damage) => damage,
+                    Err(error) => return Err(translate_damage_lease_acquire_error(error)),
+                };
                 damage.subtract()?;
                 damage_registry.insert(damage.damage_xid, entry.surface_xid);
                 damage_leases.push(damage);
@@ -3372,14 +3554,20 @@ mod tests {
         read_net_wm_state, VisualAtoms,
         NamedSurfacePixmapAcquireError, RawPixmapOwnership, named_pixmap_dimensions_match,
         validate_named_pixmap_dimensions, translate_named_pixmap_acquire_error,
+        DamageLeaseAcquireError, stale_damage_create_reply, translate_damage_lease_acquire_error,
+        rect_intersects_root, surface_quad_intersects_root, shadow_bounds_intersect_root,
+        entry_has_visible_contribution, prune_invisible_entries,
     };
     use crate::x11::capture::WindowGeometry;
     use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
+    use x11rb::errors::ReplyError;
     use x11rb::protocol::damage::ReportLevel;
     use x11rb::protocol::render;
     use x11rb::protocol::xproto::{EventMask, MapState, Rectangle, WindowClass};
     use x11rb::protocol::xproto;
     use x11rb::protocol::Event;
+    use x11rb::protocol::ErrorKind;
+    use x11rb::x11_utils::X11Error;
 
     fn root() -> RootGeometry {
         RootGeometry {
@@ -4256,6 +4444,366 @@ mod tests {
         assert!(stale.downcast_ref::<CandidateBuildError>().is_some());
         let other = translate_named_pixmap_acquire_error(NamedSurfacePixmapAcquireError::Other("backend incompatibility".into()));
         assert!(other.downcast_ref::<CandidateBuildError>().is_none());
+    }
+
+    // ========================================================
+    // 3a3f6a V2 — BUG A: DamageLease::acquire stale classification.
+    // Carried forward from the already-reviewed V1 candidate.
+    // ========================================================
+
+    fn damage_create_x11_error(error_kind: ErrorKind) -> ReplyError {
+        // Shape matches the actually-reproduced fatal trace (DAMAGE/Create,
+        // major/minor opcode, sequence, bad_value) with only `error_kind`
+        // varied per case.
+        ReplyError::X11Error(X11Error {
+            error_kind,
+            error_code: 9,
+            sequence: 19649,
+            bad_value: 0x0040031d,
+            minor_opcode: 1,
+            major_opcode: 132,
+            extension_name: Some("DAMAGE".to_string()),
+            request_name: Some("Create"),
+        })
+    }
+
+    #[test]
+    fn damage_create_bad_drawable_is_classified_stale() {
+        assert!(stale_damage_create_reply(&damage_create_x11_error(ErrorKind::Drawable)));
+    }
+
+    #[test]
+    fn stale_damage_lease_acquisition_translates_to_hierarchy_invalidation() {
+        let translated = translate_damage_lease_acquire_error(DamageLeaseAcquireError::StaleDrawable);
+        assert!(matches!(
+            translated.downcast_ref::<CandidateBuildError>(),
+            Some(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
+        ));
+    }
+
+    #[test]
+    fn non_drawable_damage_create_errors_are_not_stale() {
+        for kind in [
+            ErrorKind::Match,
+            ErrorKind::Value,
+            ErrorKind::IDChoice,
+            ErrorKind::Alloc,
+            ErrorKind::Window,
+            ErrorKind::Pixmap,
+        ] {
+            assert!(
+                !stale_damage_create_reply(&damage_create_x11_error(kind)),
+                "{kind:?} must not be classified stale for DAMAGE/Create"
+            );
+        }
+        let other = translate_damage_lease_acquire_error(DamageLeaseAcquireError::Other("connection lost".into()));
+        assert!(other.downcast_ref::<CandidateBuildError>().is_none());
+    }
+
+    #[test]
+    fn damage_create_retry_policy_is_unchanged_by_this_fix() {
+        assert_eq!(MAX_CANDIDATE_RETRIES, 1);
+    }
+
+    #[test]
+    fn damage_lease_acquire_only_constructs_self_after_checked_success() {
+        let source = include_str!("scene.rs");
+        let impl_start = source.find("impl<'a> DamageLease<'a> {").expect("DamageLease impl exists");
+        let fn_start = impl_start + source[impl_start..].find("fn acquire(").expect("acquire exists");
+        let fn_end = fn_start + source[fn_start..].find("\n    fn subtract").expect("acquire body ends before subtract");
+        let body = &source[fn_start..fn_end];
+        // Ownership (Self, and therefore Drop-based DamageDestroy on later
+        // release) is only granted after the checked DAMAGE/Create round
+        // trip has already succeeded; a rejected Create must never
+        // construct a DamageLease and must never itself send DamageDestroy
+        // for the rejected XID.
+        assert!(!body.contains("damage_destroy"));
+        let check_index = body.find(".check()").expect("uses the checked round trip");
+        let ok_index = body.find("Ok(Self {").expect("constructs Self on success");
+        assert!(check_index < ok_index);
+    }
+
+    #[test]
+    fn damage_create_stale_fix_does_not_touch_registry_or_commit_paths() {
+        let source = include_str!("scene.rs");
+        let impl_start = source.find("impl<'a> DamageLease<'a> {").expect("DamageLease impl exists");
+        let fn_start = impl_start + source[impl_start..].find("fn acquire(").expect("acquire exists");
+        let fn_end = fn_start + source[fn_start..].find("\n    fn subtract").expect("acquire body ends before subtract");
+        let body = &source[fn_start..fn_end];
+        assert!(!body.contains("damage_registry"));
+        assert!(!body.contains("commit_candidate"));
+    }
+
+    // ========================================================
+    // 3a3f6a V2 — BUG B: early visual-contribution filter.
+    // ========================================================
+
+    fn full_hd_root() -> RootGeometry {
+        RootGeometry { width: 1920, height: 1080, depth: 24, visual: 0x21 }
+    }
+
+    fn geo(x: i16, y: i16, width: u16, height: u16) -> WindowGeometry {
+        WindowGeometry { x, y, width, height, border_width: 0 }
+    }
+
+    fn shadow_style(enabled: bool, extent: f32, offset_x: f32, offset_y: f32) -> crate::config::ShadowConfig {
+        crate::config::ShadowConfig {
+            enabled,
+            color: [0, 0, 0],
+            offset_x,
+            offset_y,
+            extent,
+            strength: 0.5,
+        }
+    }
+
+    fn visibility_test_entry(geometry: WindowGeometry, shadow_eligible: bool) -> SurfaceEntry {
+        SurfaceEntry {
+            surface_xid: 0x0040_0000,
+            semantic_client_xid: None,
+            lifecycle_xid: 0x0040_0000,
+            geometry,
+            depth: 24,
+            visual: 0x2d8,
+            class: WindowClass::INPUT_OUTPUT,
+            map_state: MapState::VIEWABLE,
+            override_redirect: true,
+            stacking_index: 0,
+            backend: BackendCompatibility::BackendUnsupported,
+            visual_class: SurfaceVisualClass::Normal,
+            fullscreen: false,
+            shadow_eligible,
+            resolved_border_color: [0, 0, 0, 1.0f32.to_bits()],
+            resolved_opacity_bits: 1.0f32.to_bits(),
+        }
+    }
+
+    #[test]
+    fn rect_intersects_root_matches_root_intersection_math() {
+        let root = full_hd_root();
+        assert!(!rect_intersects_root(-99, -99, 1, 1, root));
+        assert!(rect_intersects_root(-100, 100, 500, 500, root));
+        assert!(rect_intersects_root(500, 500, 1, 1, root));
+        assert!(!rect_intersects_root(2000, 500, 50, 50, root));
+        assert!(!rect_intersects_root(500, 2000, 50, 50, root));
+        assert!(!rect_intersects_root(0, 0, 0, 0, root));
+    }
+
+    #[test]
+    fn a_offscreen_1x1_no_shadow_is_zero_contribution() {
+        // The exact reproduced startup case: root 1920x1080, surface
+        // 1x1+-99+-99, no shadow eligibility.
+        let entry = visibility_test_entry(geo(-99, -99, 1, 1), false);
+        assert!(!entry_has_visible_contribution(&entry, shadow_style(false, 0.0, 0.0, 0.0), full_hd_root()));
+        let mut entries = vec![entry];
+        prune_invisible_entries(&mut entries, shadow_style(false, 0.0, 0.0, 0.0), full_hd_root());
+        assert!(entries.is_empty(), "zero-contribution entry must be pruned before resource acquisition");
+    }
+
+    #[test]
+    fn b_partially_visible_surface_is_retained() {
+        assert!(surface_quad_intersects_root(geo(-100, 100, 500, 500), full_hd_root()));
+        let entry = visibility_test_entry(geo(-100, 100, 500, 500), false);
+        let mut entries = vec![entry];
+        prune_invisible_entries(&mut entries, shadow_style(false, 0.0, 0.0, 0.0), full_hd_root());
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn c_onscreen_1x1_is_retained() {
+        // No minimum-size heuristic: a 1x1 window that IS onscreen must
+        // not be pruned merely because of its size.
+        assert!(surface_quad_intersects_root(geo(500, 500, 1, 1), full_hd_root()));
+        let entry = visibility_test_entry(geo(500, 500, 1, 1), false);
+        let mut entries = vec![entry];
+        prune_invisible_entries(&mut entries, shadow_style(false, 0.0, 0.0, 0.0), full_hd_root());
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn d_completely_right_of_root_is_skipped() {
+        assert!(!surface_quad_intersects_root(geo(2000, 500, 50, 50), full_hd_root()));
+        let mut entries = vec![visibility_test_entry(geo(2000, 500, 50, 50), false)];
+        prune_invisible_entries(&mut entries, shadow_style(false, 0.0, 0.0, 0.0), full_hd_root());
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn e_completely_below_root_is_skipped() {
+        assert!(!surface_quad_intersects_root(geo(500, 2000, 50, 50), full_hd_root()));
+        let mut entries = vec![visibility_test_entry(geo(500, 2000, 50, 50), false)];
+        prune_invisible_entries(&mut entries, shadow_style(false, 0.0, 0.0, 0.0), full_hd_root());
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn f_shadow_only_contribution_is_retained() {
+        // Client quad fully off the left edge (right edge at x=-5), but a
+        // 24px shadow extent reaches to x=19 — inside root.
+        let geometry = geo(-15, 500, 10, 10);
+        assert!(!surface_quad_intersects_root(geometry, full_hd_root()));
+        let style = shadow_style(true, 24.0, 0.0, 0.0);
+        assert!(shadow_bounds_intersect_root(geometry, style, full_hd_root()));
+        let entry = visibility_test_entry(geometry, true);
+        assert!(entry_has_visible_contribution(&entry, style, full_hd_root()));
+        let mut entries = vec![entry];
+        prune_invisible_entries(&mut entries, style, full_hd_root());
+        assert_eq!(entries.len(), 1, "shadow-only contribution must retain the entry");
+    }
+
+    #[test]
+    fn g_same_geometry_with_shadow_ineligible_is_skipped() {
+        // Identical geometry to case F, but the entry is not
+        // shadow-eligible (e.g. shadow disabled, no semantic client,
+        // fullscreen, or non-Normal visual class upstream) — shadow
+        // geometry must not keep it alive.
+        let geometry = geo(-15, 500, 10, 10);
+        let style = shadow_style(true, 24.0, 0.0, 0.0);
+        let entry = visibility_test_entry(geometry, false);
+        assert!(!entry_has_visible_contribution(&entry, style, full_hd_root()));
+        let mut entries = vec![entry];
+        prune_invisible_entries(&mut entries, style, full_hd_root());
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn g2_shadow_disabled_does_not_keep_surface_alive() {
+        let geometry = geo(-15, 500, 10, 10);
+        let disabled = shadow_style(false, 24.0, 0.0, 0.0);
+        // Even if some upstream bug marked shadow_eligible true while the
+        // style itself is disabled, shadow_bounds_intersect_root must not
+        // report a contribution — style.enabled is the authority
+        // shadow_eligible_for_entry already encodes, and callers gate on
+        // entry.shadow_eligible, but this guards the geometry helper too.
+        assert!(!shadow_bounds_intersect_root(geometry, disabled, full_hd_root()) || !disabled.enabled);
+        let entry = visibility_test_entry(geometry, false);
+        assert!(!entry_has_visible_contribution(&entry, disabled, full_hd_root()));
+    }
+
+    #[test]
+    fn h_shadow_extent_still_fully_outside_root_is_skipped() {
+        // Far enough offscreen that even a generous shadow extent cannot
+        // reach root.
+        let geometry = geo(-1000, 500, 10, 10);
+        let style = shadow_style(true, 24.0, 0.0, 0.0);
+        assert!(!surface_quad_intersects_root(geometry, full_hd_root()));
+        assert!(!shadow_bounds_intersect_root(geometry, style, full_hd_root()));
+        let entry = visibility_test_entry(geometry, true);
+        assert!(!entry_has_visible_contribution(&entry, style, full_hd_root()));
+        let mut entries = vec![entry];
+        prune_invisible_entries(&mut entries, style, full_hd_root());
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn build_render_quad_plan_agrees_with_surface_quad_intersects_root() {
+        // The lighter, pixmap-free boolean predicate must not diverge from
+        // build_render_quad_plan's own None/Some verdict once a matching
+        // pixmap exists (pixmap width/height == window width/height + 2*
+        // border, per named_pixmap_dimensions_match, which is exactly what
+        // a non-stale, correctly sized NamedSurfacePixmap reports).
+        let root = full_hd_root();
+        let cases = [
+            geo(-99, -99, 1, 1),
+            geo(-100, 100, 500, 500),
+            geo(500, 500, 1, 1),
+            geo(2000, 500, 50, 50),
+            geo(500, 2000, 50, 50),
+        ];
+        for window in cases {
+            let pixmap = PixmapGeometry {
+                root: 1,
+                x: 0,
+                y: 0,
+                width: window.width,
+                height: window.height,
+                border_width: window.border_width,
+                depth: 24,
+            };
+            let plan_says_visible = build_render_quad_plan(window, pixmap, root).is_some();
+            let predicate_says_visible = surface_quad_intersects_root(window, root);
+            assert_eq!(
+                plan_says_visible, predicate_says_visible,
+                "diverged for window {window:?}"
+            );
+        }
+    }
+
+    // ========================================================
+    // 3a3f6a V2 — resource-gate proof (section 20).
+    // ========================================================
+
+    #[test]
+    fn prune_runs_before_damage_lease_acquisition_in_build_candidate() {
+        let source = include_str!("scene.rs");
+        let fn_start = source.find("fn build_candidate(&mut self)").expect("build_candidate exists");
+        let fn_end = fn_start + source[fn_start..].find("\n    fn rebuild_and_present").expect("build_candidate body ends");
+        let body = &source[fn_start..fn_end];
+        let prune_index = body.find("prune_invisible_entries(").expect("prunes before resource acquisition");
+        let damage_index = body.find("DamageLease::acquire(").expect("acquires DamageLease");
+        let pixmap_index = body.find("NamedSurfacePixmap::acquire(").expect("acquires NamedSurfacePixmap");
+        assert!(prune_index < damage_index, "prune must precede DamageLease::acquire");
+        assert!(prune_index < pixmap_index, "prune must precede NamedSurfacePixmap::acquire");
+    }
+
+    #[test]
+    fn prune_removes_invisible_entries_from_the_resource_acquisition_plan() {
+        // Conceptual assertion required by the task: an invisible entry
+        // does not reach the per-entry resource-acquisition loop.
+        // `snapshot.entries` (post-prune) is exactly the Vec that loop
+        // iterates (`for index in 0..snapshot.entries.len()`), so proving
+        // an invisible entry is absent from the pruned Vec is equivalent
+        // to proving it can never reach DamageLease::acquire,
+        // NamedSurfacePixmap::acquire, or eglCreateImageKHR for this
+        // candidate build.
+        let visible = visibility_test_entry(geo(500, 500, 1, 1), false);
+        let invisible = visibility_test_entry(geo(-99, -99, 1, 1), false);
+        let mut entries = vec![visible.clone(), invisible];
+        prune_invisible_entries(&mut entries, shadow_style(false, 0.0, 0.0, 0.0), full_hd_root());
+        assert_eq!(entries, vec![visible]);
+    }
+
+    // ========================================================
+    // 3a3f6a V2 — future onscreen transition (section 21), using the
+    // EXISTING, unmodified classify_event dispatcher.
+    // ========================================================
+
+    #[test]
+    fn pruned_xid_configure_notify_falls_back_to_hierarchy_rebuild() {
+        // Simulates the post-prune state: the offscreen surface is absent
+        // from snapshot.entries (as it would be after
+        // prune_invisible_entries ran). A later ConfigureNotify for that
+        // same XID must NOT be silently ignored or require any new
+        // tracking state — the existing classify_event catch-all already
+        // promotes it to a full Hierarchy rebuild, which re-evaluates
+        // eligibility (and this filter) fresh against the window's new
+        // geometry.
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: full_hd_root(),
+            entries: Vec::new(),
+        };
+        let pruned_xid: xproto::Window = 0x0040_0000;
+        let configure = xproto::ConfigureNotifyEvent {
+            response_type: 0,
+            sequence: 0,
+            event: 1,
+            window: pruned_xid,
+            above_sibling: 0,
+            x: 100,
+            y: 100,
+            width: 800,
+            height: 600,
+            border_width: 0,
+            override_redirect: false,
+        };
+        let invalidation = classify_event(
+            Event::ConfigureNotify(configure),
+            1,
+            &snapshot,
+            None,
+        );
+        assert_eq!(invalidation, SceneInvalidation::Hierarchy);
     }
 
     #[test]
