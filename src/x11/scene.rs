@@ -540,6 +540,34 @@ impl SceneSnapshot {
     }
 }
 
+fn known_non_renderable_windows(
+    hierarchy: &HierarchySnapshot,
+    overlay: Window,
+    owner_window: Window,
+) -> HashSet<Window> {
+    let mut ignored = HashSet::from([overlay, owner_window]);
+    for binding in &hierarchy.children {
+        let root_child = binding.root_child_xid;
+        if is_internal_xid(root_child, overlay, owner_window) {
+            ignored.insert(root_child);
+        }
+        if let Some(metadata) = binding.surface_candidate.as_ref()
+            && (metadata.class != WindowClass::INPUT_OUTPUT
+                || metadata.map_state != xproto::MapState::VIEWABLE)
+        {
+            ignored.insert(root_child);
+        }
+        for metadata in &binding.descendants {
+            if metadata.class != WindowClass::INPUT_OUTPUT
+                || metadata.map_state != xproto::MapState::VIEWABLE
+            {
+                ignored.insert(metadata.window);
+            }
+        }
+    }
+    ignored
+}
+
 fn eligible_surface(
     metadata: &WindowMetadata,
     semantic_client_xid: Option<Window>,
@@ -1690,6 +1718,35 @@ enum SceneInvalidation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingGeometry {
+    surface_xid: Window,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    border_width: u16,
+    override_redirect: bool,
+}
+
+fn configure_geometry_update(event: &Event, snapshot: &SceneSnapshot) -> Option<PendingGeometry> {
+    let Event::ConfigureNotify(event) = event else {
+        return None;
+    };
+    if !snapshot.entries.iter().any(|entry| entry.surface_xid == event.window) {
+        return None;
+    }
+    Some(PendingGeometry {
+        surface_xid: event.window,
+        x: event.x,
+        y: event.y,
+        width: event.width,
+        height: event.height,
+        border_width: event.border_width,
+        override_redirect: event.override_redirect,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GateDecision {
     Accept,
     Retry(SceneInvalidation),
@@ -1700,6 +1757,8 @@ enum GateDecision {
 struct InvalidationBatch {
     hierarchy: bool,
     geometry: Option<Window>,
+    geometry_update: Option<PendingGeometry>,
+    geometry_ambiguous: bool,
     shutdown: Option<ShutdownReason>,
     pixel_damage: HashSet<damage::Damage>,
     background: bool,
@@ -1716,12 +1775,17 @@ impl InvalidationBatch {
             SceneInvalidation::Background => self.background = true,
             SceneInvalidation::VisualState => self.visual_state = true,
             SceneInvalidation::Geometry(window) if !self.hierarchy => {
+                if self.geometry.is_some_and(|current| current != window) {
+                    self.geometry_ambiguous = true;
+                }
                 self.geometry = Some(window);
             }
             SceneInvalidation::Geometry(_) => {}
             SceneInvalidation::Hierarchy => {
                 self.hierarchy = true;
                 self.geometry = None;
+                self.geometry_update = None;
+                self.geometry_ambiguous = false;
             }
             SceneInvalidation::Shutdown(reason) => {
                 self.shutdown = Some(reason);
@@ -1749,6 +1813,23 @@ impl InvalidationBatch {
 
     fn pixel_damage(&self) -> &HashSet<damage::Damage> {
         &self.pixel_damage
+    }
+
+    fn push_geometry_update(&mut self, update: Option<PendingGeometry>) {
+        let Some(update) = update else {
+            return;
+        };
+        if self.hierarchy {
+            return;
+        }
+        if self.geometry_update.is_some_and(|current| current.surface_xid != update.surface_xid) {
+            self.geometry_ambiguous = true;
+        }
+        self.geometry_update = Some(update);
+    }
+
+    fn move_geometry(&self) -> Option<PendingGeometry> {
+        (!self.geometry_ambiguous).then_some(self.geometry_update).flatten()
     }
 
 }
@@ -1783,12 +1864,15 @@ struct SceneSession<'a> {
     active_window_initialized: bool,
     urgency: HashMap<Window, CachedClientVisualState>,
     pending_visual_state: bool,
+    pending_move_geometry: Option<PendingGeometry>,
+    pending_move_geometry_ambiguous: bool,
     signal: SignalWake,
     scheduler: FrameScheduler,
     present: Option<PresentClock>,
     state: SceneState,
     _config: CompositorConfig,
     shadow_style: crate::config::ShadowConfig,
+    ignored_configure_windows: HashSet<Window>,
 }
 
 struct SceneCandidate<'a> {
@@ -1802,6 +1886,7 @@ struct SceneCandidate<'a> {
     damage_registry: HashMap<damage::Damage, Window>,
     watch_ids: HashSet<Window>,
     watch_additions: Vec<Window>,
+    ignored_configure_windows: HashSet<Window>,
 }
 
 struct SceneStructureWatches<'a> {
@@ -1948,6 +2033,22 @@ impl<'a> SceneStructureWatches<'a> {
 }
 
 impl<'a> SceneSession<'a> {
+    fn defer_geometry(&mut self, batch: &InvalidationBatch) {
+        if batch.hierarchy {
+            return;
+        }
+        if let Some(update) = batch.geometry_update {
+            if self
+                .pending_move_geometry
+                .is_some_and(|current| current.surface_xid != update.surface_xid)
+            {
+                self.pending_move_geometry_ambiguous = true;
+            }
+            self.pending_move_geometry = Some(update);
+        }
+        self.pending_move_geometry_ambiguous |= batch.geometry_ambiguous;
+    }
+
     fn acquire(connection: &'a X11Connection, expected_root: Window, config: CompositorConfig) -> Result<Self, Box<dyn Error>> {
         let root = connection.inner.setup().roots[connection.screen_num()].root;
         root_guard(expected_root, root)?;
@@ -2022,12 +2123,15 @@ impl<'a> SceneSession<'a> {
             active_window_initialized: false,
             urgency: HashMap::new(),
             pending_visual_state: false,
+            pending_move_geometry: None,
+            pending_move_geometry_ambiguous: false,
             signal,
             scheduler: FrameScheduler::new(),
             present,
             state: SceneState::PlaceholderReady,
             _config: config,
             shadow_style: config.visuals.shadow,
+            ignored_configure_windows: HashSet::new(),
         };
         session.state = SceneState::ManualActive;
         Ok(session)
@@ -2088,6 +2192,7 @@ impl<'a> SceneSession<'a> {
             .as_ref()
             .ok_or("ownership is unavailable")?
             .owner_window;
+        let ignored_configure_windows = known_non_renderable_windows(&hierarchy, overlay, owner);
         let mut snapshot = SceneSnapshot::from_hierarchy(
             hierarchy,
             root_geometry,
@@ -2170,6 +2275,7 @@ impl<'a> SceneSession<'a> {
             egl_surfaces,
             watch_ids,
             watch_additions,
+            ignored_configure_windows,
         })
     }
 
@@ -2177,7 +2283,7 @@ impl<'a> SceneSession<'a> {
         for attempt in 0..=MAX_CANDIDATE_RETRIES {
             let generation = self.structural_generation;
             self.attempted_structural_generation = generation;
-            let candidate = match self.build_candidate() {
+            let mut candidate = match self.build_candidate() {
                 Ok(candidate) => candidate,
                 Err(error) => {
                     let stale = error
@@ -2196,7 +2302,7 @@ impl<'a> SceneSession<'a> {
                 }
             };
             debug_assert_eq!(candidate.generation, generation);
-            let (gate, deferred_damage) = match self.pre_commit_gate(&candidate) {
+            let (gate, deferred_damage) = match self.pre_commit_gate(&mut candidate) {
                 Ok(gate) => gate,
                 Err(error) => {
                     self.structure_watches.rollback(&candidate.watch_additions)?;
@@ -2237,7 +2343,7 @@ impl<'a> SceneSession<'a> {
 
     fn pre_commit_gate(
         &mut self,
-        candidate: &SceneCandidate<'_>,
+        candidate: &mut SceneCandidate<'a>,
     ) -> Result<(GateDecision, HashSet<damage::Damage>), Box<dyn Error>> {
         self.connection.inner.get_input_focus()?.reply()?;
         let mut batch = InvalidationBatch::default();
@@ -2247,6 +2353,7 @@ impl<'a> SceneSession<'a> {
                 break;
             };
             drained += 1;
+            let geometry_update = configure_geometry_update(&event, &candidate.snapshot);
             let visual_invalidation = if is_visual_property_notify(&event, self.root, self.visual_atoms, &candidate.snapshot) {
                 let entries = candidate.snapshot.entries.clone();
                 self.update_visual_state(&event, &entries)?
@@ -2258,17 +2365,19 @@ impl<'a> SceneSession<'a> {
             } else if let Some(invalidation) = visual_invalidation {
                 invalidation
             } else {
-                classify_event_with_registries(
+                classify_event_with_registries_and_ignored(
                 event,
                 self.root,
                 &candidate.snapshot,
                 self.ownership.as_ref(),
                 &self.damage_registry,
                 &candidate.damage_registry,
+                &candidate.ignored_configure_windows,
                 )
             };
             self.observe_invalidation(invalidation);
             batch.push(invalidation);
+            batch.push_geometry_update(geometry_update);
         }
         let batch_decision = batch.decision();
         let deferred_damage = batch.pixel_damage().clone();
@@ -2282,6 +2391,17 @@ impl<'a> SceneSession<'a> {
             ), deferred_damage));
         }
         let signal_pending = self.signal.poll_shutdown_pending()?;
+        if !signal_pending
+            && !batch.hierarchy
+            && !batch.background
+            && !batch.visual_state
+            && !bounded_batch_requires_retry(drained)
+            && batch.geometry.is_some()
+            && self.rebase_candidate_pure_move(candidate, batch.move_geometry())?
+        {
+            self.attempted_structural_generation = self.structural_generation;
+            return Ok((GateDecision::Accept, deferred_damage));
+        }
         let decision = candidate_gate_decision(
             batch_decision,
             bounded_batch_requires_retry(drained),
@@ -2289,6 +2409,94 @@ impl<'a> SceneSession<'a> {
             signal_pending,
         );
         Ok((decision, deferred_damage))
+    }
+
+    fn rebase_candidate_pure_move(
+        &mut self,
+        candidate: &mut SceneCandidate<'a>,
+        update: Option<PendingGeometry>,
+    ) -> Result<bool, Box<dyn Error>> {
+        let Some(update) = update else {
+            return Ok(false);
+        };
+        let live = self.current_snapshot();
+        let Some(live_entry) = live.entries.iter().find(|entry| entry.surface_xid == update.surface_xid) else {
+            return Ok(false);
+        };
+        let Some(candidate_index) = candidate
+            .snapshot
+            .entries
+            .iter()
+            .position(|entry| entry.surface_xid == update.surface_xid)
+        else {
+            return Ok(false);
+        };
+        let candidate_entry = candidate.snapshot.entries[candidate_index].clone();
+        if live.root != candidate.snapshot.root
+            || live_entry.surface_xid != candidate_entry.surface_xid
+            || live_entry.semantic_client_xid != candidate_entry.semantic_client_xid
+            || live_entry.lifecycle_xid != candidate_entry.lifecycle_xid
+            || live_entry.geometry.width != candidate_entry.geometry.width
+            || live_entry.geometry.height != candidate_entry.geometry.height
+            || live_entry.geometry.border_width != candidate_entry.geometry.border_width
+            || live_entry.depth != candidate_entry.depth
+            || live_entry.visual != candidate_entry.visual
+            || live_entry.class != candidate_entry.class
+            || live_entry.map_state != candidate_entry.map_state
+            || live_entry.override_redirect != candidate_entry.override_redirect
+            || live_entry.backend != candidate_entry.backend
+            || live_entry.visual_class != candidate_entry.visual_class
+            || live_entry.fullscreen != candidate_entry.fullscreen
+            || live_entry.shadow_eligible != candidate_entry.shadow_eligible
+            || live_entry.resolved_border_color != candidate_entry.resolved_border_color
+            || live_entry.resolved_opacity_bits != candidate_entry.resolved_opacity_bits
+            || live_entry.resolved_blur_request != candidate_entry.resolved_blur_request
+            || live_entry.stacking_index != candidate_entry.stacking_index
+            || !same_common_surface_order(&live.entries, &candidate.snapshot.entries)
+        {
+            return Ok(false);
+        }
+        let next_geometry = WindowGeometry {
+            x: update.x,
+            y: update.y,
+            width: update.width,
+            height: update.height,
+            border_width: update.border_width,
+        };
+        if !move_only_geometry_is_eligible(
+            &candidate_entry,
+            next_geometry,
+            self.root,
+            update.override_redirect,
+            candidate_entry.semantic_client_xid,
+        ) {
+            return Ok(false);
+        }
+        let previous_geometry = candidate_entry.geometry;
+        let previous_client_root = candidate_entry.client_root_geometry;
+        rebase_candidate_geometry_fields(&mut candidate.snapshot.entries[candidate_index], update);
+        let pixmap_index = candidate
+            .pixmaps
+            .iter()
+            .position(|pixmap| pixmap.surface_xid == update.surface_xid);
+        let previous_pixmap_geometry = pixmap_index.map(|index| candidate.pixmaps[index].window_geometry);
+        if let Some(index) = pixmap_index {
+            candidate.pixmaps[index].window_geometry = next_geometry;
+        }
+        let render_result = self.render_egl_scene(
+            &candidate.snapshot,
+            &candidate.egl_surfaces,
+            &candidate.pixmaps,
+        );
+        if let Err(error) = render_result {
+            candidate.snapshot.entries[candidate_index].geometry = previous_geometry;
+            candidate.snapshot.entries[candidate_index].client_root_geometry = previous_client_root;
+            if let (Some(index), Some(previous)) = (pixmap_index, previous_pixmap_geometry) {
+                candidate.pixmaps[index].window_geometry = previous;
+            }
+            return Err(error);
+        }
+        Ok(true)
     }
 
     fn commit_candidate(&mut self, candidate: SceneCandidate<'a>) -> Result<(), Box<dyn Error>> {
@@ -2335,6 +2543,7 @@ impl<'a> SceneSession<'a> {
         let old_damage_leases = std::mem::replace(&mut self.damage_leases, candidate.damage_leases);
         let mut old_egl_surfaces = std::mem::replace(&mut self.egl_surfaces, candidate.egl_surfaces);
         self.damage_registry = candidate.damage_registry;
+        self.ignored_configure_windows = candidate.ignored_configure_windows;
         self.snapshot = Some(snapshot);
         let live_clients = self
             .current_snapshot()
@@ -2415,6 +2624,12 @@ impl<'a> SceneSession<'a> {
             let present_enabled = self.present.is_some();
             let mut opportunity_msc = None;
             let mut batch = InvalidationBatch::default();
+            if let Some(update) = self.pending_move_geometry.take() {
+                batch.push(SceneInvalidation::Geometry(update.surface_xid));
+                batch.push_geometry_update(Some(update));
+                batch.geometry_ambiguous = self.pending_move_geometry_ambiguous;
+                self.pending_move_geometry_ambiguous = false;
+            }
             let pending = if present_enabled {
                 self.pending_damage.clone()
             } else {
@@ -2454,23 +2669,31 @@ impl<'a> SceneSession<'a> {
                     }
                 };
                 opportunity_msc = self.present_opportunity(&first);
+                let geometry_update = configure_geometry_update(&first, self.current_snapshot());
                 let visual_invalidation = self.maybe_update_visual_state(&first)?;
                 let invalidation = visual_invalidation.unwrap_or_else(|| {
                     self.classify_session_event(first, self.current_snapshot(), &self.damage_registry, &self.damage_registry)
                 });
-                self.observe_invalidation(invalidation);
+                if !matches!(invalidation, SceneInvalidation::Geometry(_)) {
+                    self.observe_invalidation(invalidation);
+                }
                 batch.push(invalidation);
+                batch.push_geometry_update(geometry_update);
                 for _ in 1..MAX_EVENTS_PER_BATCH {
                     let Some(event) = self.connection.inner.poll_for_event()? else {
                         break;
                     };
                     opportunity_msc = opportunity_msc.or_else(|| self.present_opportunity(&event));
+                    let geometry_update = configure_geometry_update(&event, self.current_snapshot());
                     let visual_invalidation = self.maybe_update_visual_state(&event)?;
                     let invalidation = visual_invalidation.unwrap_or_else(|| {
                         self.classify_session_event(event, self.current_snapshot(), &self.damage_registry, &self.damage_registry)
                     });
-                    self.observe_invalidation(invalidation);
+                    if !matches!(invalidation, SceneInvalidation::Geometry(_)) {
+                        self.observe_invalidation(invalidation);
+                    }
                     batch.push(invalidation);
+                    batch.push_geometry_update(geometry_update);
                 }
             }
             if self.signal.poll_shutdown_pending()? {
@@ -2478,6 +2701,7 @@ impl<'a> SceneSession<'a> {
                 return Ok(());
             }
             if present_enabled && opportunity_msc.is_none() {
+                self.defer_geometry(&batch);
                 self.pending_damage.extend(batch.pixel_damage().iter().copied());
                 continue;
             }
@@ -2497,7 +2721,21 @@ impl<'a> SceneSession<'a> {
                     println!("scene shutdown: {reason:?}");
                     return Ok(());
                 }
-                SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy => {
+                SceneInvalidation::Geometry(window) => {
+                    if self.try_move_only(window, batch.move_geometry(), &batch_pixel_damage)? {
+                        self.pending_damage.clear();
+                        self.pending_background = false;
+                        self.pending_visual_state = false;
+                        self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap()?;
+                    } else {
+                        self.observe_invalidation(SceneInvalidation::Geometry(window));
+                        self.pending_damage.clear();
+                        self.pending_background = false;
+                        self.refresh_background()?;
+                        self.rebuild_and_present()?;
+                    }
+                }
+                SceneInvalidation::Hierarchy => {
                     self.pending_damage.clear();
                     self.pending_background = false;
                     self.refresh_background()?;
@@ -2667,9 +2905,10 @@ impl<'a> SceneSession<'a> {
         if is_background_property_notify(&event, self.root, self.background_atoms) {
             SceneInvalidation::Background
         } else {
-            classify_event_with_registries(
+            classify_event_with_registries_and_ignored(
                 event, self.root, snapshot, self.ownership.as_ref(), current_registry,
                 candidate_registry,
+                &self.ignored_configure_windows,
             )
         }
     }
@@ -2880,6 +3119,109 @@ impl<'a> SceneSession<'a> {
             surfaces,
             pixmaps,
         )
+    }
+
+    fn try_move_only(
+        &mut self,
+        surface: Window,
+        geometry: Option<PendingGeometry>,
+        initial_damage: &HashSet<damage::Damage>,
+    ) -> Result<bool, Box<dyn Error>> {
+        if self.pending_background {
+            return Ok(false);
+        }
+        let Some(entry_index) = self
+            .current_snapshot()
+            .entries
+            .iter()
+            .position(|entry| entry.surface_xid == surface)
+        else {
+            return Ok(false);
+        };
+        let previous = self.current_snapshot().entries[entry_index].clone();
+        let Some(geometry) = geometry.filter(|geometry| geometry.surface_xid == surface) else {
+            return Ok(false);
+        };
+        let next_geometry = WindowGeometry {
+            x: geometry.x,
+            y: geometry.y,
+            width: geometry.width,
+            height: geometry.height,
+            border_width: geometry.border_width,
+        };
+        if !move_only_geometry_is_eligible(
+            &previous,
+            next_geometry,
+            self.root,
+            geometry.override_redirect,
+            previous.semantic_client_xid,
+        ) {
+            return Ok(false);
+        }
+
+        let mut next_client_root = previous.client_root_geometry;
+        if let (Some(client_root), Some(_client)) = (previous.client_root_geometry, previous.semantic_client_xid) {
+            next_client_root = Some(move_client_root_geometry(
+                client_root,
+                previous.geometry,
+                next_geometry,
+            ));
+        }
+
+        self.current_snapshot_mut().entries[entry_index].geometry = next_geometry;
+        self.current_snapshot_mut().entries[entry_index].client_root_geometry = next_client_root;
+        if let Some(pixmap) = self.pixmaps.iter_mut().find(|pixmap| pixmap.surface_xid == surface) {
+            pixmap.window_geometry = next_geometry;
+        }
+
+        let mut damage_to_subtract = initial_damage.clone();
+        let mut structural_event = false;
+        for _ in 0..MAX_EVENTS_PER_BATCH {
+            let Some(event) = self.connection.inner.poll_for_event()? else {
+                break;
+            };
+            let visual_invalidation = self.maybe_update_visual_state(&event)?;
+            let invalidation = visual_invalidation.unwrap_or_else(|| {
+                self.classify_session_event(
+                    event,
+                    self.current_snapshot(),
+                    &self.damage_registry,
+                    &self.damage_registry,
+                )
+            });
+            if !matches!(invalidation, SceneInvalidation::Geometry(_)) {
+                self.observe_invalidation(invalidation);
+            }
+            match invalidation {
+                SceneInvalidation::PixelDamage(damage_id) => {
+                    damage_to_subtract.insert(damage_id);
+                }
+                SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy => {
+                    structural_event = true;
+                }
+                _ => {}
+            }
+        }
+        if structural_event || self.signal.poll_shutdown_pending()? {
+            for damage_id in damage_to_subtract {
+                if self.damage_registry.contains_key(&damage_id) {
+                    self.damage_lease(damage_id)?.subtract()?;
+                }
+            }
+            self.current_snapshot_mut().entries[entry_index].geometry = previous.geometry;
+            self.current_snapshot_mut().entries[entry_index].client_root_geometry = previous.client_root_geometry;
+            if let Some(pixmap) = self.pixmaps.iter_mut().find(|pixmap| pixmap.surface_xid == surface) {
+                pixmap.window_geometry = previous.geometry;
+            }
+            return Ok(false);
+        }
+        self.full_recompose_current()?;
+        for damage_id in damage_to_subtract {
+            if self.damage_registry.contains_key(&damage_id) {
+                self.damage_lease(damage_id)?.subtract()?;
+            }
+        }
+        Ok(true)
     }
 
     fn current_snapshot(&self) -> &SceneSnapshot {
@@ -3862,6 +4204,7 @@ fn classify_event(
     )
 }
 
+#[cfg(test)]
 fn classify_event_with_registries(
     event: Event,
     root: Window,
@@ -3869,6 +4212,26 @@ fn classify_event_with_registries(
     ownership: Option<&CompositorOwnership>,
     current_registry: &HashMap<damage::Damage, Window>,
     candidate_registry: &HashMap<damage::Damage, Window>,
+) -> SceneInvalidation {
+    classify_event_with_registries_and_ignored(
+        event,
+        root,
+        snapshot,
+        ownership,
+        current_registry,
+        candidate_registry,
+        &HashSet::new(),
+    )
+}
+
+fn classify_event_with_registries_and_ignored(
+    event: Event,
+    root: Window,
+    snapshot: &SceneSnapshot,
+    ownership: Option<&CompositorOwnership>,
+    current_registry: &HashMap<damage::Damage, Window>,
+    candidate_registry: &HashMap<damage::Damage, Window>,
+    ignored_configure_windows: &HashSet<Window>,
 ) -> SceneInvalidation {
     match event {
         Event::SelectionClear(event)
@@ -3887,7 +4250,19 @@ fn classify_event_with_registries(
         {
             SceneInvalidation::Geometry(event.window)
         }
-        Event::ConfigureNotify(_) => SceneInvalidation::Hierarchy,
+        Event::ConfigureNotify(event) => {
+            if let Some(entry) = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.semantic_client_xid == Some(event.window))
+            {
+                SceneInvalidation::Geometry(entry.surface_xid)
+            } else if ignored_configure_windows.contains(&event.window) {
+                SceneInvalidation::Ignore
+            } else {
+                SceneInvalidation::Hierarchy
+            }
+        }
         Event::DamageNotify(event)
             if current_registry.contains_key(&event.damage)
                 || candidate_registry.contains_key(&event.damage) =>
@@ -3903,6 +4278,63 @@ fn classify_event_with_registries(
         Event::SelectionClear(_) => SceneInvalidation::Ignore,
         _ => SceneInvalidation::Ignore,
     }
+}
+
+fn move_only_geometry_is_eligible(
+    entry: &SurfaceEntry,
+    next_geometry: WindowGeometry,
+    expected_root: Window,
+    next_override_redirect: bool,
+    next_semantic_client: Option<Window>,
+) -> bool {
+    entry.geometry.width == next_geometry.width
+        && entry.geometry.height == next_geometry.height
+        && entry.geometry.border_width == next_geometry.border_width
+        && (entry.geometry.x != next_geometry.x || entry.geometry.y != next_geometry.y)
+        && entry.override_redirect == next_override_redirect
+        && entry.semantic_client_xid == next_semantic_client
+        && expected_root != x11rb::NONE
+}
+
+fn move_client_root_geometry(
+    client_root: ClientRootGeometry,
+    previous: WindowGeometry,
+    next: WindowGeometry,
+) -> ClientRootGeometry {
+    ClientRootGeometry {
+        root_x: client_root.root_x + i32::from(next.x) - i32::from(previous.x),
+        root_y: client_root.root_y + i32::from(next.y) - i32::from(previous.y),
+        width: client_root.width,
+        height: client_root.height,
+    }
+}
+
+fn rebase_candidate_geometry_fields(entry: &mut SurfaceEntry, update: PendingGeometry) {
+    let next_geometry = WindowGeometry {
+        x: update.x,
+        y: update.y,
+        width: update.width,
+        height: update.height,
+        border_width: update.border_width,
+    };
+    entry.client_root_geometry = entry
+        .client_root_geometry
+        .map(|client_root| move_client_root_geometry(client_root, entry.geometry, next_geometry));
+    entry.geometry = next_geometry;
+}
+
+fn same_common_surface_order(left: &[SurfaceEntry], right: &[SurfaceEntry]) -> bool {
+    let right_ids = right.iter().map(|entry| entry.surface_xid).collect::<HashSet<_>>();
+    let left_ids = left.iter().map(|entry| entry.surface_xid).collect::<HashSet<_>>();
+    let left_common = left
+        .iter()
+        .filter(|entry| right_ids.contains(&entry.surface_xid))
+        .map(|entry| entry.surface_xid);
+    let right_common = right
+        .iter()
+        .filter(|entry| left_ids.contains(&entry.surface_xid))
+        .map(|entry| entry.surface_xid);
+    left_common.eq(right_common)
 }
 
 fn observe_structural_generation(generation: &mut u64, invalidation: SceneInvalidation) {
@@ -4081,6 +4513,10 @@ mod tests {
         ClientRootGeometry, client_root_geometry_from_translation,
         region_request_requires_client_origin, translate_coordinates_reply_error,
         RootRect, intersect_root_rect, plan_region_backdrop,
+        move_only_geometry_is_eligible,
+        move_client_root_geometry, PendingGeometry,
+        rebase_candidate_geometry_fields, same_common_surface_order,
+        configure_geometry_update, classify_event_with_registries_and_ignored,
     };
     use crate::x11::capture::WindowGeometry;
     use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
@@ -4779,6 +5215,66 @@ mod tests {
                 SceneInvalidation::Hierarchy
             );
         }
+    }
+
+    #[test]
+    fn semantic_client_configure_is_geometry_for_its_canonical_surface() {
+        let mut entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        entry.geometry = window(10, 12, 20, 15, 0);
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: root(),
+            entries: vec![entry],
+        };
+        let configure = xproto::ConfigureNotifyEvent {
+            response_type: 0, sequence: 0, event: 1, window: 20,
+            above_sibling: 0, x: 10, y: 12, width: 20, height: 15,
+            border_width: 0, override_redirect: false,
+        };
+        assert_eq!(
+            classify_event_with_registries_and_ignored(
+                Event::ConfigureNotify(configure), 1, &snapshot, None,
+                &HashMap::new(), &HashMap::new(), &HashSet::new(),
+            ),
+            SceneInvalidation::Geometry(10)
+        );
+    }
+
+    #[test]
+    fn known_non_renderable_configure_is_ignored_but_unknown_remains_hierarchy() {
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: Vec::new() };
+        let configure = |window| Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 0, sequence: 0, event: 1, window,
+            above_sibling: 0, x: 0, y: 0, width: 10, height: 10,
+            border_width: 0, override_redirect: true,
+        });
+        let ignored = HashSet::from([20]);
+        assert_eq!(
+            classify_event_with_registries_and_ignored(
+                configure(20), 1, &snapshot, None,
+                &HashMap::new(), &HashMap::new(), &ignored,
+            ),
+            SceneInvalidation::Ignore
+        );
+        assert_eq!(
+            classify_event_with_registries_and_ignored(
+                configure(21), 1, &snapshot, None,
+                &HashMap::new(), &HashMap::new(), &ignored,
+            ),
+            SceneInvalidation::Hierarchy
+        );
+    }
+
+    #[test]
+    fn semantic_client_configure_does_not_supply_surface_geometry_update() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
+        let configure = xproto::ConfigureNotifyEvent {
+            response_type: 0, sequence: 0, event: 1, window: 20,
+            above_sibling: 0, x: 0, y: 0, width: 20, height: 15,
+            border_width: 0, override_redirect: false,
+        };
+        assert!(configure_geometry_update(&Event::ConfigureNotify(configure), &snapshot).is_none());
     }
 
     #[test]
@@ -6796,4 +7292,126 @@ mod tests {
         assert_eq!(plan.corner_radius, 0.0);
         assert_eq!(plan.border_width, 0.0);
     }
+
+    #[test]
+    fn move_only_accepts_same_surface_metadata_with_only_position_changed() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        assert!(move_only_geometry_is_eligible(
+            &entry,
+            window(17, 23, 20, 20, 0),
+            1,
+            false,
+            Some(20),
+        ));
+    }
+
+    #[test]
+    fn move_only_rejects_resize_and_identity_or_lifecycle_changes() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let moved = window(17, 23, 20, 20, 0);
+        let rejected = [
+            (window(17, 23, 21, 20, 0), false, Some(20), 1),
+            (moved, true, Some(20), 1),
+            (moved, false, None, 1),
+            (moved, false, Some(20), 0),
+        ];
+        for (geometry, override_redirect, semantic, expected_root) in rejected {
+            assert!(!move_only_geometry_is_eligible(
+                &entry, geometry, expected_root,
+                override_redirect, semantic,
+            ));
+        }
+    }
+
+    #[test]
+    fn move_only_fast_path_contains_no_resource_acquisition() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn try_move_only(").expect("move-only helper exists");
+        let end = start + source[start..].find("\n    fn current_snapshot(").expect("move-only helper ends");
+        let body = &source[start..end];
+        for forbidden in ["DamageLease::acquire", "NamedSurfacePixmap::acquire", "import_pixmap"] {
+            assert!(!body.contains(forbidden), "move-only path must not acquire {forbidden}");
+        }
+    }
+
+    #[test]
+    fn move_batch_retains_latest_geometry_and_rejects_ambiguity() {
+        let first = PendingGeometry { surface_xid: 10, x: 1, y: 2, width: 20, height: 20, border_width: 0, override_redirect: false };
+        let latest = PendingGeometry { x: 8, y: 9, ..first };
+        let other = PendingGeometry { surface_xid: 11, ..latest };
+        let mut batch = InvalidationBatch::default();
+        batch.push(SceneInvalidation::Geometry(10));
+        batch.push_geometry_update(Some(first));
+        batch.push(SceneInvalidation::Geometry(10));
+        batch.push_geometry_update(Some(latest));
+        assert_eq!(batch.move_geometry(), Some(latest));
+        batch.push(SceneInvalidation::Geometry(11));
+        batch.push_geometry_update(Some(other));
+        assert_eq!(batch.move_geometry(), None);
+    }
+
+    #[test]
+    fn move_only_client_root_follows_surface_delta_and_preserves_bounds() {
+        let root = ClientRootGeometry { root_x: 100, root_y: 200, width: 800, height: 600 };
+        let moved = move_client_root_geometry(root, window(10, 20, 30, 40, 0), window(17, 13, 30, 40, 0));
+        assert_eq!(moved, ClientRootGeometry { root_x: 107, root_y: 193, width: 800, height: 600 });
+    }
+
+    #[test]
+    fn candidate_pure_move_rebase_updates_only_root_geometry_and_client_origin() {
+        let mut entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        entry.client_root_geometry = Some(ClientRootGeometry { root_x: 30, root_y: 40, width: 20, height: 20 });
+        let update = PendingGeometry { surface_xid: 10, x: 17, y: 23, width: 20, height: 20, border_width: 0, override_redirect: false };
+        let immutable = (entry.depth, entry.visual, entry.semantic_client_xid, entry.resolved_blur_request.clone());
+        rebase_candidate_geometry_fields(&mut entry, update);
+        assert_eq!(entry.geometry, window(17, 23, 20, 20, 0));
+        assert_eq!(entry.client_root_geometry, Some(ClientRootGeometry { root_x: 47, root_y: 63, width: 20, height: 20 }));
+        assert_eq!((entry.depth, entry.visual, entry.semantic_client_xid, entry.resolved_blur_request), immutable);
+    }
+
+    #[test]
+    fn candidate_rebase_rejects_resize_by_the_existing_move_predicate() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let resize = PendingGeometry { surface_xid: 10, x: 17, y: 23, width: 21, height: 20, border_width: 0, override_redirect: false };
+        assert!(!move_only_geometry_is_eligible(&entry, window(resize.x, resize.y, resize.width, resize.height, resize.border_width), 1, resize.override_redirect, entry.semantic_client_xid));
+    }
+
+    #[test]
+    fn candidate_rebase_preserves_relative_order_of_common_surfaces() {
+        let first = visibility_test_entry(window(10, 10, 20, 20, 0), false);
+        let mut second = first.clone();
+        second.surface_xid = 11;
+        let mut inserted = first.clone();
+        inserted.surface_xid = 12;
+        assert!(same_common_surface_order(&[first.clone(), second.clone()], &[inserted, first.clone(), second.clone()]));
+        assert!(!same_common_surface_order(&[first.clone(), second.clone()], &[second, first]));
+    }
+
+    #[test]
+    fn candidate_rebase_is_bounded_and_keeps_lifecycle_gate() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn pre_commit_gate(").expect("pre-commit gate exists");
+        let end = start + source[start..].find("\n    fn commit_candidate(").expect("pre-commit gate ends");
+        let body = &source[start..end];
+        assert!(body.contains("rebase_candidate_pure_move"));
+        assert!(body.contains("!batch.hierarchy"));
+        assert!(body.contains("!batch.background"));
+        assert!(body.contains("!batch.visual_state"));
+        assert!(body.contains("bounded_batch_requires_retry(drained)"));
+        assert!(body.contains("attempted_structural_generation = self.structural_generation"));
+        assert!(body.contains("batch.push_geometry_update(geometry_update)"));
+        assert_eq!(MAX_CANDIDATE_RETRIES, 1);
+    }
+
+    #[test]
+    fn move_only_fast_path_has_zero_validation_queries() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn try_move_only(").expect("move-only helper exists");
+        let end = start + source[start..].find("\n    fn current_snapshot(").expect("move-only helper ends");
+        let body = &source[start..end];
+        for forbidden in ["get_geometry", "get_window_attributes", "get_input_focus", "verify_ownership", "translate_coordinates"] {
+            assert!(!body.contains(forbidden), "move-only path must not call {forbidden}");
+        }
+    }
+
 }
