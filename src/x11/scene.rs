@@ -2,6 +2,8 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ReplyError;
@@ -29,6 +31,1039 @@ use super::shutdown::{wait_for_event_or_shutdown, SignalWake, WaitResult};
 use super::tree::{BindingStatus, HierarchySnapshot};
 
 const BACKGROUND_BLUR_RADIUS_PX: f32 = 12.0;
+const MAX_DIAGNOSTIC_PENDING_DAMAGE: usize = 256;
+const MAX_SURFACE_DIAGNOSTICS: usize = 32;
+const RECENT_MOVE_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizeOnlyDirection {
+    Grow,
+    Shrink,
+    Mixed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeometryEventSource { CanonicalSurface, SemanticClient, Other, Unknown }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum StructuralOrigin { NormalLifecycle, Hierarchy, GeometrySurface, GeometrySemanticClient, GeometryNoPending, Other }
+
+#[derive(Default)]
+struct TimingMetric {
+    samples: u64,
+    total_us: u128,
+    max_us: u128,
+}
+
+#[derive(Default)]
+struct ResizeOnlyFallbackReasons {
+    unavailable_state: u64,
+    identity_mismatch: u64,
+    no_size_change: u64,
+    geometry_superseded: u64,
+    unsupported_visual: u64,
+    missing_damage: u64,
+    precommit_rejected: u64,
+    hierarchy: u64,
+}
+
+impl ResizeOnlyFallbackReasons {
+    fn record(&mut self, reason: ResizeOnlyFallbackReason) {
+        match reason {
+            ResizeOnlyFallbackReason::UnavailableState => self.unavailable_state += 1,
+            ResizeOnlyFallbackReason::IdentityMismatch => self.identity_mismatch += 1,
+            ResizeOnlyFallbackReason::NoSizeChange => self.no_size_change += 1,
+            ResizeOnlyFallbackReason::GeometrySuperseded => self.geometry_superseded += 1,
+            ResizeOnlyFallbackReason::UnsupportedVisual => self.unsupported_visual += 1,
+            ResizeOnlyFallbackReason::MissingDamage => self.missing_damage += 1,
+            ResizeOnlyFallbackReason::PrecommitRejected => self.precommit_rejected += 1,
+            ResizeOnlyFallbackReason::Hierarchy => self.hierarchy += 1,
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.unavailable_state
+            + self.identity_mismatch
+            + self.no_size_change
+            + self.geometry_superseded
+            + self.unsupported_visual
+            + self.missing_damage
+            + self.precommit_rejected
+            + self.hierarchy
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResizeOnlyFallbackReason {
+    UnavailableState,
+    IdentityMismatch,
+    NoSizeChange,
+    GeometrySuperseded,
+    UnsupportedVisual,
+    MissingDamage,
+    PrecommitRejected,
+    Hierarchy,
+}
+
+impl TimingMetric {
+    fn record(&mut self, elapsed: Duration) {
+        let micros = elapsed.as_micros();
+        self.samples += 1;
+        self.total_us += micros;
+        self.max_us = self.max_us.max(micros);
+    }
+
+    fn merge(&mut self, other: TimingMetric) {
+        self.samples += other.samples;
+        self.total_us += other.total_us;
+        self.max_us = self.max_us.max(other.max_us);
+    }
+}
+
+#[derive(Default)]
+struct ResizeOnlyDirectionDiagnostics {
+    attempted: u64,
+    success: u64,
+    fallback: u64,
+    hierarchy_abort: u64,
+    move_resize_attempted: u64,
+    move_resize_success: u64,
+    total: TimingMetric,
+    pre_acquire: TimingMetric,
+    damage: TimingMetric,
+    name_pixmap: TimingMetric,
+    pixmap_get_geometry: TimingMetric,
+    egl_import: TimingMetric,
+    target_build_render: TimingMetric,
+    precommit: TimingMetric,
+    publish: TimingMetric,
+    resource_blocking: TimingMetric,
+    fallback_reasons: ResizeOnlyFallbackReasons,
+    fallback_move_resize: u64,
+    fallback_to_structural: u64,
+    fallback_full_snapshot: u64,
+    structural_candidates_started: u64,
+    structural_total: TimingMetric,
+    structural_full_snapshot: TimingMetric,
+    structural_stale: u64,
+    structural_published: u64,
+    structural_retry: u64,
+}
+
+#[derive(Default)]
+struct SurfaceDiagnostic3a3f8b4c {
+    surface_xid: Window,
+    semantic_client_xid: Option<Window>,
+    first_damage_id: Option<damage::Damage>,
+    current_damage_id: Option<damage::Damage>,
+    damage_id_changes: u64,
+    damage_notify_arrivals: u64,
+    unique_damage_obligations: u64,
+    damage_subtracts: u64,
+    damage_dispatches: u64,
+    damage_pending_samples: u64,
+    damage_pending_total_us: u128,
+    damage_pending_max_us: u128,
+    last_damage_notify_timestamp: Option<Instant>,
+    damage_notify_gap_samples: u64,
+    damage_notify_gap_total_us: u128,
+    damage_notify_gap_max_us: u128,
+    moveonly_count: u64,
+    last_moveonly_timestamp: Option<Instant>,
+    damage_arrivals_before_first_move: u64,
+    damage_arrivals_after_first_move: u64,
+    damage_arrivals_within_2s_after_move: u64,
+    damage_gap_max_before_move_us: u128,
+    damage_gap_max_after_move_us: u128,
+    damage_gap_max_within_2s_after_move_us: u128,
+}
+
+impl SurfaceDiagnostic3a3f8b4c {
+    fn observe_identity(&mut self, surface_xid: Window, semantic_client_xid: Option<Window>, damage_id: damage::Damage) {
+        self.surface_xid = surface_xid;
+        if semantic_client_xid.is_some() { self.semantic_client_xid = semantic_client_xid; }
+        match self.current_damage_id {
+            None => {
+                self.first_damage_id = Some(damage_id);
+                self.current_damage_id = Some(damage_id);
+            }
+            Some(current) if current != damage_id => {
+                self.damage_id_changes += 1;
+                self.current_damage_id = Some(damage_id);
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+struct GeometryPresentHistory {
+    ever_deferred: bool,
+    deferrals: u8,
+    updated_while_deferred: bool,
+    superseded_while_deferred: bool,
+}
+
+impl GeometryPresentHistory {
+    fn deferred(mut self) -> Self {
+        self.ever_deferred = true;
+        self.deferrals = self.deferrals.saturating_add(1).min(8);
+        self
+    }
+}
+
+#[derive(Default)]
+struct Diagnostics3a3f8b3a {
+    enabled: bool,
+    configure_seen: u64,
+    configure_move_like: u64,
+    configure_resize_like: u64,
+    configure_other: u64,
+    configure_superseded: u64,
+    geometry_dispatches: u64,
+    moveonly_attempted: u64,
+    moveonly_success: u64,
+    moveonly_fallback: u64,
+    resize_geometry_dispatches: u64,
+    geometry_dispatches_while_damage_pending: u64,
+    max_geometry_dispatches_before_pending_damage_service: u64,
+    consecutive_geometry_while_damage_pending: u64,
+    pixel_damage_arrivals: u64,
+    pixel_damage_coalesced_notifications: u64,
+    pixel_damage_dispatches: u64,
+    pixel_damage_dispatch_while_geometry_pending: u64,
+    pixel_damage_deferred_by_geometry: u64,
+    pixel_damage_wait_max_us: u128,
+    pixel_damage_wait_total_us: u128,
+    pixel_damage_wait_samples: u64,
+    pixel_damage_wait_le_1ms: u64,
+    pixel_damage_wait_1_4ms: u64,
+    pixel_damage_wait_4_8ms: u64,
+    pixel_damage_wait_8_16ms: u64,
+    pixel_damage_wait_16_33ms: u64,
+    pixel_damage_wait_33_50ms: u64,
+    pixel_damage_wait_50_100ms: u64,
+    pixel_damage_wait_gt100ms: u64,
+    event_batches: u64,
+    event_batches_with_geometry: u64,
+    event_batches_with_pixel_damage_arrival: u64,
+    event_batches_ended_with_pixel_damage_pending: u64,
+    max_batches_damage_remained_pending: u64,
+    recompositions: u64,
+    recompositions_after_geometry: u64,
+    recompositions_after_pixel_damage: u64,
+    present_submissions: u64,
+    present_completion_events: u64,
+    structural_candidates_started: u64,
+    structural_candidates_published: u64,
+    structural_candidates_stale: u64,
+    structural_candidates_failed: u64,
+    resize_candidate_started: u64,
+    resize_candidate_stale: u64,
+    resize_candidate_published: u64,
+    resize_candidate_failed: u64,
+    distinct_resize_states_dispatched: u64,
+    resized_target_bundle_acquisitions: u64,
+    resized_target_damage_acquisitions: u64,
+    resized_target_named_pixmap_acquisitions: u64,
+    resized_target_egl_imports: u64,
+    resized_target_bundle_acquisition_then_candidate_stale: u64,
+    resource_bundles_reused: u64,
+    resource_bundles_new: u64,
+    resizeonly_attempted: u64,
+    resizeonly_success: u64,
+    resizeonly_fallback: u64,
+    resizeonly_superseded_before_acquisition: u64,
+    resizeonly_full_snapshot_avoided: u64,
+    resizeonly_hierarchy_abort: u64,
+    resizeonly_target_damage_reused: u64,
+    resizeonly_target_damage_created: u64,
+    resizeonly_target_damage_id_changed: u64,
+    resizeonly_publish_with_damage_pending: u64,
+    resizeonly_fallback_early_unclassified: u64,
+    resizeonly_grow: ResizeOnlyDirectionDiagnostics,
+    resizeonly_shrink: ResizeOnlyDirectionDiagnostics,
+    resizeonly_mixed: ResizeOnlyDirectionDiagnostics,
+    resizeonly_fallback_origin: Option<(ResizeOnlyDirection, bool)>,
+    resizeonly_structural_direction: Option<ResizeOnlyDirection>,
+    resizeonly_structural_timing: Option<(ResizeOnlyDirection, Instant)>,
+    pending_since: HashMap<damage::Damage, Instant>,
+    last_resize_geometry: Option<(Window, u16, u16, u16)>,
+    batches_with_damage_pending: u64,
+    last_candidate_resize: bool,
+    surface_diagnostics: Vec<SurfaceDiagnostic3a3f8b4c>,
+    configure_from_surface: u64,
+    configure_from_semantic_client: u64,
+    configure_from_other: u64,
+    configure_from_unknown: u64,
+    semantic_client_resolved_to_surface: u64,
+    semantic_client_geometry_update_rejected: u64,
+    semantic_client_without_surface_pending_geometry: u64,
+    surface_geometry_update_accepted: u64,
+    surface_geometry_update_rejected: u64,
+    pending_geometry_created: u64,
+    pending_geometry_updated: u64,
+    pending_geometry_superseded: u64,
+    pending_geometry_missing_at_dispatch: u64,
+    pending_geometry_surface_match: u64,
+    pending_geometry_surface_mismatch: u64,
+    resize_dispatch_total: u64,
+    resize_dispatch_resizeonly_selected: u64,
+    resize_dispatch_structural_selected: u64,
+    resize_dispatch_deferred: u64,
+    resize_dispatch_hierarchy_dominated: u64,
+    resize_dispatch_no_pending_geometry: u64,
+    resize_dispatch_other_source_reason: u64,
+    resize_dispatch_unknown: u64,
+    resizeonly_pre_attempt_bypass_total: u64,
+    resizeonly_pre_attempt_bypass_no_present_complete: u64,
+    resizeonly_pre_attempt_bypass_hierarchy_priority: u64,
+    resizeonly_pre_attempt_bypass_no_pending_geometry: u64,
+    resizeonly_pre_attempt_bypass_semantic_client_no_surface_pending_geometry: u64,
+    resizeonly_pre_attempt_bypass_pending_geometry_other_surface: u64,
+    resizeonly_pre_attempt_bypass_no_size_or_border_change: u64,
+    resizeonly_pre_attempt_bypass_ambiguous_or_superseded: u64,
+    resizeonly_pre_attempt_bypass_structural_already_required: u64,
+    resizeonly_pre_attempt_bypass_other: u64,
+    resizeonly_pre_attempt_bypass_direction_unknown: u64,
+    resizeonly_grow_pre_attempt_bypass: u64,
+    resizeonly_shrink_pre_attempt_bypass: u64,
+    resizeonly_mixed_pre_attempt_bypass: u64,
+    resizeonly_direction_unknown_bypass: u64,
+    pre_resizeonly_bypass_move_resize: u64,
+    structural_origin_normal: u64,
+    structural_origin_hierarchy: u64,
+    structural_origin_geometry_surface: u64,
+    structural_origin_geometry_semantic_client: u64,
+    structural_origin_geometry_no_pending: u64,
+    structural_origin_other: u64,
+    stale_geometry_from_surface_configure: u64,
+    stale_geometry_from_semantic_client_configure: u64,
+    stale_geometry_without_pending_geometry: u64,
+    stale_geometry_retry: u64,
+    stale_geometry_deferred: u64,
+    snapshot_geometry_surface: u64,
+    snapshot_geometry_semantic_client: u64,
+    snapshot_geometry_no_pending: u64,
+    snapshot_hierarchy: u64,
+    snapshot_other: u64,
+    structural_origin: Option<StructuralOrigin>,
+    geometry_scheduling_batches_total: u64,
+    geometry_scheduling_present_deferred: u64,
+    geometry_scheduling_hierarchy_dominated: u64,
+    geometry_pending_ever_present_deferred: u64,
+    geometry_pending_present_deferred_once: u64,
+    geometry_pending_present_deferred_multiple: u64,
+    geometry_pending_updated_while_present_deferred: u64,
+    geometry_pending_superseded_while_present_deferred: u64,
+    final_resize_was_present_deferred: u64,
+    final_resize_never_present_deferred: u64,
+    final_resize_deferrals_0: u64,
+    final_resize_deferrals_1: u64,
+    final_resize_deferrals_2_3: u64,
+    final_resize_deferrals_4_7: u64,
+    final_resize_deferrals_8_plus: u64,
+    grow_after_present_defer: u64,
+    grow_without_present_defer: u64,
+    shrink_after_present_defer: u64,
+    shrink_without_present_defer: u64,
+    mixed_after_present_defer: u64,
+    mixed_without_present_defer: u64,
+    move_resize_after_present_defer: u64,
+    move_resize_without_present_defer: u64,
+    resizeonly_selected_after_present_defer: u64,
+    resizeonly_selected_without_present_defer: u64,
+    structural_selected_after_present_defer: u64,
+    structural_selected_without_present_defer: u64,
+    structural_publish_without_present_defer: u64,
+    resizeonly_success_after_present_defer: u64,
+    resizeonly_success_without_present_defer: u64,
+    resizeonly_fallback_after_present_defer: u64,
+    resizeonly_fallback_without_present_defer: u64,
+    precommit_rejected_after_present_defer: u64,
+    precommit_rejected_without_present_defer: u64,
+    resizeonly_structural_present_deferred: Option<bool>,
+    resizeonly_present_deferred: Option<bool>,
+    structural_stale_after_present_defer: u64,
+    structural_stale_without_present_defer: u64,
+    structural_publish_after_present_defer: u64,
+    geometry_retry_after_present_defer: u64,
+    geometry_retry_without_present_defer: u64,
+    geometry_deferred_rebuild_after_present_defer: u64,
+    geometry_deferred_rebuild_without_present_defer: u64,
+    hierarchy_event_total: u64,
+    hierarchy_event_unknown_configure: u64,
+    hierarchy_event_create: u64,
+    hierarchy_event_map: u64,
+    hierarchy_event_unmap: u64,
+    hierarchy_event_destroy: u64,
+    hierarchy_event_reparent: u64,
+    hierarchy_event_circulate: u64,
+    hierarchy_decision_total: u64,
+    hierarchy_decision_only_unknown_configure: u64,
+    hierarchy_decision_only_create: u64,
+    hierarchy_decision_only_map: u64,
+    hierarchy_decision_only_unmap: u64,
+    hierarchy_decision_only_destroy: u64,
+    hierarchy_decision_only_reparent: u64,
+    hierarchy_decision_only_circulate: u64,
+    hierarchy_decision_multi_source: u64,
+    hierarchy_decision_existing_merge: u64,
+    unknown_configure_internal: u64,
+    unknown_configure_unresolved: u64,
+    hierarchy_from_internal_window: u64,
+    hierarchy_event_target_surface: u64,
+    hierarchy_event_target_semantic_client: u64,
+    hierarchy_event_other_tracked_surface: u64,
+    hierarchy_event_other_semantic_client: u64,
+    hierarchy_event_unknown_window: u64,
+    hierarchy_decision_with_geometry_pending: u64,
+    hierarchy_decision_cleared_pending_geometry: u64,
+    hierarchy_selected_while_resize_geometry_pending: u64,
+    hierarchy_won_over_grow: u64,
+    hierarchy_won_over_shrink: u64,
+    hierarchy_won_over_mixed: u64,
+    snapshot_hierarchy_unknown_configure: u64,
+    snapshot_hierarchy_lifecycle: u64,
+    snapshot_hierarchy_reparent: u64,
+    snapshot_hierarchy_circulate: u64,
+    snapshot_hierarchy_multi_source: u64,
+    hierarchy_unknown_configure_candidate_stale_geometry: u64,
+    hierarchy_lifecycle_candidate_stale_geometry: u64,
+    hierarchy_reparent_candidate_stale_geometry: u64,
+    hierarchy_circulate_candidate_stale_geometry: u64,
+    hierarchy_multi_candidate_stale_geometry: u64,
+    hierarchy_unknown_configure_retry: u64,
+    hierarchy_lifecycle_retry: u64,
+    hierarchy_reparent_retry: u64,
+    hierarchy_circulate_retry: u64,
+    hierarchy_multi_retry: u64,
+    hierarchy_unknown_configure_deferred: u64,
+    hierarchy_lifecycle_deferred: u64,
+    hierarchy_reparent_deferred: u64,
+    hierarchy_circulate_deferred: u64,
+    hierarchy_multi_deferred: u64,
+    hierarchy_source_bits: u16,
+    compound_hierarchy_geometry_observed: u64,
+    compound_rebase_attempted: u64,
+    compound_rebase_success: u64,
+    compound_rebase_rejected_lifecycle: u64,
+    compound_rebase_rejected_scene_membership: u64,
+    compound_rebase_rejected_newer_hierarchy: u64,
+    compound_rebase_superseded_geometry: u64,
+    compound_rebase_damage_reused: u64,
+    compound_rebase_named_pixmap_reacquired: u64,
+    compound_rebase_egl_reacquired: u64,
+    compound_rebase_avoided_full_retry: u64,
+}
+
+impl Diagnostics3a3f8b3a {
+    fn from_environment() -> Self {
+        Self { enabled: std::env::var_os("XOMPOSITE_3A3F8B3A_DIAG").is_some(), ..Self::default() }
+    }
+
+    fn record_configure(&mut self, event: &Event, snapshot: &SceneSnapshot) {
+        if !self.enabled { return; }
+        let Event::ConfigureNotify(event) = event else { return; };
+        self.configure_seen += 1;
+        match snapshot.entries.iter().find(|entry| entry.surface_xid == event.window) {
+            Some(entry) if entry.geometry.width == event.width && entry.geometry.height == event.height
+                && entry.geometry.border_width == event.border_width => self.configure_move_like += 1,
+            Some(_) => {
+                self.configure_resize_like += 1;
+                let state = (event.window, event.width, event.height, event.border_width);
+                if self.last_resize_geometry != Some(state) { self.distinct_resize_states_dispatched += 1; }
+                self.last_resize_geometry = Some(state);
+            }
+            None => self.configure_other += 1,
+        }
+    }
+
+    fn record_geometry_source(&mut self, source: GeometryEventSource) {
+        if !self.enabled { return; }
+        match source {
+            GeometryEventSource::CanonicalSurface => self.configure_from_surface += 1,
+            GeometryEventSource::SemanticClient => { self.configure_from_semantic_client += 1; self.semantic_client_resolved_to_surface += 1; }
+            GeometryEventSource::Other => self.configure_from_other += 1,
+            GeometryEventSource::Unknown => self.configure_from_unknown += 1,
+        }
+    }
+
+    fn record_geometry_rejected(&mut self, source: GeometryEventSource) {
+        if !self.enabled { return; }
+        match source {
+            GeometryEventSource::CanonicalSurface => self.surface_geometry_update_rejected += 1,
+            GeometryEventSource::SemanticClient => {
+                self.semantic_client_geometry_update_rejected += 1;
+                self.semantic_client_without_surface_pending_geometry += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn record_pending_geometry(&mut self, source: GeometryEventSource, had_pending: bool, same_surface: bool) {
+        if !self.enabled { return; }
+        if had_pending { self.pending_geometry_updated += 1; self.pending_geometry_superseded += 1; }
+        else { self.pending_geometry_created += 1; }
+        if same_surface { self.pending_geometry_surface_match += 1; }
+        else { self.pending_geometry_surface_mismatch += 1; }
+        if matches!(source, GeometryEventSource::CanonicalSurface) { self.surface_geometry_update_accepted += 1; }
+    }
+
+    fn record_resize_dispatch(&mut self, source: GeometryEventSource, structural: bool) {
+        if !self.enabled { return; }
+        self.resize_dispatch_total += 1;
+        if structural { self.resize_dispatch_structural_selected += 1; }
+        else { self.resize_dispatch_resizeonly_selected += 1; }
+        match source { GeometryEventSource::Unknown => self.resize_dispatch_unknown += 1, GeometryEventSource::Other => self.resize_dispatch_other_source_reason += 1, _ => {} }
+    }
+
+    fn record_pre_attempt_bypass(&mut self, source: GeometryEventSource, reason: PreResizeOnlyBypassReason, direction: Option<ResizeOnlyDirection>, move_resize: bool) {
+        if !self.enabled { return; }
+        self.resizeonly_pre_attempt_bypass_total += 1;
+        match reason {
+            PreResizeOnlyBypassReason::NoPresentComplete => self.resizeonly_pre_attempt_bypass_no_present_complete += 1,
+            PreResizeOnlyBypassReason::HierarchyPriority => self.resizeonly_pre_attempt_bypass_hierarchy_priority += 1,
+            PreResizeOnlyBypassReason::NoPendingGeometry => self.resizeonly_pre_attempt_bypass_no_pending_geometry += 1,
+            PreResizeOnlyBypassReason::SemanticClientNoSurfacePendingGeometry => self.resizeonly_pre_attempt_bypass_semantic_client_no_surface_pending_geometry += 1,
+            PreResizeOnlyBypassReason::PendingGeometryOtherSurface => self.resizeonly_pre_attempt_bypass_pending_geometry_other_surface += 1,
+            PreResizeOnlyBypassReason::NoSizeOrBorderChange => self.resizeonly_pre_attempt_bypass_no_size_or_border_change += 1,
+            PreResizeOnlyBypassReason::AmbiguousOrSuperseded => self.resizeonly_pre_attempt_bypass_ambiguous_or_superseded += 1,
+            PreResizeOnlyBypassReason::StructuralAlreadyRequired => self.resizeonly_pre_attempt_bypass_structural_already_required += 1,
+            PreResizeOnlyBypassReason::Other => self.resizeonly_pre_attempt_bypass_other += 1,
+            PreResizeOnlyBypassReason::DirectionUnknown => self.resizeonly_pre_attempt_bypass_direction_unknown += 1,
+        }
+        match direction { Some(ResizeOnlyDirection::Grow) => self.resizeonly_grow_pre_attempt_bypass += 1, Some(ResizeOnlyDirection::Shrink) => self.resizeonly_shrink_pre_attempt_bypass += 1, Some(ResizeOnlyDirection::Mixed) => self.resizeonly_mixed_pre_attempt_bypass += 1, None => self.resizeonly_direction_unknown_bypass += 1 }
+        if move_resize { self.pre_resizeonly_bypass_move_resize += 1; }
+        if matches!(source, GeometryEventSource::SemanticClient) { self.semantic_client_geometry_update_rejected += 1; self.semantic_client_without_surface_pending_geometry += 1; }
+    }
+
+    fn begin_structural_origin(&mut self, origin: StructuralOrigin) {
+        if !self.enabled { return; }
+        self.structural_origin = Some(origin);
+        match origin { StructuralOrigin::NormalLifecycle => self.structural_origin_normal += 1, StructuralOrigin::Hierarchy => self.structural_origin_hierarchy += 1, StructuralOrigin::GeometrySurface => self.structural_origin_geometry_surface += 1, StructuralOrigin::GeometrySemanticClient => self.structural_origin_geometry_semantic_client += 1, StructuralOrigin::GeometryNoPending => self.structural_origin_geometry_no_pending += 1, StructuralOrigin::Other => self.structural_origin_other += 1 }
+    }
+
+    fn record_snapshot_origin(&mut self) {
+        if !self.enabled { return; }
+        match self.structural_origin { Some(StructuralOrigin::GeometrySurface) => self.snapshot_geometry_surface += 1, Some(StructuralOrigin::GeometrySemanticClient) => self.snapshot_geometry_semantic_client += 1, Some(StructuralOrigin::GeometryNoPending) => self.snapshot_geometry_no_pending += 1, Some(StructuralOrigin::Hierarchy) => self.snapshot_hierarchy += 1, _ => self.snapshot_other += 1 }
+        if matches!(self.structural_origin, Some(StructuralOrigin::Hierarchy)) { self.record_hierarchy_snapshot_source(self.hierarchy_source_bits); }
+    }
+
+    fn record_stale_origin(&mut self, invalidation: SceneInvalidation, deferred: bool) {
+        if !self.enabled || !matches!(invalidation, SceneInvalidation::Geometry(_)) { return; }
+        match self.structural_origin { Some(StructuralOrigin::GeometrySurface) => self.stale_geometry_from_surface_configure += 1, Some(StructuralOrigin::GeometrySemanticClient) => self.stale_geometry_from_semantic_client_configure += 1, Some(StructuralOrigin::GeometryNoPending) => self.stale_geometry_without_pending_geometry += 1, _ => {} }
+        if deferred { self.stale_geometry_deferred += 1; } else { self.stale_geometry_retry += 1; }
+        if matches!(self.structural_origin, Some(StructuralOrigin::Hierarchy)) { self.record_hierarchy_geometry_stage(self.hierarchy_source_bits, !deferred); }
+    }
+
+    fn record_geometry_pending_at_dispatch(&mut self, update: Option<PendingGeometry>) { if self.enabled && update.is_none() { self.pending_geometry_missing_at_dispatch += 1; } }
+
+    fn record_hierarchy_event(&mut self, source: HierarchyEventSource, internal: bool, relation: HierarchyEventRelation) {
+        if !self.enabled { return; }
+        self.hierarchy_event_total += 1;
+        match source {
+            HierarchyEventSource::UnknownConfigure => self.hierarchy_event_unknown_configure += 1,
+            HierarchyEventSource::Create => self.hierarchy_event_create += 1,
+            HierarchyEventSource::Map => self.hierarchy_event_map += 1,
+            HierarchyEventSource::Unmap => self.hierarchy_event_unmap += 1,
+            HierarchyEventSource::Destroy => self.hierarchy_event_destroy += 1,
+            HierarchyEventSource::Reparent => self.hierarchy_event_reparent += 1,
+            HierarchyEventSource::Circulate => self.hierarchy_event_circulate += 1,
+            HierarchyEventSource::ExistingHierarchyMerge => {}
+        }
+        if internal { self.hierarchy_from_internal_window += 1; }
+        match relation {
+            HierarchyEventRelation::TargetSurface => self.hierarchy_event_target_surface += 1,
+            HierarchyEventRelation::TargetSemanticClient => self.hierarchy_event_target_semantic_client += 1,
+            HierarchyEventRelation::OtherTrackedSurface => self.hierarchy_event_other_tracked_surface += 1,
+            HierarchyEventRelation::OtherSemanticClient => self.hierarchy_event_other_semantic_client += 1,
+            HierarchyEventRelation::Unknown => self.hierarchy_event_unknown_window += 1,
+        }
+        if matches!(source, HierarchyEventSource::UnknownConfigure) {
+            if internal { self.unknown_configure_internal += 1; }
+            else { self.unknown_configure_unresolved += 1; }
+        }
+    }
+
+    fn record_hierarchy_decision(&mut self, bits: u16, had_geometry: bool, direction: Option<ResizeOnlyDirection>) {
+        if !self.enabled { return; }
+        self.hierarchy_decision_total += 1;
+        if had_geometry {
+            self.hierarchy_decision_with_geometry_pending += 1;
+            self.hierarchy_decision_cleared_pending_geometry += 1;
+            self.hierarchy_selected_while_resize_geometry_pending += 1;
+            match direction {
+                Some(ResizeOnlyDirection::Grow) => self.hierarchy_won_over_grow += 1,
+                Some(ResizeOnlyDirection::Shrink) => self.hierarchy_won_over_shrink += 1,
+                Some(ResizeOnlyDirection::Mixed) => self.hierarchy_won_over_mixed += 1,
+                None => {}
+            }
+        }
+        if bits.count_ones() > 1 { self.hierarchy_decision_multi_source += 1; return; }
+        match bits {
+            b if b == HierarchyEventSource::UnknownConfigure.bit() => self.hierarchy_decision_only_unknown_configure += 1,
+            b if b == HierarchyEventSource::Create.bit() => self.hierarchy_decision_only_create += 1,
+            b if b == HierarchyEventSource::Map.bit() => self.hierarchy_decision_only_map += 1,
+            b if b == HierarchyEventSource::Unmap.bit() => self.hierarchy_decision_only_unmap += 1,
+            b if b == HierarchyEventSource::Destroy.bit() => self.hierarchy_decision_only_destroy += 1,
+            b if b == HierarchyEventSource::Reparent.bit() => self.hierarchy_decision_only_reparent += 1,
+            b if b == HierarchyEventSource::Circulate.bit() => self.hierarchy_decision_only_circulate += 1,
+            _ => self.hierarchy_decision_existing_merge += 1,
+        }
+    }
+
+    fn record_hierarchy_snapshot_source(&mut self, bits: u16) {
+        if !self.enabled || bits == 0 { return; }
+        if bits.count_ones() > 1 { self.snapshot_hierarchy_multi_source += 1; }
+        if bits & HierarchyEventSource::UnknownConfigure.bit() != 0 { self.snapshot_hierarchy_unknown_configure += 1; }
+        if bits & (HierarchyEventSource::Create.bit() | HierarchyEventSource::Map.bit() | HierarchyEventSource::Unmap.bit() | HierarchyEventSource::Destroy.bit()) != 0 { self.snapshot_hierarchy_lifecycle += 1; }
+        if bits & HierarchyEventSource::Reparent.bit() != 0 { self.snapshot_hierarchy_reparent += 1; }
+        if bits & HierarchyEventSource::Circulate.bit() != 0 { self.snapshot_hierarchy_circulate += 1; }
+    }
+
+    fn record_hierarchy_geometry_stage(&mut self, bits: u16, retry: bool) {
+        if !self.enabled || bits == 0 { return; }
+        let multiple = bits.count_ones() > 1;
+        if multiple {
+            if retry { self.hierarchy_multi_candidate_stale_geometry += 1; }
+            if retry { self.hierarchy_multi_retry += 1; } else { self.hierarchy_multi_deferred += 1; }
+        } else if bits & HierarchyEventSource::UnknownConfigure.bit() != 0 {
+            self.hierarchy_unknown_configure_candidate_stale_geometry += 1;
+            if retry { self.hierarchy_unknown_configure_retry += 1; } else { self.hierarchy_unknown_configure_deferred += 1; }
+        } else if bits & HierarchyEventSource::Reparent.bit() != 0 {
+            self.hierarchy_reparent_candidate_stale_geometry += 1;
+            if retry { self.hierarchy_reparent_retry += 1; } else { self.hierarchy_reparent_deferred += 1; }
+        } else if bits & HierarchyEventSource::Circulate.bit() != 0 {
+            self.hierarchy_circulate_candidate_stale_geometry += 1;
+            if retry { self.hierarchy_circulate_retry += 1; } else { self.hierarchy_circulate_deferred += 1; }
+        } else {
+            self.hierarchy_lifecycle_candidate_stale_geometry += 1;
+            if retry { self.hierarchy_lifecycle_retry += 1; } else { self.hierarchy_lifecycle_deferred += 1; }
+        }
+    }
+
+    fn record_geometry_scheduling_batch(&mut self) {
+        if self.enabled { self.geometry_scheduling_batches_total += 1; }
+    }
+
+    fn record_present_deferred(&mut self) {
+        if self.enabled { self.geometry_scheduling_present_deferred += 1; }
+    }
+
+    fn record_pending_present_history(&mut self, history: GeometryPresentHistory) {
+        if !self.enabled || !history.ever_deferred { return; }
+        self.geometry_pending_ever_present_deferred += 1;
+        if history.deferrals > 1 { self.geometry_pending_present_deferred_multiple += 1; }
+        else { self.geometry_pending_present_deferred_once += 1; }
+    }
+
+    fn record_final_resize_history(&mut self, history: GeometryPresentHistory, direction: ResizeOnlyDirection, move_resize: bool) {
+        if !self.enabled { return; }
+        if history.ever_deferred { self.final_resize_was_present_deferred += 1; }
+        else { self.final_resize_never_present_deferred += 1; }
+        match history.deferrals {
+            0 => self.final_resize_deferrals_0 += 1,
+            1 => self.final_resize_deferrals_1 += 1,
+            2..=3 => self.final_resize_deferrals_2_3 += 1,
+            4..=7 => self.final_resize_deferrals_4_7 += 1,
+            _ => self.final_resize_deferrals_8_plus += 1,
+        }
+        match (direction, history.ever_deferred) {
+            (ResizeOnlyDirection::Grow, true) => self.grow_after_present_defer += 1,
+            (ResizeOnlyDirection::Grow, false) => self.grow_without_present_defer += 1,
+            (ResizeOnlyDirection::Shrink, true) => self.shrink_after_present_defer += 1,
+            (ResizeOnlyDirection::Shrink, false) => self.shrink_without_present_defer += 1,
+            (ResizeOnlyDirection::Mixed, true) => self.mixed_after_present_defer += 1,
+            (ResizeOnlyDirection::Mixed, false) => self.mixed_without_present_defer += 1,
+        }
+        if move_resize {
+            if history.ever_deferred { self.move_resize_after_present_defer += 1; }
+            else { self.move_resize_without_present_defer += 1; }
+        }
+    }
+
+    fn record_final_resize_selection(&mut self, history: GeometryPresentHistory, structural: bool) {
+        if !self.enabled { return; }
+        match (structural, history.ever_deferred) {
+            (true, true) => self.structural_selected_after_present_defer += 1,
+            (true, false) => self.structural_selected_without_present_defer += 1,
+            (false, true) => self.resizeonly_selected_after_present_defer += 1,
+            (false, false) => self.resizeonly_selected_without_present_defer += 1,
+        }
+    }
+
+    fn record_resizeonly_cohort_outcome(&mut self, success: bool, reason: Option<ResizeOnlyFallbackReason>) {
+        if !self.enabled { return; }
+        let Some(deferred) = self.resizeonly_present_deferred else { return; };
+        match (success, deferred) {
+            (true, true) => self.resizeonly_success_after_present_defer += 1,
+            (true, false) => self.resizeonly_success_without_present_defer += 1,
+            (false, true) => self.resizeonly_fallback_after_present_defer += 1,
+            (false, false) => self.resizeonly_fallback_without_present_defer += 1,
+        }
+        if matches!(reason, Some(ResizeOnlyFallbackReason::PrecommitRejected)) {
+            if deferred { self.precommit_rejected_after_present_defer += 1; }
+            else { self.precommit_rejected_without_present_defer += 1; }
+        }
+    }
+
+    fn surface_record_mut(&mut self, surface: (Window, Option<Window>), id: damage::Damage) -> Option<&mut SurfaceDiagnostic3a3f8b4c> {
+        let (surface_xid, semantic_client_xid) = surface;
+        let index = self.surface_diagnostics.iter().position(|record| record.surface_xid == surface_xid)?;
+        let record = &mut self.surface_diagnostics[index];
+        record.observe_identity(surface_xid, semantic_client_xid, id);
+        Some(record)
+    }
+
+    fn observe_surface_identity(&mut self, surface: Option<(Window, Option<Window>)>, id: damage::Damage) {
+        if !self.enabled { return; }
+        let Some(surface) = surface else { return; };
+        if self.surface_diagnostics.iter().any(|record| record.surface_xid == surface.0) {
+            let _ = self.surface_record_mut(surface, id);
+        } else if self.surface_diagnostics.len() < MAX_SURFACE_DIAGNOSTICS {
+            let mut record = SurfaceDiagnostic3a3f8b4c::default();
+            record.observe_identity(surface.0, surface.1, id);
+            self.surface_diagnostics.push(record);
+        }
+    }
+
+    fn record_damage_arrival(&mut self, id: damage::Damage, surface: Option<(Window, Option<Window>)>) {
+        if !self.enabled { return; }
+        let now = Instant::now();
+        let unique = !self.pending_since.contains_key(&id);
+        self.observe_surface_identity(surface, id);
+        if let Some(surface) = surface {
+            if let Some(record) = self.surface_record_mut(surface, id) {
+                record.damage_notify_arrivals += 1;
+                if let Some(previous) = record.last_damage_notify_timestamp {
+                    let gap = previous.elapsed().as_micros();
+                    record.damage_notify_gap_samples += 1;
+                    record.damage_notify_gap_total_us += gap;
+                    record.damage_notify_gap_max_us = record.damage_notify_gap_max_us.max(gap);
+                    if record.last_moveonly_timestamp.is_none() {
+                        record.damage_gap_max_before_move_us = record.damage_gap_max_before_move_us.max(gap);
+                    } else {
+                        record.damage_gap_max_after_move_us = record.damage_gap_max_after_move_us.max(gap);
+                        if record.last_moveonly_timestamp.is_some_and(|move_time| now.duration_since(move_time) <= RECENT_MOVE_DIAGNOSTIC_WINDOW) {
+                            record.damage_gap_max_within_2s_after_move_us = record.damage_gap_max_within_2s_after_move_us.max(gap);
+                        }
+                    }
+                }
+                record.last_damage_notify_timestamp = Some(now);
+                if record.last_moveonly_timestamp.is_none() {
+                    record.damage_arrivals_before_first_move += 1;
+                } else {
+                    record.damage_arrivals_after_first_move += 1;
+                    if record.last_moveonly_timestamp.is_some_and(|move_time| now.duration_since(move_time) <= RECENT_MOVE_DIAGNOSTIC_WINDOW) {
+                        record.damage_arrivals_within_2s_after_move += 1;
+                    }
+                }
+                if unique { record.unique_damage_obligations += 1; }
+            }
+        }
+        if !unique {
+            self.pixel_damage_coalesced_notifications += 1;
+        } else {
+            self.pixel_damage_arrivals += 1;
+            if self.pending_since.len() < MAX_DIAGNOSTIC_PENDING_DAMAGE {
+                self.pending_since.insert(id, now);
+            }
+        }
+    }
+
+    fn record_damage_dispatch(&mut self, id: damage::Damage, geometry_pending: bool, surface: Option<(Window, Option<Window>)>) {
+        if !self.enabled { return; }
+        let start = self.pending_since.remove(&id);
+        self.observe_surface_identity(surface, id);
+        if let Some(surface) = surface {
+            if let Some(record) = self.surface_record_mut(surface, id) {
+                record.damage_subtracts += 1;
+                record.damage_dispatches += 1;
+                if let Some(start) = start {
+                    let micros = start.elapsed().as_micros();
+                    record.damage_pending_samples += 1;
+                    record.damage_pending_total_us += micros;
+                    record.damage_pending_max_us = record.damage_pending_max_us.max(micros);
+                }
+            }
+        }
+        let Some(start) = start else { return; };
+        let micros = start.elapsed().as_micros();
+        self.pixel_damage_dispatches += 1;
+        if geometry_pending { self.pixel_damage_dispatch_while_geometry_pending += 1; }
+        self.consecutive_geometry_while_damage_pending = 0;
+        self.pixel_damage_wait_samples += 1;
+        self.pixel_damage_wait_total_us += micros;
+        self.pixel_damage_wait_max_us = self.pixel_damage_wait_max_us.max(micros);
+        match micros {
+            0..=1_000 => self.pixel_damage_wait_le_1ms += 1,
+            1_001..=4_000 => self.pixel_damage_wait_1_4ms += 1,
+            4_001..=8_000 => self.pixel_damage_wait_4_8ms += 1,
+            8_001..=16_000 => self.pixel_damage_wait_8_16ms += 1,
+            16_001..=33_000 => self.pixel_damage_wait_16_33ms += 1,
+            33_001..=50_000 => self.pixel_damage_wait_33_50ms += 1,
+            50_001..=100_000 => self.pixel_damage_wait_50_100ms += 1,
+            _ => self.pixel_damage_wait_gt100ms += 1,
+        }
+    }
+
+    fn print_summary(&self) {
+        if !self.enabled { return; }
+        println!("3a3f8b3a_diag: configure_seen={} configure_move_like={} configure_resize_like={} configure_other={} configure_superseded={} geometry_dispatches={} moveonly_attempted={} moveonly_success={} moveonly_fallback={} resize_geometry_dispatches={} geometry_dispatches_while_damage_pending={} max_geometry_dispatches_before_pending_damage_service={} pixel_damage_arrivals={} pixel_damage_coalesced_notifications={} pixel_damage_dispatches={} pixel_damage_dispatch_while_geometry_pending={} pixel_damage_deferred_by_geometry={} pixel_damage_wait_max_us={} pixel_damage_wait_total_us={} pixel_damage_wait_samples={} pixel_damage_wait_le_1ms={} pixel_damage_wait_1_4ms={} pixel_damage_wait_4_8ms={} pixel_damage_wait_8_16ms={} pixel_damage_wait_16_33ms={} pixel_damage_wait_33_50ms={} pixel_damage_wait_50_100ms={} pixel_damage_wait_gt100ms={} event_batches={} event_batches_with_geometry={} event_batches_with_pixel_damage_arrival={} event_batches_ended_with_pixel_damage_pending={} max_batches_damage_remained_pending={} recompositions={} recompositions_after_geometry={} recompositions_after_pixel_damage={} present_submissions={} present_completion_events={} structural_candidates_started={} structural_candidates_published={} structural_candidates_stale={} structural_candidates_failed={} resize_candidate_started={} resize_candidate_stale={} resize_candidate_published={} resize_candidate_failed={} distinct_resize_states_dispatched={} resized_target_bundle_acquisitions={} resized_target_damage_acquisitions={} resized_target_named_pixmap_acquisitions={} resized_target_egl_imports={} resized_target_bundle_acquisition_then_candidate_stale={} resource_bundles_reused={} resource_bundles_new={}", self.configure_seen, self.configure_move_like, self.configure_resize_like, self.configure_other, self.configure_superseded, self.geometry_dispatches, self.moveonly_attempted, self.moveonly_success, self.moveonly_fallback, self.resize_geometry_dispatches, self.geometry_dispatches_while_damage_pending, self.max_geometry_dispatches_before_pending_damage_service, self.pixel_damage_arrivals, self.pixel_damage_coalesced_notifications, self.pixel_damage_dispatches, self.pixel_damage_dispatch_while_geometry_pending, self.pixel_damage_deferred_by_geometry, self.pixel_damage_wait_max_us, self.pixel_damage_wait_total_us, self.pixel_damage_wait_samples, self.pixel_damage_wait_le_1ms, self.pixel_damage_wait_1_4ms, self.pixel_damage_wait_4_8ms, self.pixel_damage_wait_8_16ms, self.pixel_damage_wait_16_33ms, self.pixel_damage_wait_33_50ms, self.pixel_damage_wait_50_100ms, self.pixel_damage_wait_gt100ms, self.event_batches, self.event_batches_with_geometry, self.event_batches_with_pixel_damage_arrival, self.event_batches_ended_with_pixel_damage_pending, self.max_batches_damage_remained_pending, self.recompositions, self.recompositions_after_geometry, self.recompositions_after_pixel_damage, self.present_submissions, self.present_completion_events, self.structural_candidates_started, self.structural_candidates_published, self.structural_candidates_stale, self.structural_candidates_failed, self.resize_candidate_started, self.resize_candidate_stale, self.resize_candidate_published, self.resize_candidate_failed, self.distinct_resize_states_dispatched, self.resized_target_bundle_acquisitions, self.resized_target_damage_acquisitions, self.resized_target_named_pixmap_acquisitions, self.resized_target_egl_imports, self.resized_target_bundle_acquisition_then_candidate_stale, self.resource_bundles_reused, self.resource_bundles_new);
+        println!("3a3f8b4c_surface_diag:");
+        for record in &self.surface_diagnostics {
+            let semantic_client = record.semantic_client_xid.map_or_else(|| "none".to_string(), |id| format!("0x{id:08x}"));
+            let first_damage = record.first_damage_id.map_or_else(|| "none".to_string(), |id| format!("0x{id:08x}"));
+            let current_damage = record.current_damage_id.map_or_else(|| "none".to_string(), |id| format!("0x{id:08x}"));
+            println!("surface=0x{:08x} semantic_client={} first_damage={} damage={} damage_id_changes={} moveonly={} arrivals={} arrivals_before_move={} arrivals_after_move={} arrivals_within_2s_after_move={} obligations={} subtracts={} dispatches={} pending_samples={} pending_total_us={} pending_max_us={} gap_samples={} gap_total_us={} gap_max_us={} gap_max_before_move_us={} gap_max_after_move_us={} gap_max_within_2s_after_move_us={}", record.surface_xid, semantic_client, first_damage, current_damage, record.damage_id_changes, record.moveonly_count, record.damage_notify_arrivals, record.damage_arrivals_before_first_move, record.damage_arrivals_after_first_move, record.damage_arrivals_within_2s_after_move, record.unique_damage_obligations, record.damage_subtracts, record.damage_dispatches, record.damage_pending_samples, record.damage_pending_total_us, record.damage_pending_max_us, record.damage_notify_gap_samples, record.damage_notify_gap_total_us, record.damage_notify_gap_max_us, record.damage_gap_max_before_move_us, record.damage_gap_max_after_move_us, record.damage_gap_max_within_2s_after_move_us);
+        }
+        println!("3a3f8b5d_resizeonly_diag: attempted={} success={} fallback={} superseded_before_acquisition={} full_snapshot_avoided={} hierarchy_abort={} target_damage_reused={} target_damage_created={} target_damage_id_changed={} publish_with_damage_pending={} fallback_early_unclassified={}", self.resizeonly_attempted, self.resizeonly_success, self.resizeonly_fallback, self.resizeonly_superseded_before_acquisition, self.resizeonly_full_snapshot_avoided, self.resizeonly_hierarchy_abort, self.resizeonly_target_damage_reused, self.resizeonly_target_damage_created, self.resizeonly_target_damage_id_changed, self.resizeonly_publish_with_damage_pending, self.resizeonly_fallback_early_unclassified);
+        self.print_resizeonly_direction("grow", &self.resizeonly_grow);
+        self.print_resizeonly_direction("shrink", &self.resizeonly_shrink);
+        self.print_resizeonly_direction("mixed", &self.resizeonly_mixed);
+        println!("3a3f8b5o_event_provenance: configure_from_surface={} configure_from_semantic_client={} configure_from_other={} configure_from_unknown={} semantic_client_resolved_to_surface={} semantic_client_geometry_update_rejected={} semantic_client_without_surface_pending_geometry={} surface_geometry_update_accepted={} surface_geometry_update_rejected={} pending_geometry_created={} pending_geometry_updated={} pending_geometry_superseded={} pending_geometry_missing_at_dispatch={} pending_geometry_surface_match={} pending_geometry_surface_mismatch={}", self.configure_from_surface, self.configure_from_semantic_client, self.configure_from_other, self.configure_from_unknown, self.semantic_client_resolved_to_surface, self.semantic_client_geometry_update_rejected, self.semantic_client_without_surface_pending_geometry, self.surface_geometry_update_accepted, self.surface_geometry_update_rejected, self.pending_geometry_created, self.pending_geometry_updated, self.pending_geometry_superseded, self.pending_geometry_missing_at_dispatch, self.pending_geometry_surface_match, self.pending_geometry_surface_mismatch);
+        println!("3a3f8b5o_resize_dispatch: total={} resizeonly_selected={} structural_selected={} deferred={} hierarchy_dominated={} no_pending_geometry={} other_source_reason={} unknown={} pre_attempt_bypass_total={} no_present_complete={} hierarchy_priority={} no_pending_geometry={} semantic_client_no_surface_pending_geometry={} pending_geometry_other_surface={} no_size_or_border_change={} ambiguous_or_superseded={} structural_already_required={} other={} direction_unknown={} grow_bypass={} shrink_bypass={} mixed_bypass={} direction_unknown_bypass={} move_resize_bypass={}", self.resize_dispatch_total, self.resize_dispatch_resizeonly_selected, self.resize_dispatch_structural_selected, self.resize_dispatch_deferred, self.resize_dispatch_hierarchy_dominated, self.resize_dispatch_no_pending_geometry, self.resize_dispatch_other_source_reason, self.resize_dispatch_unknown, self.resizeonly_pre_attempt_bypass_total, self.resizeonly_pre_attempt_bypass_no_present_complete, self.resizeonly_pre_attempt_bypass_hierarchy_priority, self.resizeonly_pre_attempt_bypass_no_pending_geometry, self.resizeonly_pre_attempt_bypass_semantic_client_no_surface_pending_geometry, self.resizeonly_pre_attempt_bypass_pending_geometry_other_surface, self.resizeonly_pre_attempt_bypass_no_size_or_border_change, self.resizeonly_pre_attempt_bypass_ambiguous_or_superseded, self.resizeonly_pre_attempt_bypass_structural_already_required, self.resizeonly_pre_attempt_bypass_other, self.resizeonly_pre_attempt_bypass_direction_unknown, self.resizeonly_grow_pre_attempt_bypass, self.resizeonly_shrink_pre_attempt_bypass, self.resizeonly_mixed_pre_attempt_bypass, self.resizeonly_direction_unknown_bypass, self.pre_resizeonly_bypass_move_resize);
+        println!("3a3f8b5o_structural_origin: normal={} hierarchy={} geometry_surface={} geometry_semantic_client={} geometry_no_pending={} other={} stale_geometry_surface={} stale_geometry_semantic_client={} stale_geometry_no_pending={} stale_geometry_retry={} stale_geometry_deferred={} snapshot_geometry_surface={} snapshot_geometry_semantic_client={} snapshot_geometry_no_pending={} snapshot_hierarchy={} snapshot_other={}", self.structural_origin_normal, self.structural_origin_hierarchy, self.structural_origin_geometry_surface, self.structural_origin_geometry_semantic_client, self.structural_origin_geometry_no_pending, self.structural_origin_other, self.stale_geometry_from_surface_configure, self.stale_geometry_from_semantic_client_configure, self.stale_geometry_without_pending_geometry, self.stale_geometry_retry, self.stale_geometry_deferred, self.snapshot_geometry_surface, self.snapshot_geometry_semantic_client, self.snapshot_geometry_no_pending, self.snapshot_hierarchy, self.snapshot_other);
+        println!("3a3f8b5q_scheduling: geometry_scheduling_batches_total={} geometry_scheduling_present_deferred={} geometry_scheduling_hierarchy_dominated={} note=these_are_scheduling_observations_not_final_resize_decisions", self.geometry_scheduling_batches_total, self.geometry_scheduling_present_deferred, self.geometry_scheduling_hierarchy_dominated);
+        println!("3a3f8b5q_pending_geometry_cohort: ever_present_deferred={} present_deferred_once={} present_deferred_multiple={} updated_while_present_deferred={} superseded_while_present_deferred={}", self.geometry_pending_ever_present_deferred, self.geometry_pending_present_deferred_once, self.geometry_pending_present_deferred_multiple, self.geometry_pending_updated_while_present_deferred, self.geometry_pending_superseded_while_present_deferred);
+        println!("3a3f8b5q_final_resize: total={} was_present_deferred={} never_present_deferred={} deferrals_0={} deferrals_1={} deferrals_2_3={} deferrals_4_7={} deferrals_8_plus={} source_metadata_unknown={}", self.final_resize_was_present_deferred + self.final_resize_never_present_deferred, self.final_resize_was_present_deferred, self.final_resize_never_present_deferred, self.final_resize_deferrals_0, self.final_resize_deferrals_1, self.final_resize_deferrals_2_3, self.final_resize_deferrals_4_7, self.final_resize_deferrals_8_plus, self.resize_dispatch_unknown);
+        println!("3a3f8b5q_direction_present_history: grow_after_present_defer={} grow_without_present_defer={} shrink_after_present_defer={} shrink_without_present_defer={} mixed_after_present_defer={} mixed_without_present_defer={} move_resize_after_present_defer={} move_resize_without_present_defer={}", self.grow_after_present_defer, self.grow_without_present_defer, self.shrink_after_present_defer, self.shrink_without_present_defer, self.mixed_after_present_defer, self.mixed_without_present_defer, self.move_resize_after_present_defer, self.move_resize_without_present_defer);
+        println!("3a3f8b5q_outcome_present_history: resizeonly_selected_after_present_defer={} resizeonly_selected_without_present_defer={} structural_selected_after_present_defer={} structural_selected_without_present_defer={} resizeonly_success_after_present_defer={} resizeonly_success_without_present_defer={} resizeonly_fallback_after_present_defer={} resizeonly_fallback_without_present_defer={} precommit_rejected_after_present_defer={} precommit_rejected_without_present_defer={}", self.resizeonly_selected_after_present_defer, self.resizeonly_selected_without_present_defer, self.structural_selected_after_present_defer, self.structural_selected_without_present_defer, self.resizeonly_success_after_present_defer, self.resizeonly_success_without_present_defer, self.resizeonly_fallback_after_present_defer, self.resizeonly_fallback_without_present_defer, self.precommit_rejected_after_present_defer, self.precommit_rejected_without_present_defer);
+        println!("3a3f8b5q_structural_present_history: stale_after_present_defer={} stale_without_present_defer={} publish_after_present_defer={} publish_without_present_defer={} retry_after_present_defer={} retry_without_present_defer={} deferred_rebuild_after_present_defer={} deferred_rebuild_without_present_defer={}", self.structural_stale_after_present_defer, self.structural_stale_without_present_defer, self.structural_publish_after_present_defer, self.structural_publish_without_present_defer, self.geometry_retry_after_present_defer, self.geometry_retry_without_present_defer, self.geometry_deferred_rebuild_after_present_defer, self.geometry_deferred_rebuild_without_present_defer);
+        println!("3a3f8b5s_hierarchy_events: total={} unknown_configure={} create={} map={} unmap={} destroy={} reparent={} circulate={} note=raw_event_population_separate_from_scheduler_decisions", self.hierarchy_event_total, self.hierarchy_event_unknown_configure, self.hierarchy_event_create, self.hierarchy_event_map, self.hierarchy_event_unmap, self.hierarchy_event_destroy, self.hierarchy_event_reparent, self.hierarchy_event_circulate);
+        println!("3a3f8b5s_hierarchy_decisions: total={} only_unknown_configure={} only_create={} only_map={} only_unmap={} only_destroy={} only_reparent={} only_circulate={} multi_source={} existing_merge={} with_geometry_pending={} cleared_pending_geometry={} selected_while_resize_geometry_pending={} won_over_grow={} won_over_shrink={} won_over_mixed={}", self.hierarchy_decision_total, self.hierarchy_decision_only_unknown_configure, self.hierarchy_decision_only_create, self.hierarchy_decision_only_map, self.hierarchy_decision_only_unmap, self.hierarchy_decision_only_destroy, self.hierarchy_decision_only_reparent, self.hierarchy_decision_only_circulate, self.hierarchy_decision_multi_source, self.hierarchy_decision_existing_merge, self.hierarchy_decision_with_geometry_pending, self.hierarchy_decision_cleared_pending_geometry, self.hierarchy_selected_while_resize_geometry_pending, self.hierarchy_won_over_grow, self.hierarchy_won_over_shrink, self.hierarchy_won_over_mixed);
+        println!("3a3f8b5s_hierarchy_event_relation: internal={} target_surface={} target_semantic_client={} other_tracked_surface={} other_semantic_client={} unknown_window={} unknown_configure_internal={} unknown_configure_unresolved={}", self.hierarchy_from_internal_window, self.hierarchy_event_target_surface, self.hierarchy_event_target_semantic_client, self.hierarchy_event_other_tracked_surface, self.hierarchy_event_other_semantic_client, self.hierarchy_event_unknown_window, self.unknown_configure_internal, self.unknown_configure_unresolved);
+        println!("3a3f8b5s_hierarchy_snapshot_source: unknown_configure={} lifecycle={} reparent={} circulate={} multi_source={}", self.snapshot_hierarchy_unknown_configure, self.snapshot_hierarchy_lifecycle, self.snapshot_hierarchy_reparent, self.snapshot_hierarchy_circulate, self.snapshot_hierarchy_multi_source);
+        println!("3a3f8b5s_hierarchy_stale_source: unknown_configure={} lifecycle={} reparent={} circulate={} multi_source={} retry_unknown={} retry_lifecycle={} retry_reparent={} retry_circulate={} retry_multi={} deferred_unknown={} deferred_lifecycle={} deferred_reparent={} deferred_circulate={} deferred_multi={}", self.hierarchy_unknown_configure_candidate_stale_geometry, self.hierarchy_lifecycle_candidate_stale_geometry, self.hierarchy_reparent_candidate_stale_geometry, self.hierarchy_circulate_candidate_stale_geometry, self.hierarchy_multi_candidate_stale_geometry, self.hierarchy_unknown_configure_retry, self.hierarchy_lifecycle_retry, self.hierarchy_reparent_retry, self.hierarchy_circulate_retry, self.hierarchy_multi_retry, self.hierarchy_unknown_configure_deferred, self.hierarchy_lifecycle_deferred, self.hierarchy_reparent_deferred, self.hierarchy_circulate_deferred, self.hierarchy_multi_deferred);
+        println!("3a3f8b5v_r2_compound: geometry_observed={} attempted={} success={} reject_lifecycle={} reject_scene_membership={} reject_newer_hierarchy={} superseded_geometry={} damage_reused={} named_pixmap_reacquired={} egl_reacquired={} avoided_full_retry={}", self.compound_hierarchy_geometry_observed, self.compound_rebase_attempted, self.compound_rebase_success, self.compound_rebase_rejected_lifecycle, self.compound_rebase_rejected_scene_membership, self.compound_rebase_rejected_newer_hierarchy, self.compound_rebase_superseded_geometry, self.compound_rebase_damage_reused, self.compound_rebase_named_pixmap_reacquired, self.compound_rebase_egl_reacquired, self.compound_rebase_avoided_full_retry);
+    }
+
+    fn record_moveonly(&mut self, surface: Window, semantic_client_xid: Option<Window>, damage_id: Option<damage::Damage>) {
+        if !self.enabled { return; }
+        let Some(damage_id) = damage_id else { return; };
+        self.observe_surface_identity(Some((surface, semantic_client_xid)), damage_id);
+        if let Some(record) = self.surface_record_mut((surface, semantic_client_xid), damage_id) {
+            record.moveonly_count += 1;
+            record.last_moveonly_timestamp = Some(Instant::now());
+        }
+    }
+
+    fn resizeonly_direction_mut(&mut self, direction: ResizeOnlyDirection) -> &mut ResizeOnlyDirectionDiagnostics {
+        match direction {
+            ResizeOnlyDirection::Grow => &mut self.resizeonly_grow,
+            ResizeOnlyDirection::Shrink => &mut self.resizeonly_shrink,
+            ResizeOnlyDirection::Mixed => &mut self.resizeonly_mixed,
+        }
+    }
+
+    fn record_resizeonly_attempt(&mut self, direction: ResizeOnlyDirection, move_resize: bool) {
+        let stats = self.resizeonly_direction_mut(direction);
+        stats.attempted += 1;
+        if move_resize { stats.move_resize_attempted += 1; }
+    }
+
+    fn record_resizeonly_early_fallback(&mut self) {
+        self.resizeonly_fallback += 1;
+        self.resizeonly_fallback_early_unclassified += 1;
+        self.record_resizeonly_cohort_outcome(false, None);
+    }
+
+    fn record_resizeonly_fallback(
+        &mut self,
+        direction: ResizeOnlyDirection,
+        move_resize: bool,
+        reason: ResizeOnlyFallbackReason,
+    ) {
+        let stats = self.resizeonly_direction_mut(direction);
+        stats.fallback_reasons.record(reason);
+        if move_resize {
+            stats.fallback_move_resize += 1;
+        }
+        self.record_resizeonly_cohort_outcome(false, Some(reason));
+        self.resizeonly_fallback_origin = Some((direction, move_resize));
+    }
+
+    fn begin_resizeonly_structural_fallback(&mut self) {
+        let Some((direction, _move_resize)) = self.resizeonly_fallback_origin.take() else {
+            return;
+        };
+        let stats = self.resizeonly_direction_mut(direction);
+        stats.fallback_to_structural += 1;
+        stats.structural_candidates_started += 1;
+        self.resizeonly_structural_direction = Some(direction);
+        self.resizeonly_structural_timing = self.enabled.then(|| (direction, Instant::now()));
+        self.resizeonly_structural_present_deferred = self.resizeonly_present_deferred;
+    }
+
+    fn record_structural_snapshot(&mut self, elapsed: Duration) {
+        if let Some(direction) = self.resizeonly_structural_direction {
+            let stats = self.resizeonly_direction_mut(direction);
+            stats.fallback_full_snapshot += 1;
+            stats.structural_full_snapshot.record(elapsed);
+        }
+    }
+
+    fn record_structural_terminal(&mut self, published: bool, stale: bool, retry: bool) {
+        let Some((direction, start)) = self.resizeonly_structural_timing.take() else {
+            return;
+        };
+        let cohort = self.resizeonly_structural_present_deferred;
+        if stale {
+            match cohort {
+                Some(true) => self.structural_stale_after_present_defer += 1,
+                Some(false) => self.structural_stale_without_present_defer += 1,
+                None => {}
+            }
+        }
+        if published {
+            match cohort {
+                Some(true) => self.structural_publish_after_present_defer += 1,
+                Some(false) => self.structural_publish_without_present_defer += 1,
+                None => {}
+            }
+        }
+        if retry {
+            match cohort {
+                Some(true) => self.geometry_retry_after_present_defer += 1,
+                Some(false) => self.geometry_retry_without_present_defer += 1,
+                None => {}
+            }
+            self.resizeonly_structural_timing = Some((direction, Instant::now()));
+        } else if stale {
+            match self.resizeonly_structural_present_deferred {
+                Some(true) => self.geometry_deferred_rebuild_after_present_defer += 1,
+                Some(false) => self.geometry_deferred_rebuild_without_present_defer += 1,
+                None => {}
+            }
+        }
+        let stats = self.resizeonly_direction_mut(direction);
+        stats.structural_total.record(start.elapsed());
+        if stale { stats.structural_stale += 1; }
+        if published { stats.structural_published += 1; }
+        if retry { stats.structural_retry += 1; }
+        if !retry {
+            self.resizeonly_structural_direction = None;
+            self.resizeonly_structural_present_deferred = None;
+            self.resizeonly_present_deferred = None;
+            self.structural_origin = None;
+        }
+    }
+
+    fn record_resizeonly_outcome(
+        &mut self,
+        direction: ResizeOnlyDirection,
+        move_resize: bool,
+        success: bool,
+        hierarchy_abort: bool,
+        elapsed: Option<Duration>,
+    ) {
+        if success { self.record_resizeonly_cohort_outcome(true, None); }
+        let stats = self.resizeonly_direction_mut(direction);
+        if success {
+            stats.success += 1;
+            if move_resize { stats.move_resize_success += 1; }
+        } else if hierarchy_abort {
+            stats.hierarchy_abort += 1;
+        } else {
+            stats.fallback += 1;
+        }
+        if let Some(elapsed) = elapsed { stats.total.record(elapsed); }
+    }
+
+    fn record_resizeonly_stage(
+        &mut self,
+        direction: ResizeOnlyDirection,
+        stage: ResizeOnlyStage,
+        elapsed: Duration,
+    ) {
+        let stats = self.resizeonly_direction_mut(direction);
+        let metric = match stage {
+            ResizeOnlyStage::PreAcquire => &mut stats.pre_acquire,
+            ResizeOnlyStage::Damage => &mut stats.damage,
+            ResizeOnlyStage::NamePixmap => &mut stats.name_pixmap,
+            ResizeOnlyStage::EglImport => &mut stats.egl_import,
+            ResizeOnlyStage::TargetBuildRender => &mut stats.target_build_render,
+            ResizeOnlyStage::Precommit => &mut stats.precommit,
+            ResizeOnlyStage::Publish => &mut stats.publish,
+            ResizeOnlyStage::ResourceBlocking => &mut stats.resource_blocking,
+        };
+        metric.record(elapsed);
+    }
+
+    fn print_resizeonly_direction(&self, name: &str, stats: &ResizeOnlyDirectionDiagnostics) {
+        if !self.enabled { return; }
+        let metric = |timing: &TimingMetric| {
+            format!("{}:{}:{}", timing.samples, timing.total_us, timing.max_us)
+        };
+        println!(
+            "3a3f8b5j_resizeonly_direction: direction={} attempted={} success={} fallback={} fallback_reason_total={} hierarchy_abort={} move_resize_attempted={} move_resize_success={} total={} pre_acquire={} damage={} name_pixmap={} pixmap_get_geometry={} egl_import={} target_build_render={} precommit={} publish={} resource_blocking={} fallback_reasons=unavailable_state:{}:identity_mismatch:{}:no_size_change:{}:geometry_superseded:{}:unsupported_visual:{}:missing_damage:{}:precommit_rejected:{}:hierarchy:{} fallback_move_resize={} fallback_to_structural={} fallback_full_snapshot={} structural_candidates_started={} structural_total={} structural_full_snapshot={} structural_stale={} structural_published={} structural_retry={}",
+            name,
+            stats.attempted,
+            stats.success,
+            stats.fallback,
+            stats.fallback_reasons.total(),
+            stats.hierarchy_abort,
+            stats.move_resize_attempted,
+            stats.move_resize_success,
+            metric(&stats.total),
+            metric(&stats.pre_acquire),
+            metric(&stats.damage),
+            metric(&stats.name_pixmap),
+            metric(&stats.pixmap_get_geometry),
+            metric(&stats.egl_import),
+            metric(&stats.target_build_render),
+            metric(&stats.precommit),
+            metric(&stats.publish),
+            metric(&stats.resource_blocking),
+            stats.fallback_reasons.unavailable_state,
+            stats.fallback_reasons.identity_mismatch,
+            stats.fallback_reasons.no_size_change,
+            stats.fallback_reasons.geometry_superseded,
+            stats.fallback_reasons.unsupported_visual,
+            stats.fallback_reasons.missing_damage,
+            stats.fallback_reasons.precommit_rejected,
+            stats.fallback_reasons.hierarchy,
+            stats.fallback_move_resize,
+            stats.fallback_to_structural,
+            stats.fallback_full_snapshot,
+            stats.structural_candidates_started,
+            metric(&stats.structural_total),
+            metric(&stats.structural_full_snapshot),
+            stats.structural_stale,
+            stats.structural_published,
+            stats.structural_retry,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResizeOnlyStage {
+    PreAcquire,
+    Damage,
+    NamePixmap,
+    EglImport,
+    TargetBuildRender,
+    Precommit,
+    Publish,
+    ResourceBlocking,
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum PreResizeOnlyBypassReason {
+    NoPresentComplete,
+    HierarchyPriority,
+    NoPendingGeometry,
+    SemanticClientNoSurfacePendingGeometry,
+    PendingGeometryOtherSurface,
+    NoSizeOrBorderChange,
+    AmbiguousOrSuperseded,
+    StructuralAlreadyRequired,
+    Other,
+    DirectionUnknown,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RootGeometry {
@@ -36,6 +1071,216 @@ struct RootGeometry {
     height: u16,
     depth: u8,
     visual: u32,
+}
+
+#[cfg(test)]
+mod resource_reuse_invariant_tests {
+    use std::cell::Cell;
+    use std::collections::{HashMap, HashSet};
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct Drops {
+        damage: Cell<usize>,
+        pixmap: Cell<usize>,
+        egl: Cell<usize>,
+    }
+
+    struct FakeResource {
+        kind: &'static str,
+        drops: Rc<Drops>,
+    }
+
+    impl Drop for FakeResource {
+        fn drop(&mut self) {
+            let counter = match self.kind {
+                "damage" => &self.drops.damage,
+                "pixmap" => &self.drops.pixmap,
+                "egl" => &self.drops.egl,
+                _ => unreachable!(),
+            };
+            counter.set(counter.get() + 1);
+        }
+    }
+
+    #[allow(dead_code)]
+    struct FakeBundle {
+        damage_id: u32,
+        damage: FakeResource,
+        pixmap: FakeResource,
+        egl: FakeResource,
+    }
+
+    type SharedBundle = Rc<FakeBundle>;
+
+    fn bundle(id: u32, drops: &Rc<Drops>) -> SharedBundle {
+        Rc::new(FakeBundle {
+            damage_id: id,
+            damage: FakeResource { kind: "damage", drops: Rc::clone(drops) },
+            pixmap: FakeResource { kind: "pixmap", drops: Rc::clone(drops) },
+            egl: FakeResource { kind: "egl", drops: Rc::clone(drops) },
+        })
+    }
+
+    fn candidate(
+        live: &HashMap<char, SharedBundle>,
+        additions: &[char],
+        fail: bool,
+        next_id: u32,
+        drops: &Rc<Drops>,
+    ) -> Result<HashMap<char, SharedBundle>, ()> {
+        let mut result = HashMap::new();
+        for (surface, resource) in live {
+            if *surface != 'C' {
+                result.insert(*surface, Rc::clone(resource));
+            }
+        }
+        for surface in additions {
+            let resource = bundle(next_id, drops);
+            if fail {
+                drop(resource);
+                return Err(());
+            }
+            result.insert(*surface, resource);
+        }
+        Ok(result)
+    }
+
+    #[test]
+    fn shared_bundle_identity_and_last_owner_drop_are_exactly_once() {
+        let drops = Rc::new(Drops::default());
+        let live = bundle(1, &drops);
+        let candidate = Rc::clone(&live);
+        assert!(Rc::ptr_eq(&live, &candidate));
+        drop(live);
+        assert_eq!(drops.damage.get(), 0);
+        assert_eq!(drops.pixmap.get(), 0);
+        assert_eq!(drops.egl.get(), 0);
+        drop(candidate);
+        assert_eq!(drops.damage.get(), 1);
+        assert_eq!(drops.pixmap.get(), 1);
+        assert_eq!(drops.egl.get(), 1);
+    }
+
+    #[test]
+    fn publication_reuses_survivors_and_retires_removed_bundle_once() {
+        let drops = Rc::new(Drops::default());
+        let a = bundle(1, &drops);
+        let b = bundle(2, &drops);
+        let c = bundle(3, &drops);
+        let mut old = HashMap::from([('A', Rc::clone(&a)), ('B', Rc::clone(&b)), ('C', Rc::clone(&c))]);
+        let new_d = bundle(4, &drops);
+        let new = HashMap::from([('A', Rc::clone(&a)), ('B', Rc::clone(&b)), ('D', Rc::clone(&new_d))]);
+        assert!(Rc::ptr_eq(old.get(&'A').unwrap(), new.get(&'A').unwrap()));
+        assert!(Rc::ptr_eq(old.get(&'B').unwrap(), new.get(&'B').unwrap()));
+        assert_eq!(drops.damage.get(), 0);
+        old = new;
+        drop(c);
+        assert_eq!(drops.damage.get(), 1);
+        assert_eq!(drops.pixmap.get(), 1);
+        assert_eq!(drops.egl.get(), 1);
+        drop(old);
+        drop(a);
+        drop(b);
+        drop(new_d);
+        assert_eq!(drops.damage.get(), 4);
+        assert_eq!(drops.pixmap.get(), 4);
+        assert_eq!(drops.egl.get(), 4);
+    }
+
+    #[test]
+    fn candidate_failure_and_stale_preserve_old_scene_and_cleanup_new_only() {
+        let drops = Rc::new(Drops::default());
+        let a = bundle(1, &drops);
+        let b = bundle(2, &drops);
+        let c = bundle(3, &drops);
+        let old = HashMap::from([('A', Rc::clone(&a)), ('B', Rc::clone(&b)), ('C', Rc::clone(&c))]);
+        assert!(candidate(&old, &['D'], true, 4, &drops).is_err());
+        assert_eq!(drops.damage.get(), 1);
+        assert_eq!(Rc::strong_count(old.get(&'A').unwrap()), 2);
+        let stale = candidate(&old, &['D'], false, 5, &drops).unwrap();
+        drop(stale);
+        assert_eq!(drops.damage.get(), 2);
+        assert_eq!(Rc::strong_count(old.get(&'A').unwrap()), 2);
+        drop(old);
+        assert_eq!(drops.damage.get(), 2);
+        drop(a);
+        drop(b);
+        drop(c);
+        assert_eq!(drops.damage.get(), 5);
+        assert_eq!(drops.pixmap.get(), 5);
+        assert_eq!(drops.egl.get(), 5);
+    }
+
+    #[test]
+    fn pending_damage_is_coalesced_and_subtracted_once_across_candidate_reuse() {
+        let drops = Rc::new(Drops::default());
+        let a = bundle(41, &drops);
+        let old = HashMap::from([('A', Rc::clone(&a))]);
+        let reused = candidate(&old, &[], false, 42, &drops).unwrap();
+        let mut pending = HashSet::from([reused.get(&'A').unwrap().damage_id]);
+        pending.insert(41);
+        assert_eq!(pending.len(), 1);
+        let mut subtracts = 0;
+        for damage_id in pending {
+            if damage_id == 41 { subtracts += 1; }
+        }
+        assert_eq!(subtracts, 1);
+        drop(reused);
+        drop(old);
+        drop(a);
+        assert_eq!(drops.damage.get(), 1);
+    }
+
+    #[test]
+    fn higher_priority_structural_work_preserves_damage_through_failure_and_stale() {
+        let drops = Rc::new(Drops::default());
+        let a = bundle(51, &drops);
+        let old = HashMap::from([('A', Rc::clone(&a))]);
+        let pending = HashSet::from([51_u32]);
+        assert!(candidate(&old, &['D'], true, 52, &drops).is_err());
+        assert!(pending.contains(&old.get(&'A').unwrap().damage_id));
+        let stale = candidate(&old, &['D'], false, 53, &drops).unwrap();
+        drop(stale);
+        assert!(pending.contains(&51));
+        let subtract_count = pending.iter().filter(|damage_id| **damage_id == 51).count();
+        assert_eq!(subtract_count, 1);
+        drop(old);
+        drop(a);
+        assert_eq!(drops.damage.get(), 3);
+    }
+
+    #[test]
+    fn resource_identity_is_separate_from_candidate_metadata() {
+        let drops = Rc::new(Drops::default());
+        let resource = bundle(7, &drops);
+        let old_metadata = (100_i32, 200_i32, 0_usize);
+        let candidate_metadata = (120_i32, 240_i32, 1_usize);
+        assert!(Rc::ptr_eq(&resource, &resource));
+        assert_ne!(old_metadata, candidate_metadata);
+        assert_eq!(old_metadata, (100, 200, 0));
+        drop(resource);
+        assert_eq!(drops.damage.get(), 1);
+    }
+
+    #[test]
+    fn resize_uses_new_generation_and_retires_old_after_publication() {
+        let drops = Rc::new(Drops::default());
+        let old_c = bundle(10, &drops);
+        let new_c = bundle(11, &drops);
+        let old = Rc::clone(&old_c);
+        let new = Rc::clone(&new_c);
+        drop(old);
+        assert_eq!(drops.damage.get(), 0);
+        drop(old_c);
+        assert_eq!(drops.damage.get(), 1);
+        assert_eq!(Rc::strong_count(&new), 2);
+        drop(new);
+        drop(new_c);
+        assert_eq!(drops.damage.get(), 2);
+        assert_eq!(drops.pixmap.get(), 2);
+        assert_eq!(drops.egl.get(), 2);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -949,6 +2194,13 @@ fn translate_damage_lease_acquire_error(error: DamageLeaseAcquireError) -> Box<d
     }
 }
 
+fn is_hierarchy_stale_candidate_error(error: &(dyn Error + 'static)) -> bool {
+    matches!(
+        error.downcast_ref::<CandidateBuildError>(),
+        Some(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
+    )
+}
+
 struct DamageLease<'a> {
     connection: &'a X11Connection,
     surface_xid: Window,
@@ -1226,6 +2478,7 @@ impl<'a> NamedSurfacePixmap<'a> {
         entry: &SurfaceEntry,
         root_window: Window,
         _root: RootGeometry,
+        mut pixmap_geometry_timing: Option<&mut TimingMetric>,
     ) -> Result<Self, NamedSurfacePixmapAcquireError> {
         let pixmap_xid = connection
             .inner
@@ -1244,6 +2497,7 @@ impl<'a> NamedSurfacePixmap<'a> {
                 }
             })?;
         let mut guard = NamedPixmapGuard::new(connection, pixmap_xid);
+        let geometry_start = pixmap_geometry_timing.as_ref().map(|_| Instant::now());
         let geometry = connection
             .inner
             .get_geometry(pixmap_xid)
@@ -1256,6 +2510,9 @@ impl<'a> NamedSurfacePixmap<'a> {
                     NamedSurfacePixmapAcquireError::Other(Box::new(error))
                 }
             })?;
+        if let (Some(start), Some(timing)) = (geometry_start, pixmap_geometry_timing.as_mut()) {
+            timing.record(start.elapsed());
+        }
         let pixmap_geometry = PixmapGeometry {
             root: geometry.root,
             x: geometry.x,
@@ -1354,6 +2611,16 @@ impl Drop for NamedSurfacePixmap<'_> {
             }
         }
     }
+}
+
+/// One atomically reusable owner for a surface's source-side resources.
+/// Scene metadata remains in SurfaceEntry and is never shared through this
+/// bundle. Rc is correct because SceneSession and SceneCandidate are strictly
+/// single-threaded; the bundle itself has one owning Drop path per resource.
+struct SurfaceResourceBundle<'a> {
+    damage: Option<Rc<DamageLease<'a>>>,
+    pixmap: Rc<NamedSurfacePixmap<'a>>,
+    egl: Option<Rc<std::cell::RefCell<EglImportedSurface>>>,
 }
 
 #[allow(dead_code)]
@@ -1718,6 +2985,68 @@ enum SceneInvalidation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HierarchyEventSource {
+    UnknownConfigure,
+    Create,
+    Map,
+    Unmap,
+    Destroy,
+    Reparent,
+    Circulate,
+    ExistingHierarchyMerge,
+}
+
+impl HierarchyEventSource {
+    fn bit(self) -> u16 {
+        match self {
+            Self::UnknownConfigure => 1 << 0,
+            Self::Create => 1 << 1,
+            Self::Map => 1 << 2,
+            Self::Unmap => 1 << 3,
+            Self::Destroy => 1 << 4,
+            Self::Reparent => 1 << 5,
+            Self::Circulate => 1 << 6,
+            Self::ExistingHierarchyMerge => 1 << 7,
+        }
+    }
+}
+
+fn hierarchy_event_source(event: &Event) -> Option<HierarchyEventSource> {
+    match event {
+        Event::ConfigureNotify(_) => Some(HierarchyEventSource::UnknownConfigure),
+        Event::CreateNotify(_) => Some(HierarchyEventSource::Create),
+        Event::MapNotify(_) => Some(HierarchyEventSource::Map),
+        Event::UnmapNotify(_) => Some(HierarchyEventSource::Unmap),
+        Event::DestroyNotify(_) => Some(HierarchyEventSource::Destroy),
+        Event::ReparentNotify(_) => Some(HierarchyEventSource::Reparent),
+        Event::CirculateNotify(_) => Some(HierarchyEventSource::Circulate),
+        _ => None,
+    }
+}
+
+fn hierarchy_event_window(event: &Event) -> Option<Window> {
+    match event {
+        Event::ConfigureNotify(event) => Some(event.window),
+        Event::CreateNotify(event) => Some(event.window),
+        Event::MapNotify(event) => Some(event.window),
+        Event::UnmapNotify(event) => Some(event.window),
+        Event::DestroyNotify(event) => Some(event.window),
+        Event::ReparentNotify(event) => Some(event.window),
+        Event::CirculateNotify(event) => Some(event.window),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HierarchyEventRelation {
+    TargetSurface,
+    TargetSemanticClient,
+    OtherTrackedSurface,
+    OtherSemanticClient,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingGeometry {
     surface_xid: Window,
     x: i16,
@@ -1746,6 +3075,13 @@ fn configure_geometry_update(event: &Event, snapshot: &SceneSnapshot) -> Option<
     })
 }
 
+fn geometry_event_source(event: &Event, snapshot: &SceneSnapshot) -> GeometryEventSource {
+    let Event::ConfigureNotify(event) = event else { return GeometryEventSource::Unknown; };
+    if snapshot.entries.iter().any(|entry| entry.surface_xid == event.window) { GeometryEventSource::CanonicalSurface }
+    else if snapshot.entries.iter().any(|entry| entry.semantic_client_xid == Some(event.window)) { GeometryEventSource::SemanticClient }
+    else { GeometryEventSource::Other }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GateDecision {
     Accept,
@@ -1763,6 +3099,12 @@ struct InvalidationBatch {
     pixel_damage: HashSet<damage::Damage>,
     background: bool,
     visual_state: bool,
+    geometry_source: Option<GeometryEventSource>,
+    geometry_event_update: Option<PendingGeometry>,
+    present_history: GeometryPresentHistory,
+    hierarchy_source_bits: u16,
+    hierarchy_geometry_pending: bool,
+    hierarchy_pending_geometry: Option<PendingGeometry>,
 }
 
 impl InvalidationBatch {
@@ -1782,9 +3124,10 @@ impl InvalidationBatch {
             }
             SceneInvalidation::Geometry(_) => {}
             SceneInvalidation::Hierarchy => {
+                self.hierarchy_geometry_pending |= self.geometry.is_some() || self.geometry_update.is_some();
+                self.hierarchy_pending_geometry = self.geometry_update.or(self.geometry_event_update);
                 self.hierarchy = true;
                 self.geometry = None;
-                self.geometry_update = None;
                 self.geometry_ambiguous = false;
             }
             SceneInvalidation::Shutdown(reason) => {
@@ -1820,12 +3163,30 @@ impl InvalidationBatch {
             return;
         };
         if self.hierarchy {
+            self.hierarchy_geometry_pending = true;
+            self.hierarchy_pending_geometry = Some(update);
             return;
         }
         if self.geometry_update.is_some_and(|current| current.surface_xid != update.surface_xid) {
             self.geometry_ambiguous = true;
         }
+        if self.present_history.ever_deferred {
+            self.present_history.updated_while_deferred = true;
+            self.present_history.superseded_while_deferred = true;
+        }
         self.geometry_update = Some(update);
+    }
+
+    fn note_configure_event(&mut self, event: &Event, source: GeometryEventSource, surface_xid: Option<Window>) {
+        let Event::ConfigureNotify(event) = event else { return; };
+        self.geometry_source = Some(source);
+        if let Some(surface_xid) = surface_xid {
+            self.geometry_event_update = Some(PendingGeometry { surface_xid, x: event.x, y: event.y, width: event.width, height: event.height, border_width: event.border_width, override_redirect: event.override_redirect });
+        }
+    }
+
+    fn note_hierarchy_source(&mut self, source: HierarchyEventSource) {
+        self.hierarchy_source_bits |= source.bit();
     }
 
     fn move_geometry(&self) -> Option<PendingGeometry> {
@@ -1848,15 +3209,16 @@ struct SceneSession<'a> {
     visual_formats: VisualFormatCache,
     manual: Option<ManualSubwindowsRedirect<'a>>,
     egl: Option<EglSceneRenderer>,
-    pixmaps: Vec<NamedSurfacePixmap<'a>>,
-    damage_leases: Vec<DamageLease<'a>>,
+    pixmaps: Vec<Rc<NamedSurfacePixmap<'a>>>,
+    damage_leases: Vec<Rc<DamageLease<'a>>>,
     damage_registry: HashMap<damage::Damage, Window>,
     pending_damage: HashSet<damage::Damage>,
     pending_background: bool,
     structural_generation: u64,
     attempted_structural_generation: u64,
     snapshot: Option<SceneSnapshot>,
-    egl_surfaces: HashMap<Window, EglImportedSurface>,
+    resources: HashMap<Window, Rc<SurfaceResourceBundle<'a>>>,
+    egl_surfaces: HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
     background: Option<ImportedBackground>,
     background_atoms: BackgroundAtoms,
     visual_atoms: VisualAtoms,
@@ -1866,6 +3228,8 @@ struct SceneSession<'a> {
     pending_visual_state: bool,
     pending_move_geometry: Option<PendingGeometry>,
     pending_move_geometry_ambiguous: bool,
+    pending_move_geometry_present_history: GeometryPresentHistory,
+    pending_hierarchy_geometry: Option<PendingGeometry>,
     signal: SignalWake,
     scheduler: FrameScheduler,
     present: Option<PresentClock>,
@@ -1873,16 +3237,18 @@ struct SceneSession<'a> {
     _config: CompositorConfig,
     shadow_style: crate::config::ShadowConfig,
     ignored_configure_windows: HashSet<Window>,
+    diagnostics: Diagnostics3a3f8b3a,
 }
 
 struct SceneCandidate<'a> {
     snapshot: SceneSnapshot,
     generation: u64,
+    resources: HashMap<Window, Rc<SurfaceResourceBundle<'a>>>,
     // Declaration order is cleanup order: imported EGL resources must drop
     // before their source pixmaps, with Damage leases released in between.
-    egl_surfaces: HashMap<Window, EglImportedSurface>,
-    damage_leases: Vec<DamageLease<'a>>,
-    pixmaps: Vec<NamedSurfacePixmap<'a>>,
+    egl_surfaces: HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
+    damage_leases: Vec<Rc<DamageLease<'a>>>,
+    pixmaps: Vec<Rc<NamedSurfacePixmap<'a>>>,
     damage_registry: HashMap<damage::Damage, Window>,
     watch_ids: HashSet<Window>,
     watch_additions: Vec<Window>,
@@ -2038,6 +3404,9 @@ impl<'a> SceneSession<'a> {
             return;
         }
         if let Some(update) = batch.geometry_update {
+            if self.pending_move_geometry.is_some() {
+                self.diagnostics.configure_superseded += 1;
+            }
             if self
                 .pending_move_geometry
                 .is_some_and(|current| current.surface_xid != update.surface_xid)
@@ -2046,6 +3415,15 @@ impl<'a> SceneSession<'a> {
             }
             self.pending_move_geometry = Some(update);
         }
+        let mut history = self.pending_move_geometry_present_history;
+        history.updated_while_deferred |= batch.present_history.updated_while_deferred;
+        history.superseded_while_deferred |= batch.present_history.superseded_while_deferred;
+        let was_deferred = history.ever_deferred;
+        history = history.deferred();
+        if !was_deferred { self.diagnostics.record_pending_present_history(history); }
+        self.pending_move_geometry_present_history = history;
+        if history.updated_while_deferred { self.diagnostics.geometry_pending_updated_while_present_deferred += 1; }
+        if history.superseded_while_deferred { self.diagnostics.geometry_pending_superseded_while_present_deferred += 1; }
         self.pending_move_geometry_ambiguous |= batch.geometry_ambiguous;
     }
 
@@ -2115,6 +3493,7 @@ impl<'a> SceneSession<'a> {
             structural_generation: 1,
             attempted_structural_generation: 0,
             snapshot: None,
+            resources: HashMap::new(),
             egl_surfaces: HashMap::new(),
             background: None,
             background_atoms,
@@ -2125,6 +3504,8 @@ impl<'a> SceneSession<'a> {
             pending_visual_state: false,
             pending_move_geometry: None,
             pending_move_geometry_ambiguous: false,
+            pending_move_geometry_present_history: GeometryPresentHistory::default(),
+            pending_hierarchy_geometry: None,
             signal,
             scheduler: FrameScheduler::new(),
             present,
@@ -2132,6 +3513,7 @@ impl<'a> SceneSession<'a> {
             _config: config,
             shadow_style: config.visuals.shadow,
             ignored_configure_windows: HashSet::new(),
+            diagnostics: Diagnostics3a3f8b3a::from_environment(),
         };
         session.state = SceneState::ManualActive;
         Ok(session)
@@ -2144,6 +3526,7 @@ impl<'a> SceneSession<'a> {
             .and_then(|_| session.wait_live_pixel());
         debug_assert!(coordinator_requires_cleanup(session.state));
         let cleanup = session.cleanup();
+        session.diagnostics.print_summary();
         match (operation, cleanup) {
             (Err(operation), Err(cleanup)) => {
                 eprintln!("scene cleanup also failed: {cleanup}");
@@ -2181,6 +3564,11 @@ impl<'a> SceneSession<'a> {
     }
 
     fn build_candidate(&mut self) -> Result<SceneCandidate<'a>, Box<dyn Error>> {
+        if self.diagnostics.enabled && self.diagnostics.structural_origin.is_none() { self.diagnostics.begin_structural_origin(StructuralOrigin::NormalLifecycle); }
+        self.diagnostics.structural_candidates_started += 1;
+        let resizeonly_snapshot_start = self.diagnostics.resizeonly_structural_direction
+            .filter(|_| self.diagnostics.enabled)
+            .map(|_| Instant::now());
         let generation = self.structural_generation;
         let root_geometry = read_root_geometry(self.connection, self.root)?;
         let hierarchy = self.connection.snapshot_hierarchy()?;
@@ -2199,6 +3587,39 @@ impl<'a> SceneSession<'a> {
             overlay,
             owner,
         )?;
+        self.diagnostics.record_snapshot_origin();
+        let mut compound_target = None;
+        if let Some(update) = self.pending_hierarchy_geometry {
+            self.diagnostics.compound_hierarchy_geometry_observed += 1;
+            self.diagnostics.compound_rebase_attempted += 1;
+            let live_entry = self.snapshot.as_ref().and_then(|live| live.entries.iter().find(|entry| entry.surface_xid == update.surface_xid));
+            let candidate_entry = snapshot.entries.iter_mut().find(|entry| entry.surface_xid == update.surface_xid);
+            if let (Some(live_entry), Some(candidate_entry)) = (live_entry, candidate_entry) {
+                let identity_ok = live_entry.surface_xid == candidate_entry.surface_xid
+                    && live_entry.semantic_client_xid == candidate_entry.semantic_client_xid
+                    && live_entry.lifecycle_xid == candidate_entry.lifecycle_xid
+                    && candidate_entry.map_state != xproto::MapState::UNMAPPED
+                    && candidate_entry.override_redirect == update.override_redirect;
+                if identity_ok {
+                    compound_target = Some(update.surface_xid);
+                    rebase_candidate_geometry_fields(candidate_entry, update);
+                    if let Some(client) = candidate_entry.client_root_geometry.as_mut() {
+                        client.width = i32::from(update.width);
+                        client.height = i32::from(update.height);
+                    }
+                    self.diagnostics.compound_rebase_success += 1;
+                    self.diagnostics.compound_rebase_avoided_full_retry += 1;
+                } else {
+                    self.diagnostics.compound_rebase_rejected_lifecycle += 1;
+                    self.pending_hierarchy_geometry = None;
+                    return Err(Box::new(CandidateBuildError::Stale(SceneInvalidation::Hierarchy)));
+                }
+            } else {
+                self.diagnostics.compound_rebase_rejected_scene_membership += 1;
+                self.pending_hierarchy_geometry = None;
+                return Err(Box::new(CandidateBuildError::Stale(SceneInvalidation::Hierarchy)));
+            }
+        }
         self.initialize_visual_state(&snapshot)?;
         resolve_regions_client_geometry(
             self.connection,
@@ -2211,45 +3632,114 @@ impl<'a> SceneSession<'a> {
         resolve_snapshot_fullscreen(&mut snapshot, &self.urgency, self.shadow_style);
         resolve_snapshot_opacity(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
         prune_invisible_entries(&mut snapshot.entries, self.shadow_style, snapshot.root_geometry);
+        if let Some(start) = resizeonly_snapshot_start {
+            self.diagnostics.record_structural_snapshot(start.elapsed());
+        }
         self.state = SceneState::SceneSnapshotReady;
+        if self.snapshot.as_ref().is_some_and(|live| candidate_has_resized_target(live, &snapshot, &self.resources)) {
+            if let Some(invalidation) = self.refresh_resize_state_before_acquisition(&mut snapshot)? {
+                return Err(Box::new(CandidateBuildError::Stale(invalidation)));
+            }
+        }
         let mut pixmaps = Vec::new();
         let mut damage_leases = Vec::new();
         let mut damage_registry = HashMap::new();
         let mut egl_surfaces = HashMap::new();
+        let mut resources = HashMap::new();
+        let mut replaced_existing_resource = false;
         let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
         for index in 0..snapshot.entries.len() {
             let entry = snapshot.entries[index].clone();
             let semantics = self.visual_formats.semantics(entry.visual, entry.depth);
             let importable = semantics != EglPixelSemantics::Unsupported;
-            if importable {
-                let damage = match DamageLease::acquire(self.connection, entry.surface_xid) {
-                    Ok(damage) => damage,
-                    Err(error) => return Err(translate_damage_lease_acquire_error(error)),
-                };
-                damage.subtract()?;
-                damage_registry.insert(damage.damage_xid, entry.surface_xid);
-                damage_leases.push(damage);
+            let replaced_existing = self.resources.contains_key(&entry.surface_xid);
+            replaced_existing_resource |= replaced_existing;
+            if let Some(old) = self.resources.get(&entry.surface_xid)
+                && reusable_resource_identity(self.current_snapshot(), &entry, old)
+            {
+                self.diagnostics.resource_bundles_reused += 1;
+                if let Some(damage) = &old.damage {
+                    damage_registry.insert(damage.damage_xid, entry.surface_xid);
+                }
+                if let Some(egl_surface) = &old.egl {
+                    egl_surfaces.insert(entry.surface_xid, Rc::clone(egl_surface));
+                }
+                pixmaps.push(Rc::clone(&old.pixmap));
+                if let Some(damage) = &old.damage { damage_leases.push(Rc::clone(damage)); }
+                resources.insert(entry.surface_xid, Rc::clone(old));
+                continue;
             }
+            self.diagnostics.resource_bundles_new += 1;
+            let reuse_compound_damage = compound_target == Some(entry.surface_xid)
+                && self.resources.get(&entry.surface_xid).is_some_and(|old| {
+                    old.damage.as_ref().is_some_and(|_| {
+                        self.snapshot.as_ref().and_then(|live| live.entries.iter().find(|previous| previous.surface_xid == entry.surface_xid)).is_some_and(|previous| damage_identity_compatible(previous, &entry))
+                    })
+                });
+            let damage = if importable {
+                let damage = if reuse_compound_damage {
+                    let damage = Rc::clone(self.resources.get(&entry.surface_xid).and_then(|old| old.damage.as_ref()).expect("compound Damage reuse was checked"));
+                    self.diagnostics.compound_rebase_damage_reused += 1;
+                    damage
+                } else {
+                    let damage = match DamageLease::acquire(self.connection, entry.surface_xid) {
+                        Ok(damage) => damage,
+                        Err(error) => return Err(translate_damage_lease_acquire_error(error)),
+                    };
+                    if replaced_existing { self.diagnostics.resized_target_damage_acquisitions += 1; }
+                    damage.subtract()?;
+                    Rc::new(damage)
+                };
+                damage_registry.insert(damage.damage_xid, entry.surface_xid);
+                damage_leases.push(Rc::clone(&damage));
+                Some(damage)
+            } else {
+                None
+            };
             let pixmap = match NamedSurfacePixmap::acquire(
                 self.connection,
                 &entry,
                 self.root,
                 root_geometry,
+                None,
             ) {
                 Ok(pixmap) => pixmap,
                 Err(error) => return Err(translate_named_pixmap_acquire_error(error)),
             };
+            if replaced_existing { self.diagnostics.resized_target_named_pixmap_acquisitions += 1; }
+            if compound_target == Some(entry.surface_xid) && replaced_existing {
+                self.diagnostics.compound_rebase_named_pixmap_reacquired += 1;
+            }
             if !importable {
                 println!(
                     "EGL import unsupported by capability policy: canonical surface=0x{:08x} depth={} visual=0x{:08x}",
                     entry.surface_xid, entry.depth, entry.visual
                 );
-                pixmaps.push(pixmap);
+                let pixmap = Rc::new(pixmap);
+                pixmaps.push(Rc::clone(&pixmap));
+                resources.insert(entry.surface_xid, Rc::new(SurfaceResourceBundle {
+                    damage,
+                    pixmap,
+                    egl: None,
+                }));
                 continue;
             }
-            let egl_surface = egl.import_pixmap(pixmap.pixmap_xid, semantics)?;
-            egl_surfaces.insert(entry.surface_xid, egl_surface);
-            pixmaps.push(pixmap);
+            let pixmap = Rc::new(pixmap);
+            let egl_surface = Rc::new(std::cell::RefCell::new(egl.import_pixmap(pixmap.pixmap_xid, semantics)?));
+            if replaced_existing {
+                self.diagnostics.resized_target_egl_imports += 1;
+                self.diagnostics.resized_target_bundle_acquisitions += 1;
+            }
+            if compound_target == Some(entry.surface_xid) && replaced_existing {
+                self.diagnostics.compound_rebase_egl_reacquired += 1;
+            }
+            egl_surfaces.insert(entry.surface_xid, Rc::clone(&egl_surface));
+            pixmaps.push(Rc::clone(&pixmap));
+            resources.insert(entry.surface_xid, Rc::new(SurfaceResourceBundle {
+                damage,
+                pixmap,
+                egl: Some(egl_surface),
+            }));
         }
         self.connection.inner.get_input_focus()?.reply()?;
         for entry in &snapshot.entries {
@@ -2263,12 +3753,15 @@ impl<'a> SceneSession<'a> {
             return Err("scene has canonical surfaces but no EGL-renderable surfaces".into());
         }
         self.render_egl_scene(&snapshot, &egl_surfaces, &pixmaps)?;
+        self.diagnostics.last_candidate_resize = replaced_existing_resource;
+        if replaced_existing_resource { self.diagnostics.resize_candidate_started += 1; }
         self.state = SceneState::NamedPixmapsReady;
         println!("state: EGLImported surfaces={}", egl_surfaces.len());
         let watch_additions = self.structure_watches.ensure_candidate(&watch_ids)?;
         Ok(SceneCandidate {
             snapshot,
             generation,
+            resources,
             pixmaps,
             damage_leases,
             damage_registry,
@@ -2277,6 +3770,77 @@ impl<'a> SceneSession<'a> {
             watch_additions,
             ignored_configure_windows,
         })
+    }
+
+    fn refresh_resize_state_before_acquisition(
+        &mut self,
+        candidate: &mut SceneSnapshot,
+    ) -> Result<Option<SceneInvalidation>, Box<dyn Error>> {
+        for _ in 0..MAX_EVENTS_PER_BATCH {
+            let Some(event) = self.connection.inner.poll_for_event()? else {
+                break;
+            };
+            self.diagnostics.record_configure(&event, candidate);
+            let geometry_source = geometry_event_source(&event, candidate);
+            self.diagnostics.record_geometry_source(geometry_source);
+            let _ = self.present_opportunity(&event);
+            let geometry_update = configure_geometry_update(&event, candidate);
+            if geometry_update.is_none() && matches!(event, Event::ConfigureNotify(_)) { self.diagnostics.record_geometry_rejected(geometry_source); }
+            let visual_invalidation = self.maybe_update_visual_state(&event)?;
+            let invalidation = if is_background_property_notify(&event, self.root, self.background_atoms) {
+                SceneInvalidation::Background
+            } else if let Some(invalidation) = visual_invalidation {
+                invalidation
+            } else {
+                self.classify_session_event(event, self.current_snapshot(), &self.damage_registry, &self.damage_registry)
+            };
+            self.observe_invalidation(invalidation);
+            if matches!(invalidation, SceneInvalidation::Hierarchy) {
+                self.diagnostics.compound_rebase_attempted += 1;
+                self.diagnostics.compound_rebase_rejected_newer_hierarchy += 1;
+                return Ok(Some(SceneInvalidation::Hierarchy));
+            }
+            if let Some(update) = geometry_update {
+                self.diagnostics.record_pending_geometry(geometry_source, self.pending_move_geometry.is_some(), self.pending_move_geometry.is_some_and(|current| current.surface_xid == update.surface_xid));
+                if self.pending_move_geometry.is_some() {
+                    self.diagnostics.configure_superseded += 1;
+                }
+                if self.pending_move_geometry.is_some_and(|current| current.surface_xid != update.surface_xid) {
+                    self.pending_move_geometry_ambiguous = true;
+                }
+                self.pending_move_geometry = Some(update);
+                if let Some(candidate_entry) = candidate.entries.iter().find(|entry| entry.surface_xid == update.surface_xid)
+                    && resize_geometry_is_obsolete(candidate_entry.geometry, update)
+                {
+                    self.diagnostics.compound_hierarchy_geometry_observed += 1;
+                    self.diagnostics.compound_rebase_attempted += 1;
+                    self.diagnostics.compound_rebase_superseded_geometry += 1;
+                    if target_geometry_rebase_compatible(self.current_snapshot(), candidate, update) {
+                        if let Some(candidate_entry) = candidate.entries.iter_mut().find(|entry| entry.surface_xid == update.surface_xid) {
+                            let size_changed = candidate_entry.geometry.width != update.width || candidate_entry.geometry.height != update.height || candidate_entry.geometry.border_width != update.border_width;
+                            rebase_candidate_geometry_fields(candidate_entry, update);
+                            if let Some(client) = candidate_entry.client_root_geometry.as_mut() { client.width = i32::from(update.width); client.height = i32::from(update.height); }
+                            self.diagnostics.compound_rebase_success += 1;
+                            self.diagnostics.compound_rebase_avoided_full_retry += 1;
+                            if size_changed { self.diagnostics.compound_rebase_named_pixmap_reacquired += 1; self.diagnostics.compound_rebase_egl_reacquired += 1; }
+                            else { self.diagnostics.compound_rebase_damage_reused += 1; }
+                        }
+                    } else {
+                        self.diagnostics.compound_rebase_rejected_scene_membership += 1;
+                        return Ok(Some(SceneInvalidation::Geometry(update.surface_xid)));
+                    }
+                }
+            }
+            match invalidation {
+                SceneInvalidation::PixelDamage(damage_id) => {
+                    self.pending_damage.insert(damage_id);
+                }
+                SceneInvalidation::Hierarchy => return Ok(Some(SceneInvalidation::Hierarchy)),
+                SceneInvalidation::Shutdown(reason) => return Ok(Some(SceneInvalidation::Shutdown(reason))),
+                _ => {}
+            }
+        }
+        Ok(None)
     }
 
     fn rebuild_and_present(&mut self) -> Result<(), Box<dyn Error>> {
@@ -2290,12 +3854,19 @@ impl<'a> SceneSession<'a> {
                         .downcast_ref::<CandidateBuildError>()
                         .map(|stale| match stale { CandidateBuildError::Stale(invalidation) => *invalidation });
                     let Some(invalidation) = stale else {
+                        self.diagnostics.structural_candidates_failed += 1;
+                        self.diagnostics.record_structural_terminal(false, false, false);
                         return Err(error);
                     };
+                    self.diagnostics.structural_candidates_stale += 1;
+                    self.diagnostics.record_stale_origin(invalidation, !retry_allowed(attempt));
+                    if self.diagnostics.last_candidate_resize { self.diagnostics.resize_candidate_stale += 1; }
                     if retry_allowed(attempt) {
+                        self.diagnostics.record_structural_terminal(false, true, true);
                         println!("candidate stale; bounded retry: {invalidation:?}");
                         continue;
                     } else {
+                        self.diagnostics.record_structural_terminal(false, true, false);
                         println!("candidate stale; deferred rebuild: {invalidation:?}");
                         return Ok(());
                     }
@@ -2306,32 +3877,49 @@ impl<'a> SceneSession<'a> {
                 Ok(gate) => gate,
                 Err(error) => {
                     self.structure_watches.rollback(&candidate.watch_additions)?;
+                    self.diagnostics.record_structural_terminal(false, false, false);
                     return Err(error);
                 }
             };
             match gate {
                 GateDecision::Accept => {
-                    self.commit_candidate(candidate)?;
+                    self.diagnostics.structural_candidates_published += 1;
+                    if self.diagnostics.last_candidate_resize { self.diagnostics.resize_candidate_published += 1; }
+                    if let Err(error) = self.commit_candidate(candidate) {
+                        self.diagnostics.record_structural_terminal(false, false, false);
+                        return Err(error);
+                    }
+                    self.diagnostics.record_structural_terminal(true, false, false);
                     self.merge_deferred_damage(deferred_damage);
                     return Ok(());
                 }
                 GateDecision::Shutdown(reason) => {
                     self.structure_watches.rollback(&candidate.watch_additions)?;
+                    self.diagnostics.record_structural_terminal(false, false, false);
                     return Err(format!("candidate aborted by shutdown: {reason:?}").into());
                 }
                 GateDecision::Retry(invalidation) if retry_allowed(attempt) => {
+                    self.diagnostics.structural_candidates_stale += 1;
+                    self.diagnostics.record_stale_origin(invalidation, false);
+                    if self.diagnostics.last_candidate_resize { self.diagnostics.resize_candidate_stale += 1; }
                     self.merge_deferred_damage(deferred_damage);
                     self.structure_watches.rollback(&candidate.watch_additions)?;
+                    self.diagnostics.record_structural_terminal(false, true, true);
                     println!("candidate stale; bounded retry: {invalidation:?}");
                 }
                 GateDecision::Retry(invalidation) => {
+                    self.diagnostics.structural_candidates_stale += 1;
+                    self.diagnostics.record_stale_origin(invalidation, true);
+                    if self.diagnostics.last_candidate_resize { self.diagnostics.resize_candidate_stale += 1; }
                     self.merge_deferred_damage(deferred_damage);
                     self.structure_watches.rollback(&candidate.watch_additions)?;
                     if retry_allowed(attempt) {
+                        self.diagnostics.record_structural_terminal(false, true, true);
                         println!("candidate stale; bounded retry: {invalidation:?}");
                         continue;
                     } else {
                         drop(candidate);
+                        self.diagnostics.record_structural_terminal(false, true, false);
                         println!("candidate stale; deferred rebuild: {invalidation:?}");
                         return Ok(());
                     }
@@ -2353,7 +3941,12 @@ impl<'a> SceneSession<'a> {
                 break;
             };
             drained += 1;
+            self.diagnostics.record_configure(&event, &candidate.snapshot);
+            let geometry_source = geometry_event_source(&event, &candidate.snapshot);
+            self.diagnostics.record_geometry_source(geometry_source);
             let geometry_update = configure_geometry_update(&event, &candidate.snapshot);
+            if geometry_update.is_none() && matches!(event, Event::ConfigureNotify(_)) { self.diagnostics.record_geometry_rejected(geometry_source); }
+            batch.note_configure_event(&event, geometry_source, candidate.snapshot.entries.iter().find_map(|entry| matches!(&event, Event::ConfigureNotify(event) if entry.surface_xid == event.window || entry.semantic_client_xid == Some(event.window)).then_some(entry.surface_xid)));
             let visual_invalidation = if is_visual_property_notify(&event, self.root, self.visual_atoms, &candidate.snapshot) {
                 let entries = candidate.snapshot.entries.clone();
                 self.update_visual_state(&event, &entries)?
@@ -2366,7 +3959,7 @@ impl<'a> SceneSession<'a> {
                 invalidation
             } else {
                 classify_event_with_registries_and_ignored(
-                event,
+                event.clone(),
                 self.root,
                 &candidate.snapshot,
                 self.ownership.as_ref(),
@@ -2375,6 +3968,8 @@ impl<'a> SceneSession<'a> {
                 &candidate.ignored_configure_windows,
                 )
             };
+            self.record_hierarchy_event_diagnostic(&event, invalidation, &candidate.snapshot, self.pending_move_geometry);
+            if matches!(invalidation, SceneInvalidation::Hierarchy) { if let Some(source) = hierarchy_event_source(&event) { batch.note_hierarchy_source(source); } }
             self.observe_invalidation(invalidation);
             batch.push(invalidation);
             batch.push_geometry_update(geometry_update);
@@ -2475,14 +4070,6 @@ impl<'a> SceneSession<'a> {
         let previous_geometry = candidate_entry.geometry;
         let previous_client_root = candidate_entry.client_root_geometry;
         rebase_candidate_geometry_fields(&mut candidate.snapshot.entries[candidate_index], update);
-        let pixmap_index = candidate
-            .pixmaps
-            .iter()
-            .position(|pixmap| pixmap.surface_xid == update.surface_xid);
-        let previous_pixmap_geometry = pixmap_index.map(|index| candidate.pixmaps[index].window_geometry);
-        if let Some(index) = pixmap_index {
-            candidate.pixmaps[index].window_geometry = next_geometry;
-        }
         let render_result = self.render_egl_scene(
             &candidate.snapshot,
             &candidate.egl_surfaces,
@@ -2491,9 +4078,6 @@ impl<'a> SceneSession<'a> {
         if let Err(error) = render_result {
             candidate.snapshot.entries[candidate_index].geometry = previous_geometry;
             candidate.snapshot.entries[candidate_index].client_root_geometry = previous_client_root;
-            if let (Some(index), Some(previous)) = (pixmap_index, previous_pixmap_geometry) {
-                candidate.pixmaps[index].window_geometry = previous;
-            }
             return Err(error);
         }
         Ok(true)
@@ -2539,9 +4123,10 @@ impl<'a> SceneSession<'a> {
             .copied()
             .collect::<HashSet<_>>();
         let snapshot = candidate.snapshot;
-        let old_pixmaps = std::mem::replace(&mut self.pixmaps, candidate.pixmaps);
-        let old_damage_leases = std::mem::replace(&mut self.damage_leases, candidate.damage_leases);
-        let mut old_egl_surfaces = std::mem::replace(&mut self.egl_surfaces, candidate.egl_surfaces);
+        let old_resources = std::mem::replace(&mut self.resources, candidate.resources);
+        let _old_pixmaps = std::mem::replace(&mut self.pixmaps, candidate.pixmaps);
+        let _old_damage_leases = std::mem::replace(&mut self.damage_leases, candidate.damage_leases);
+        let _old_egl_surfaces = std::mem::replace(&mut self.egl_surfaces, candidate.egl_surfaces);
         self.damage_registry = candidate.damage_registry;
         self.ignored_configure_windows = candidate.ignored_configure_windows;
         self.snapshot = Some(snapshot);
@@ -2553,14 +4138,9 @@ impl<'a> SceneSession<'a> {
             .collect::<HashSet<_>>();
         self.urgency.retain(|client, _| live_clients.contains(client));
         self.structure_watches.reconcile(&candidate.watch_ids)?;
-        for damage in &old_damage_leases {
-            retire_damage_lease(damage, removed_surfaces.contains(&damage.surface_xid))?;
-        }
-        egl.make_current()?;
-        for surface in old_egl_surfaces.values_mut() {
-            egl.destroy_import(surface)?;
-        }
-        drop(old_pixmaps);
+        self.pending_hierarchy_geometry = None;
+        drop(removed_surfaces);
+        drop(old_resources);
         self.retain_current_pending();
         self.state = SceneState::RunningLivePixel;
         println!("state: ScenePresented (MANUAL active, EGL scene renderer)");
@@ -2577,7 +4157,9 @@ impl<'a> SceneSession<'a> {
             return Ok(());
         };
         let (serial, target_msc) = self.scheduler.arm(target_msc);
-        present.arm(self.connection, serial, target_msc)
+        let result = present.arm(self.connection, serial, target_msc);
+        if result.is_ok() { self.diagnostics.present_submissions += 1; }
+        result
     }
 
     fn merge_deferred_damage(&mut self, deferred: HashSet<damage::Damage>) {
@@ -2591,7 +4173,16 @@ impl<'a> SceneSession<'a> {
     fn observe_invalidation(&mut self, invalidation: SceneInvalidation) {
         observe_structural_generation(&mut self.structural_generation, invalidation);
         match invalidation {
-            SceneInvalidation::PixelDamage(_) => self.scheduler.mark_pixel_dirty(),
+            SceneInvalidation::PixelDamage(damage_id) => {
+                let surface = self.damage_registry.get(&damage_id).copied();
+                let identity = surface.map(|surface_xid| {
+                    (surface_xid, self.current_snapshot().entries.iter()
+                        .find(|entry| entry.surface_xid == surface_xid)
+                        .and_then(|entry| entry.semantic_client_xid))
+                });
+                self.diagnostics.record_damage_arrival(damage_id, identity);
+                self.scheduler.mark_pixel_dirty();
+            }
             SceneInvalidation::Background => {
                 self.pending_background = true;
                 self.scheduler.mark_pixel_dirty();
@@ -2607,12 +4198,35 @@ impl<'a> SceneSession<'a> {
         }
     }
 
+    fn record_hierarchy_event_diagnostic(&mut self, event: &Event, invalidation: SceneInvalidation, snapshot: &SceneSnapshot, pending: Option<PendingGeometry>) {
+        if !matches!(invalidation, SceneInvalidation::Hierarchy) { return; }
+        let Some(source) = hierarchy_event_source(event) else { return; };
+        let xid = hierarchy_event_window(event);
+        let internal = xid.is_some_and(|xid| {
+            self.overlay.as_ref().is_some_and(|overlay| self.ownership.as_ref().is_some_and(|owner| is_internal_xid(xid, overlay.overlay, owner.owner_window)))
+        });
+        let relation = match xid {
+            Some(xid) if pending.is_some_and(|pending| pending.surface_xid == xid) => HierarchyEventRelation::TargetSurface,
+            Some(xid) if pending.and_then(|pending| snapshot.entries.iter().find(|entry| entry.surface_xid == pending.surface_xid).and_then(|entry| entry.semantic_client_xid)).is_some_and(|client| client == xid) => HierarchyEventRelation::TargetSemanticClient,
+            Some(xid) if snapshot.entries.iter().any(|entry| entry.surface_xid == xid) => HierarchyEventRelation::OtherTrackedSurface,
+            Some(xid) if snapshot.entries.iter().any(|entry| entry.semantic_client_xid == Some(xid)) => HierarchyEventRelation::OtherSemanticClient,
+            _ => HierarchyEventRelation::Unknown,
+        };
+        self.diagnostics.record_hierarchy_event(source, internal, relation);
+    }
+
+    fn begin_hierarchy_origin(&mut self, bits: u16) {
+        self.diagnostics.hierarchy_source_bits = bits;
+        self.diagnostics.begin_structural_origin(StructuralOrigin::Hierarchy);
+    }
+
     fn present_opportunity(&mut self, event: &Event) -> Option<u64> {
         let Event::PresentCompleteNotify(event) = event else {
             return None;
         };
         let present = self.present.as_mut()?;
         let msc = present.complete(event)?;
+        self.diagnostics.present_completion_events += 1;
         if !self.scheduler.complete(event.serial, msc) {
             return None;
         }
@@ -2625,8 +4239,11 @@ impl<'a> SceneSession<'a> {
             let mut opportunity_msc = None;
             let mut batch = InvalidationBatch::default();
             if let Some(update) = self.pending_move_geometry.take() {
+                let history = self.pending_move_geometry_present_history;
                 batch.push(SceneInvalidation::Geometry(update.surface_xid));
                 batch.push_geometry_update(Some(update));
+                batch.present_history = history;
+                self.pending_move_geometry_present_history = GeometryPresentHistory::default();
                 batch.geometry_ambiguous = self.pending_move_geometry_ambiguous;
                 self.pending_move_geometry_ambiguous = false;
             }
@@ -2651,6 +4268,7 @@ impl<'a> SceneSession<'a> {
                 ),
                 StructuralGenerationState::Ready(_)
             ) {
+                batch.note_hierarchy_source(HierarchyEventSource::ExistingHierarchyMerge);
                 batch.push(SceneInvalidation::Hierarchy);
             }
             for damage_id in pending {
@@ -2668,31 +4286,51 @@ impl<'a> SceneSession<'a> {
                         return Ok(());
                     }
                 };
+                let snapshot = self.snapshot.as_ref().expect("published scene snapshot must exist while live");
+                self.diagnostics.record_configure(&first, snapshot);
+                let first_geometry_source = geometry_event_source(&first, snapshot);
+                let first_surface_xid = snapshot.entries.iter().find_map(|entry| matches!(&first, Event::ConfigureNotify(event) if entry.surface_xid == event.window || entry.semantic_client_xid == Some(event.window)).then_some(entry.surface_xid));
+                self.diagnostics.record_geometry_source(first_geometry_source);
+                batch.note_configure_event(&first, first_geometry_source, first_surface_xid);
                 opportunity_msc = self.present_opportunity(&first);
                 let geometry_update = configure_geometry_update(&first, self.current_snapshot());
                 let visual_invalidation = self.maybe_update_visual_state(&first)?;
                 let invalidation = visual_invalidation.unwrap_or_else(|| {
-                    self.classify_session_event(first, self.current_snapshot(), &self.damage_registry, &self.damage_registry)
+                self.classify_session_event(first.clone(), self.current_snapshot(), &self.damage_registry, &self.damage_registry)
                 });
                 if !matches!(invalidation, SceneInvalidation::Geometry(_)) {
                     self.observe_invalidation(invalidation);
                 }
+                let current_snapshot = self.current_snapshot().clone();
+                self.record_hierarchy_event_diagnostic(&first, invalidation, &current_snapshot, batch.geometry_update);
+                if matches!(invalidation, SceneInvalidation::Hierarchy) { if let Some(source) = hierarchy_event_source(&first) { batch.note_hierarchy_source(source); } }
                 batch.push(invalidation);
+                if geometry_update.is_some() { self.diagnostics.record_pending_geometry(first_geometry_source, batch.geometry_update.is_some(), true); }
                 batch.push_geometry_update(geometry_update);
                 for _ in 1..MAX_EVENTS_PER_BATCH {
                     let Some(event) = self.connection.inner.poll_for_event()? else {
                         break;
                     };
+                    let snapshot = self.snapshot.as_ref().expect("published scene snapshot must exist while live");
+                    self.diagnostics.record_configure(&event, snapshot);
+                    let geometry_source = geometry_event_source(&event, snapshot);
+                    let surface_xid = snapshot.entries.iter().find_map(|entry| matches!(&event, Event::ConfigureNotify(event) if entry.surface_xid == event.window || entry.semantic_client_xid == Some(event.window)).then_some(entry.surface_xid));
+                    self.diagnostics.record_geometry_source(geometry_source);
+                    batch.note_configure_event(&event, geometry_source, surface_xid);
                     opportunity_msc = opportunity_msc.or_else(|| self.present_opportunity(&event));
                     let geometry_update = configure_geometry_update(&event, self.current_snapshot());
                     let visual_invalidation = self.maybe_update_visual_state(&event)?;
                     let invalidation = visual_invalidation.unwrap_or_else(|| {
-                        self.classify_session_event(event, self.current_snapshot(), &self.damage_registry, &self.damage_registry)
+                    self.classify_session_event(event.clone(), self.current_snapshot(), &self.damage_registry, &self.damage_registry)
                     });
                     if !matches!(invalidation, SceneInvalidation::Geometry(_)) {
                         self.observe_invalidation(invalidation);
                     }
+                    let current_snapshot = self.current_snapshot().clone();
+                    self.record_hierarchy_event_diagnostic(&event, invalidation, &current_snapshot, batch.geometry_update);
+                    if matches!(invalidation, SceneInvalidation::Hierarchy) { if let Some(source) = hierarchy_event_source(&event) { batch.note_hierarchy_source(source); } }
                     batch.push(invalidation);
+                    if geometry_update.is_some() { self.diagnostics.record_pending_geometry(geometry_source, batch.geometry_update.is_some(), true); }
                     batch.push_geometry_update(geometry_update);
                 }
             }
@@ -2700,20 +4338,43 @@ impl<'a> SceneSession<'a> {
                 println!("scene shutdown: Signal");
                 return Ok(());
             }
+            if batch.geometry.is_some() { self.diagnostics.record_geometry_scheduling_batch(); }
             if present_enabled && opportunity_msc.is_none() {
+                if batch.geometry.is_some() {
+                    self.diagnostics.resize_dispatch_deferred += 1;
+                    self.diagnostics.record_present_deferred();
+                    self.diagnostics.record_pre_attempt_bypass(batch.geometry_source.unwrap_or(GeometryEventSource::Unknown), PreResizeOnlyBypassReason::NoPresentComplete, None, false);
+                }
                 self.defer_geometry(&batch);
                 self.pending_damage.extend(batch.pixel_damage().iter().copied());
                 continue;
             }
             let decision = batch.decision();
+            if matches!(decision, SceneInvalidation::Hierarchy) {
+                let direction = batch.hierarchy_pending_geometry.and_then(|update| self.current_snapshot().entries.iter().find(|entry| entry.surface_xid == update.surface_xid).map(|entry| classify_resizeonly_direction(entry.geometry, update).0));
+                self.diagnostics.record_hierarchy_decision(batch.hierarchy_source_bits, batch.hierarchy_geometry_pending, direction);
+            }
             let batch_pixel_damage = batch.pixel_damage().clone();
+            self.diagnostics.event_batches += 1;
+            if batch.geometry.is_some() { self.diagnostics.event_batches_with_geometry += 1; }
+            if !batch_pixel_damage.is_empty() { self.diagnostics.event_batches_with_pixel_damage_arrival += 1; }
+            if !self.pending_damage.is_empty() {
+                self.diagnostics.event_batches_ended_with_pixel_damage_pending += 1;
+                self.diagnostics.batches_with_damage_pending += 1;
+                self.diagnostics.max_batches_damage_remained_pending =
+                    self.diagnostics.max_batches_damage_remained_pending.max(self.diagnostics.batches_with_damage_pending);
+            } else {
+                self.diagnostics.batches_with_damage_pending = 0;
+            }
             if batch_damage_requires_subtraction(decision, &batch_pixel_damage) {
                 for damage_id in &batch_pixel_damage {
-                    self.damage_lease(*damage_id)?.subtract()?;
+                    self.subtract_damage_for_diagnostics(*damage_id)?;
                 }
             }
-            if present_enabled {
+            if present_enabled && !matches!(decision, SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy) {
                 self.pending_damage.clear();
+            } else {
+                carry_structural_pending_damage(&mut self.pending_damage, decision, &batch_pixel_damage);
             }
             match decision {
                 SceneInvalidation::Ignore => {}
@@ -2722,22 +4383,81 @@ impl<'a> SceneSession<'a> {
                     return Ok(());
                 }
                 SceneInvalidation::Geometry(window) => {
-                    if self.try_move_only(window, batch.move_geometry(), &batch_pixel_damage)? {
+                    self.diagnostics.geometry_dispatches += 1;
+                    let geometry_source = batch.geometry_source.unwrap_or(GeometryEventSource::Unknown);
+                    let diagnostic_update = batch.move_geometry().or(batch.geometry_event_update);
+                    let size_change = diagnostic_update.is_some_and(|update| self.current_snapshot().entries.iter().find(|entry| entry.surface_xid == window).is_some_and(|entry| entry.geometry.width != update.width || entry.geometry.height != update.height || entry.geometry.border_width != update.border_width));
+                    let resize_direction = diagnostic_update.and_then(|update| self.current_snapshot().entries.iter().find(|entry| entry.surface_xid == window).map(|entry| classify_resizeonly_direction(entry.geometry, update)));
+                    if let Some((direction, move_resize)) = resize_direction.filter(|_| size_change) {
+                        self.diagnostics.record_final_resize_history(batch.present_history, direction, move_resize);
+                    }
+                    if size_change { self.diagnostics.record_geometry_pending_at_dispatch(batch.move_geometry()); }
+                    if !batch_pixel_damage.is_empty() {
+                        self.diagnostics.geometry_dispatches_while_damage_pending += 1;
+                        self.diagnostics.pixel_damage_deferred_by_geometry += 1;
+                        self.diagnostics.consecutive_geometry_while_damage_pending += 1;
+                        self.diagnostics.max_geometry_dispatches_before_pending_damage_service =
+                            self.diagnostics.max_geometry_dispatches_before_pending_damage_service
+                                .max(self.diagnostics.consecutive_geometry_while_damage_pending);
+                    }
+                    if let Some(update) = batch.move_geometry()
+                        && self.current_snapshot().entries.iter().find(|entry| entry.surface_xid == window)
+                            .is_some_and(|entry| entry.geometry.width != update.width || entry.geometry.height != update.height)
+                    {
+                        self.diagnostics.resize_geometry_dispatches += 1;
+                    }
+                    let resize_only = batch.move_geometry()
+                        .filter(|update| update.surface_xid == window)
+                        .filter(|update| self.current_snapshot().entries.iter()
+                            .find(|entry| entry.surface_xid == window)
+                            .is_some_and(|entry| entry.geometry.width != update.width
+                                || entry.geometry.height != update.height
+                            || entry.geometry.border_width != update.border_width));
+                    let resizeonly_selected = resize_only.is_some();
+                    if resizeonly_selected {
+                        self.diagnostics.resizeonly_present_deferred = Some(batch.present_history.ever_deferred);
+                    }
+                    let resizeonly_succeeded = if let Some(update) = resize_only
+                        && self.try_resize_only(update, &batch_pixel_damage)?
+                    {
+                        if size_change { self.diagnostics.record_resize_dispatch(geometry_source, false); }
+                        self.pending_background = false;
+                        self.pending_visual_state = false;
+                        true
+                    } else { false };
+                    if resizeonly_succeeded {
+                        self.diagnostics.record_final_resize_selection(batch.present_history, false);
+                        self.diagnostics.resizeonly_present_deferred = None;
+                    } else if self.try_move_only(window, batch.move_geometry(), &batch_pixel_damage)? {
                         self.pending_damage.clear();
                         self.pending_background = false;
                         self.pending_visual_state = false;
                         self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap()?;
                     } else {
                         self.observe_invalidation(SceneInvalidation::Geometry(window));
-                        self.pending_damage.clear();
                         self.pending_background = false;
+                        self.diagnostics.begin_resizeonly_structural_fallback();
                         self.refresh_background()?;
+                        if size_change {
+                            self.diagnostics.record_resize_dispatch(geometry_source, true);
+                            self.diagnostics.record_final_resize_selection(batch.present_history, true);
+                            if batch.move_geometry().is_none() { self.diagnostics.resize_dispatch_no_pending_geometry += 1; }
+                            let direction = resize_direction.map(|(direction, _)| direction);
+                            if !resizeonly_selected {
+                                let reason = if matches!(geometry_source, GeometryEventSource::SemanticClient) { PreResizeOnlyBypassReason::SemanticClientNoSurfacePendingGeometry } else if batch.move_geometry().is_none() { PreResizeOnlyBypassReason::NoPendingGeometry } else if batch.geometry_ambiguous { PreResizeOnlyBypassReason::AmbiguousOrSuperseded } else { PreResizeOnlyBypassReason::StructuralAlreadyRequired };
+                                self.diagnostics.record_pre_attempt_bypass(geometry_source, reason, direction, false);
+                            }
+                            self.diagnostics.begin_structural_origin(match geometry_source { GeometryEventSource::CanonicalSurface => StructuralOrigin::GeometrySurface, GeometryEventSource::SemanticClient => StructuralOrigin::GeometrySemanticClient, GeometryEventSource::Other | GeometryEventSource::Unknown => StructuralOrigin::GeometryNoPending });
+                        }
                         self.rebuild_and_present()?;
                     }
                 }
                 SceneInvalidation::Hierarchy => {
-                    self.pending_damage.clear();
                     self.pending_background = false;
+                    self.diagnostics.resize_dispatch_hierarchy_dominated += 1;
+                    self.diagnostics.geometry_scheduling_hierarchy_dominated += 1;
+                    self.pending_hierarchy_geometry = batch.hierarchy_pending_geometry;
+                    self.begin_hierarchy_origin(batch.hierarchy_source_bits);
                     self.refresh_background()?;
                     self.rebuild_and_present()?;
                 }
@@ -2773,6 +4493,187 @@ impl<'a> SceneSession<'a> {
         }
     }
 
+    fn try_resize_only(
+        &mut self,
+        update: PendingGeometry,
+        initial_damage: &HashSet<damage::Damage>,
+    ) -> Result<bool, Box<dyn Error>> {
+        self.diagnostics.resizeonly_attempted += 1;
+        if self.pending_background || self.pending_visual_state || self.snapshot.is_none() {
+            self.diagnostics.record_resizeonly_early_fallback();
+            return Ok(false);
+        }
+        let live = self.current_snapshot().clone();
+        let Some(index) = live.entries.iter().position(|entry| entry.surface_xid == update.surface_xid) else {
+            self.diagnostics.record_resizeonly_early_fallback();
+            return Ok(false);
+        };
+        let previous = live.entries[index].clone();
+        let (direction, move_resize) = classify_resizeonly_direction(previous.geometry, update);
+        self.diagnostics.record_resizeonly_attempt(direction, move_resize);
+        let total_start = self.diagnostics.enabled.then(Instant::now);
+        macro_rules! resizeonly_fallback {
+            ($reason:expr) => {{
+                self.diagnostics.resizeonly_fallback += 1;
+                self.diagnostics.record_resizeonly_fallback(direction, move_resize, $reason);
+                self.diagnostics.record_resizeonly_outcome(
+                    direction, move_resize, false, false, total_start.map(|start| start.elapsed()),
+                );
+                return Ok(false);
+            }};
+        }
+        if previous.override_redirect != update.override_redirect {
+            resizeonly_fallback!(ResizeOnlyFallbackReason::IdentityMismatch);
+        }
+        if previous.geometry.width == update.width
+            && previous.geometry.height == update.height
+            && previous.geometry.border_width == update.border_width
+        {
+            resizeonly_fallback!(ResizeOnlyFallbackReason::NoSizeChange);
+        }
+
+        let mut snapshot = live;
+        rebase_candidate_geometry_fields(&mut snapshot.entries[index], update);
+        if let Some(client) = snapshot.entries[index].client_root_geometry.as_mut() {
+            client.width = i32::from(update.width);
+            client.height = i32::from(update.height);
+        }
+
+        let pre_acquire_start = self.diagnostics.enabled.then(Instant::now);
+        if let Some(invalidation) = self.refresh_resize_state_before_acquisition(&mut snapshot)? {
+            if matches!(invalidation, SceneInvalidation::Geometry(_)) {
+                self.diagnostics.resizeonly_superseded_before_acquisition += 1;
+            }
+            let reason = match invalidation {
+                SceneInvalidation::Geometry(_) => ResizeOnlyFallbackReason::GeometrySuperseded,
+                SceneInvalidation::Hierarchy => ResizeOnlyFallbackReason::Hierarchy,
+                _ => ResizeOnlyFallbackReason::UnavailableState,
+            };
+            resizeonly_fallback!(reason);
+        }
+        if let Some(start) = pre_acquire_start {
+            self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::PreAcquire, start.elapsed());
+        }
+
+        let semantics = self.visual_formats.semantics(previous.visual, previous.depth);
+        if semantics == EglPixelSemantics::Unsupported {
+            resizeonly_fallback!(ResizeOnlyFallbackReason::UnsupportedVisual);
+        }
+        let root_geometry = snapshot.root_geometry;
+        let Some(damage) = self
+            .resources
+            .get(&update.surface_xid)
+            .and_then(|bundle| bundle.damage.as_ref())
+            .filter(|damage| self.damage_registry.get(&damage.damage_xid) == Some(&update.surface_xid))
+            .map(Rc::clone)
+        else {
+            resizeonly_fallback!(ResizeOnlyFallbackReason::MissingDamage);
+        };
+        self.diagnostics.resizeonly_target_damage_reused += 1;
+        if self.diagnostics.enabled {
+            self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::Damage, Duration::ZERO);
+        }
+        let resource_start = self.diagnostics.enabled.then(Instant::now);
+        let mut pixmap_geometry_timing = TimingMetric::default();
+        let name_pixmap_start = self.diagnostics.enabled.then(Instant::now);
+        let pixmap_result = NamedSurfacePixmap::acquire(
+            self.connection,
+            &snapshot.entries[index],
+            self.root,
+            root_geometry,
+            self.diagnostics.enabled.then_some(&mut pixmap_geometry_timing),
+        ).map_err(translate_named_pixmap_acquire_error);
+        if let Some(start) = name_pixmap_start {
+            self.diagnostics.record_resizeonly_stage(
+                direction,
+                ResizeOnlyStage::NamePixmap,
+                start.elapsed(),
+            );
+        }
+        if self.diagnostics.enabled {
+            self.diagnostics
+                .resizeonly_direction_mut(direction)
+                .pixmap_get_geometry
+                .merge(pixmap_geometry_timing);
+        }
+        let pixmap = match pixmap_result {
+            Ok(pixmap) => Rc::new(pixmap),
+            Err(error) if is_hierarchy_stale_candidate_error(error.as_ref()) => {
+                self.diagnostics.resizeonly_hierarchy_abort += 1;
+                self.diagnostics.record_resizeonly_outcome(
+                    direction, move_resize, false, true, total_start.map(|start| start.elapsed()),
+                );
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
+        let egl_start = self.diagnostics.enabled.then(Instant::now);
+        let egl_surface = Rc::new(std::cell::RefCell::new(egl.import_pixmap(pixmap.pixmap_xid, semantics)?));
+        if let Some(start) = egl_start {
+            self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::EglImport, start.elapsed());
+        }
+
+        let mut resources = self.resources.clone();
+        resources.insert(update.surface_xid, Rc::new(SurfaceResourceBundle {
+            damage: Some(Rc::clone(&damage)),
+            pixmap: Rc::clone(&pixmap),
+            egl: Some(Rc::clone(&egl_surface)),
+        }));
+        let mut pixmaps = self.pixmaps.clone();
+        pixmaps.retain(|item| item.surface_xid != update.surface_xid);
+        pixmaps.push(Rc::clone(&pixmap));
+        let damage_leases = self.damage_leases.clone();
+        let mut egl_surfaces = self.egl_surfaces.clone();
+        egl_surfaces.insert(update.surface_xid, Rc::clone(&egl_surface));
+        let damage_registry = self.damage_registry.clone();
+        let mut candidate = SceneCandidate {
+            snapshot,
+            generation: self.structural_generation,
+            resources,
+            pixmaps,
+            damage_leases,
+            damage_registry,
+            egl_surfaces,
+            watch_ids: self.structure_watches.previous_masks.keys().copied().collect(),
+            watch_additions: Vec::new(),
+            ignored_configure_windows: self.ignored_configure_windows.clone(),
+        };
+        let target_build_start = self.diagnostics.enabled.then(Instant::now);
+        self.render_egl_scene(&candidate.snapshot, &candidate.egl_surfaces, &candidate.pixmaps)?;
+        if let Some(start) = target_build_start {
+            self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::TargetBuildRender, start.elapsed());
+        }
+        if let Some(start) = resource_start {
+            self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::ResourceBlocking, start.elapsed());
+        }
+        let precommit_start = self.diagnostics.enabled.then(Instant::now);
+        let (gate, deferred_damage) = self.pre_commit_gate(&mut candidate)?;
+        if let Some(start) = precommit_start {
+            self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::Precommit, start.elapsed());
+        }
+        if !matches!(gate, GateDecision::Accept) {
+            self.merge_deferred_damage(deferred_damage);
+            resizeonly_fallback!(ResizeOnlyFallbackReason::PrecommitRejected);
+        }
+        if self.pending_damage.contains(&damage.damage_xid) || initial_damage.contains(&damage.damage_xid) {
+            self.diagnostics.resizeonly_publish_with_damage_pending += 1;
+        }
+        let publish_start = self.diagnostics.enabled.then(Instant::now);
+        self.commit_candidate(candidate)?;
+        if let Some(start) = publish_start {
+            self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::Publish, start.elapsed());
+        }
+        self.merge_deferred_damage(deferred_damage);
+        let _ = initial_damage;
+        self.diagnostics.resizeonly_success += 1;
+        self.diagnostics.resizeonly_full_snapshot_avoided += 1;
+        self.diagnostics.record_resizeonly_outcome(
+            direction, move_resize, true, false, total_start.map(|start| start.elapsed()),
+        );
+        Ok(true)
+    }
+
     fn recompose_current_scene(
         &mut self,
         touched_damage: HashSet<damage::Damage>,
@@ -2785,7 +4686,7 @@ impl<'a> SceneSession<'a> {
             return Ok(());
         }
         for damage_id in subtract_plan(&touched_damage) {
-            self.damage_lease(damage_id)?.subtract()?;
+            self.subtract_damage_for_diagnostics(damage_id)?;
         }
         self.connection.inner.get_input_focus()?.reply()?;
         let post_subtract = self.drain_current_events()?;
@@ -2796,7 +4697,7 @@ impl<'a> SceneSession<'a> {
                 return Ok(());
             }
             SceneInvalidation::Hierarchy | SceneInvalidation::Geometry(_) => {
-                self.pending_damage.clear();
+                carry_structural_pending_damage(&mut self.pending_damage, post_subtract.decision(), post_subtract.pixel_damage());
                 return self.rebuild_and_present();
             }
             SceneInvalidation::Background => {
@@ -2838,7 +4739,7 @@ impl<'a> SceneSession<'a> {
                 Ok(())
             }
             SceneInvalidation::Hierarchy | SceneInvalidation::Geometry(_) => {
-                self.pending_damage.clear();
+                carry_structural_pending_damage(&mut self.pending_damage, final_gate.decision(), final_gate.pixel_damage());
                 self.rebuild_and_present()
             }
             SceneInvalidation::Background => {
@@ -2859,10 +4760,17 @@ impl<'a> SceneSession<'a> {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
             };
+            let snapshot = self.snapshot.as_ref().expect("published scene snapshot must exist while live");
+            self.diagnostics.record_configure(&event, snapshot);
+            let geometry_source = geometry_event_source(&event, snapshot);
+            self.diagnostics.record_geometry_source(geometry_source);
             let visual_invalidation = self.maybe_update_visual_state(&event)?;
             let invalidation = visual_invalidation.unwrap_or_else(|| {
-                self.classify_session_event(event, self.current_snapshot(), &self.damage_registry, &self.damage_registry)
+                self.classify_session_event(event.clone(), self.current_snapshot(), &self.damage_registry, &self.damage_registry)
             });
+            let current_snapshot = self.current_snapshot().clone();
+            self.record_hierarchy_event_diagnostic(&event, invalidation, &current_snapshot, batch.geometry_update);
+            if matches!(invalidation, SceneInvalidation::Hierarchy) { if let Some(source) = hierarchy_event_source(&event) { batch.note_hierarchy_source(source); } }
             self.observe_invalidation(invalidation);
             batch.push(invalidation);
         }
@@ -2876,10 +4784,28 @@ impl<'a> SceneSession<'a> {
         self.damage_leases
             .iter()
             .find(|lease| lease.damage_xid == damage_id)
+            .map(Rc::as_ref)
             .ok_or_else(|| format!("current DamageLease is unavailable: 0x{damage_id:08x}").into())
     }
 
+    fn subtract_damage_for_diagnostics(
+        &mut self,
+        damage_id: damage::Damage,
+    ) -> Result<(), Box<dyn Error>> {
+        let geometry_pending = self.pending_move_geometry.is_some();
+        let surface = self.damage_registry.get(&damage_id).copied();
+        let identity = surface.map(|surface_xid| {
+            (surface_xid, self.current_snapshot().entries.iter()
+                .find(|entry| entry.surface_xid == surface_xid)
+                .and_then(|entry| entry.semantic_client_xid))
+        });
+        self.damage_lease(damage_id)?.subtract()?;
+        self.diagnostics.record_damage_dispatch(damage_id, geometry_pending, identity);
+        Ok(())
+    }
+
     fn full_recompose_current(&mut self) -> Result<(), Box<dyn Error>> {
+        self.diagnostics.recompositions += 1;
         let snapshot = self
             .snapshot
             .as_ref()
@@ -3107,8 +5033,8 @@ impl<'a> SceneSession<'a> {
     fn render_egl_scene(
         &mut self,
         snapshot: &SceneSnapshot,
-        surfaces: &HashMap<Window, EglImportedSurface>,
-        pixmaps: &[NamedSurfacePixmap<'a>],
+        surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
+        pixmaps: &[Rc<NamedSurfacePixmap<'a>>],
     ) -> Result<(), Box<dyn Error>> {
         render_egl_scene_parts(
             self.egl.as_mut().ok_or("EGL scene renderer is unavailable")?,
@@ -3127,6 +5053,7 @@ impl<'a> SceneSession<'a> {
         geometry: Option<PendingGeometry>,
         initial_damage: &HashSet<damage::Damage>,
     ) -> Result<bool, Box<dyn Error>> {
+        self.diagnostics.moveonly_attempted += 1;
         if self.pending_background {
             return Ok(false);
         }
@@ -3170,9 +5097,6 @@ impl<'a> SceneSession<'a> {
 
         self.current_snapshot_mut().entries[entry_index].geometry = next_geometry;
         self.current_snapshot_mut().entries[entry_index].client_root_geometry = next_client_root;
-        if let Some(pixmap) = self.pixmaps.iter_mut().find(|pixmap| pixmap.surface_xid == surface) {
-            pixmap.window_geometry = next_geometry;
-        }
 
         let mut damage_to_subtract = initial_damage.clone();
         let mut structural_event = false;
@@ -3180,6 +5104,8 @@ impl<'a> SceneSession<'a> {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
             };
+            let snapshot = self.snapshot.as_ref().expect("published scene snapshot must exist while live");
+            self.diagnostics.record_configure(&event, snapshot);
             let visual_invalidation = self.maybe_update_visual_state(&event)?;
             let invalidation = visual_invalidation.unwrap_or_else(|| {
                 self.classify_session_event(
@@ -3205,22 +5131,29 @@ impl<'a> SceneSession<'a> {
         if structural_event || self.signal.poll_shutdown_pending()? {
             for damage_id in damage_to_subtract {
                 if self.damage_registry.contains_key(&damage_id) {
-                    self.damage_lease(damage_id)?.subtract()?;
+                    self.subtract_damage_for_diagnostics(damage_id)?;
                 }
             }
             self.current_snapshot_mut().entries[entry_index].geometry = previous.geometry;
             self.current_snapshot_mut().entries[entry_index].client_root_geometry = previous.client_root_geometry;
-            if let Some(pixmap) = self.pixmaps.iter_mut().find(|pixmap| pixmap.surface_xid == surface) {
-                pixmap.window_geometry = previous.geometry;
-            }
+            self.diagnostics.moveonly_fallback += 1;
             return Ok(false);
         }
         self.full_recompose_current()?;
         for damage_id in damage_to_subtract {
             if self.damage_registry.contains_key(&damage_id) {
-                self.damage_lease(damage_id)?.subtract()?;
+                self.subtract_damage_for_diagnostics(damage_id)?;
             }
         }
+        self.diagnostics.moveonly_success += 1;
+        let damage_id = self.damage_leases.iter()
+            .find(|lease| lease.surface_xid == surface)
+            .map(|lease| lease.damage_xid);
+        self.diagnostics.record_moveonly(
+            surface,
+            previous.semantic_client_xid,
+            damage_id,
+        );
         Ok(true)
     }
 
@@ -3286,7 +5219,7 @@ impl<'a> SceneSession<'a> {
         }
         self.manual.take();
         for damage in &self.damage_leases {
-            if let Err(error) = damage.destroy() {
+            if let Err(error) = retire_damage_lease(damage, false) {
                 first_error.get_or_insert(error);
             }
         }
@@ -3310,8 +5243,8 @@ impl<'a> SceneSession<'a> {
                     first_error.get_or_insert(error);
                 }
             }
-            for surface in self.egl_surfaces.values_mut() {
-                if let Err(error) = egl.destroy_import(surface) {
+            for surface in self.egl_surfaces.values() {
+                if let Err(error) = egl.destroy_import(&mut surface.borrow_mut()) {
                     first_error.get_or_insert(error);
                 }
             }
@@ -3319,8 +5252,8 @@ impl<'a> SceneSession<'a> {
             if let Some(background) = self.background.as_mut() {
                 background.surface.disarm();
             }
-            for surface in self.egl_surfaces.values_mut() {
-                surface.disarm();
+            for surface in self.egl_surfaces.values() {
+                surface.borrow_mut().disarm();
             }
         }
         self.background = None;
@@ -3381,8 +5314,8 @@ impl<'a> SceneSession<'a> {
         self.damage_registry.clear();
         self.pending_damage.clear();
         self.pending_background = false;
-        for surface in self.egl_surfaces.values_mut() {
-            surface.disarm();
+        for surface in self.egl_surfaces.values() {
+            surface.borrow_mut().disarm();
         }
         if let Some(background) = self.background.as_mut() {
             background.surface.disarm();
@@ -3536,8 +5469,8 @@ fn render_egl_scene_parts<'a>(
     shadow_style: crate::config::ShadowConfig,
     visuals: &crate::config::VisualConfig,
     snapshot: &SceneSnapshot,
-    surfaces: &HashMap<Window, EglImportedSurface>,
-    pixmaps: &[NamedSurfacePixmap<'a>],
+    surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
+    pixmaps: &[Rc<NamedSurfacePixmap<'a>>],
 ) -> Result<(), Box<dyn Error>> {
     egl.clear()?;
     if let Some(background) = background {
@@ -3549,6 +5482,7 @@ fn render_egl_scene_parts<'a>(
         let Some(surface) = surfaces.get(&entry.surface_xid) else {
             continue;
         };
+        let surface = surface.borrow();
         let pixmap = pixmaps
             .iter()
             .find(|pixmap| pixmap.surface_xid == entry.surface_xid)
@@ -4323,6 +6257,51 @@ fn rebase_candidate_geometry_fields(entry: &mut SurfaceEntry, update: PendingGeo
     entry.geometry = next_geometry;
 }
 
+fn structural_identity_matches(left: &SceneSnapshot, right: &SceneSnapshot) -> bool {
+    left.root == right.root
+        && left.root_geometry == right.root_geometry
+        && left.entries.len() == right.entries.len()
+        && left.entries.iter().zip(&right.entries).all(|(left, right)| {
+            left.surface_xid == right.surface_xid
+                && left.semantic_client_xid == right.semantic_client_xid
+                && left.lifecycle_xid == right.lifecycle_xid
+                && left.depth == right.depth
+                && left.visual == right.visual
+                && left.class == right.class
+                && left.map_state == right.map_state
+                && left.override_redirect == right.override_redirect
+                && left.stacking_index == right.stacking_index
+                && left.backend == right.backend
+                && left.visual_class == right.visual_class
+                && left.fullscreen == right.fullscreen
+                && left.shadow_eligible == right.shadow_eligible
+                && left.resolved_border_color == right.resolved_border_color
+                && left.resolved_opacity_bits == right.resolved_opacity_bits
+                && left.resolved_blur_request == right.resolved_blur_request
+        })
+}
+
+fn target_geometry_rebase_compatible(
+    live: &SceneSnapshot,
+    candidate: &SceneSnapshot,
+    update: PendingGeometry,
+) -> bool {
+    if !structural_identity_matches(live, candidate) {
+        return false;
+    }
+    let Some(live_entry) = live.entries.iter().find(|entry| entry.surface_xid == update.surface_xid) else {
+        return false;
+    };
+    let Some(candidate_entry) = candidate.entries.iter().find(|entry| entry.surface_xid == update.surface_xid) else {
+        return false;
+    };
+    live_entry.surface_xid == candidate_entry.surface_xid
+        && live_entry.semantic_client_xid == candidate_entry.semantic_client_xid
+        && live_entry.lifecycle_xid == candidate_entry.lifecycle_xid
+        && candidate_entry.map_state != xproto::MapState::UNMAPPED
+        && candidate_entry.override_redirect == update.override_redirect
+}
+
 fn same_common_surface_order(left: &[SurfaceEntry], right: &[SurfaceEntry]) -> bool {
     let right_ids = right.iter().map(|entry| entry.surface_xid).collect::<HashSet<_>>();
     let left_ids = left.iter().map(|entry| entry.surface_xid).collect::<HashSet<_>>();
@@ -4335,6 +6314,87 @@ fn same_common_surface_order(left: &[SurfaceEntry], right: &[SurfaceEntry]) -> b
         .filter(|entry| left_ids.contains(&entry.surface_xid))
         .map(|entry| entry.surface_xid);
     left_common.eq(right_common)
+}
+
+fn reusable_resource_identity(
+    live: &SceneSnapshot,
+    candidate: &SurfaceEntry,
+    bundle: &SurfaceResourceBundle<'_>,
+) -> bool {
+    let Some(previous) = live.entries.iter().find(|entry| entry.surface_xid == candidate.surface_xid) else {
+        return false;
+    };
+    resource_identity_fields_match(previous, candidate)
+        && bundle.pixmap.geometry.root == live.root
+        && bundle.pixmap.geometry.depth == candidate.depth
+        && named_pixmap_dimensions_match(candidate.geometry, bundle.pixmap.geometry)
+        && (candidate.backend == BackendCompatibility::BackendUnsupported || bundle.egl.is_some())
+}
+
+fn candidate_has_resized_target(
+    live: &SceneSnapshot,
+    candidate: &SceneSnapshot,
+    resources: &HashMap<Window, Rc<SurfaceResourceBundle<'_>>>,
+) -> bool {
+    candidate.entries.iter().any(|entry| {
+        let Some(previous) = live.entries.iter().find(|previous| previous.surface_xid == entry.surface_xid) else {
+            return false;
+        };
+        resources.contains_key(&entry.surface_xid)
+            && (previous.geometry.width != entry.geometry.width
+                || previous.geometry.height != entry.geometry.height
+                || previous.geometry.border_width != entry.geometry.border_width)
+    })
+}
+
+fn resize_geometry_is_obsolete(candidate: WindowGeometry, update: PendingGeometry) -> bool {
+    candidate.width != update.width
+        || candidate.height != update.height
+        || candidate.border_width != update.border_width
+}
+
+fn classify_resizeonly_direction(
+    previous: WindowGeometry,
+    update: PendingGeometry,
+) -> (ResizeOnlyDirection, bool) {
+    let width_grows = update.width > previous.width;
+    let height_grows = update.height > previous.height;
+    let width_shrinks = update.width < previous.width;
+    let height_shrinks = update.height < previous.height;
+    let direction = if (width_grows || height_grows) && !(width_shrinks || height_shrinks) {
+        ResizeOnlyDirection::Grow
+    } else if (width_shrinks || height_shrinks) && !(width_grows || height_grows) {
+        ResizeOnlyDirection::Shrink
+    } else {
+        ResizeOnlyDirection::Mixed
+    };
+    (
+        direction,
+        update.x != previous.x || update.y != previous.y,
+    )
+}
+
+fn resource_identity_fields_match(previous: &SurfaceEntry, candidate: &SurfaceEntry) -> bool {
+    previous.surface_xid == candidate.surface_xid
+        && previous.semantic_client_xid == candidate.semantic_client_xid
+        && previous.lifecycle_xid == candidate.lifecycle_xid
+        && previous.geometry.width == candidate.geometry.width
+        && previous.geometry.height == candidate.geometry.height
+        && previous.geometry.border_width == candidate.geometry.border_width
+        && previous.depth == candidate.depth
+        && previous.visual == candidate.visual
+        && previous.map_state == candidate.map_state
+        && previous.backend == candidate.backend
+}
+
+fn damage_identity_compatible(previous: &SurfaceEntry, candidate: &SurfaceEntry) -> bool {
+    previous.surface_xid == candidate.surface_xid
+        && previous.semantic_client_xid == candidate.semantic_client_xid
+        && previous.lifecycle_xid == candidate.lifecycle_xid
+        && previous.map_state == candidate.map_state
+        && previous.depth == candidate.depth
+        && previous.visual == candidate.visual
+        && previous.backend == candidate.backend
 }
 
 fn observe_structural_generation(generation: &mut u64, invalidation: SceneInvalidation) {
@@ -4353,6 +6413,16 @@ fn batch_damage_requires_subtraction(
             SceneInvalidation::Background
                 | SceneInvalidation::VisualState
         )
+}
+
+fn carry_structural_pending_damage(
+    pending: &mut HashSet<damage::Damage>,
+    decision: SceneInvalidation,
+    batch_damage: &HashSet<damage::Damage>,
+) {
+    if matches!(decision, SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy) {
+        pending.extend(batch_damage.iter().copied());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4471,6 +6541,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
 
     use super::{
         build_copy_plan,
@@ -4489,6 +6560,8 @@ mod tests {
         render_version_compatible, gate_decision_after_batch, guards_allow_retry, GateDecision,
         pending_work_requires_iteration, pixel_gate_allows_presentation,
         retry_allowed, subtract_plan, watch_plan, build_render_quad_plan,
+        GeometryPresentHistory, ResizeOnlyDirection,
+        HierarchyEventSource, HierarchyEventRelation,
         egl_scene_is_renderable, merge_deferred_damage_for_registry, EglPixelSemantics,
         VisualFormatCache, VisualFormatInfo, InvalidationBatch, SceneInvalidation, SceneSnapshot,
         build_pict_format_index, classify_scene_visual_format,
@@ -4498,6 +6571,7 @@ mod tests {
         BACKGROUND_BLUR_RADIUS_PX,
         observe_structural_generation,
         batch_damage_requires_subtraction,
+        carry_structural_pending_damage,
         structural_generation_state, StructuralGenerationState,
         FrameScheduler, FrameSchedulerState,
         classify_retired_damage_destroy, DamageDestroyClassification, DamageReleaseOutcome,
@@ -4506,8 +6580,15 @@ mod tests {
         NamedSurfacePixmapAcquireError, RawPixmapOwnership, named_pixmap_dimensions_match,
         validate_named_pixmap_dimensions, translate_named_pixmap_acquire_error,
         DamageLeaseAcquireError, stale_damage_create_reply, translate_damage_lease_acquire_error,
+        is_hierarchy_stale_candidate_error,
+        Diagnostics3a3f8b3a,
+        ResizeOnlyDirectionDiagnostics,
+        ResizeOnlyFallbackReason, ResizeOnlyFallbackReasons,
+        retain_pending_for_registry,
         rect_intersects_root, surface_quad_intersects_root, shadow_bounds_intersect_root,
         entry_has_visible_contribution, prune_invisible_entries,
+        resource_identity_fields_match,
+        damage_identity_compatible,
         BlurRequest, BlurRegionRect, parse_blur_behind_region, is_visual_property_notify,
         resolved_blur_request, resolve_snapshot_fullscreen,
         ClientRootGeometry, client_root_geometry_from_translation,
@@ -4515,8 +6596,12 @@ mod tests {
         RootRect, intersect_root_rect, plan_region_backdrop,
         move_only_geometry_is_eligible,
         move_client_root_geometry, PendingGeometry,
-        rebase_candidate_geometry_fields, same_common_surface_order,
+        rebase_candidate_geometry_fields, same_common_surface_order, resize_geometry_is_obsolete,
+        structural_identity_matches, target_geometry_rebase_compatible,
+        classify_resizeonly_direction,
         configure_geometry_update, classify_event_with_registries_and_ignored,
+        geometry_event_source, GeometryEventSource, PreResizeOnlyBypassReason,
+        StructuralOrigin,
     };
     use crate::x11::capture::WindowGeometry;
     use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
@@ -5395,6 +7480,81 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_and_damage_carry_pending_obligation() {
+        let mut pending = HashSet::new();
+        carry_structural_pending_damage(&mut pending, SceneInvalidation::Hierarchy, &HashSet::from([42]));
+        assert_eq!(subtract_plan(&pending), vec![42]);
+    }
+
+    #[test]
+    fn geometry_and_damage_carry_pending_obligation() {
+        let mut pending = HashSet::new();
+        carry_structural_pending_damage(&mut pending, SceneInvalidation::Geometry(10), &HashSet::from([42]));
+        assert_eq!(pending, HashSet::from([42]));
+    }
+
+    #[test]
+    fn publication_keeps_survivor_damage_pending() {
+        let mut pending = HashSet::from([41_u32]);
+        carry_structural_pending_damage(&mut pending, SceneInvalidation::Hierarchy, &HashSet::from([42]));
+        assert_eq!(pending, HashSet::from([41, 42]));
+        assert_eq!(subtract_plan(&pending).len(), 2);
+    }
+
+    #[test]
+    fn stale_candidate_keeps_damage_pending() {
+        let mut pending = HashSet::new();
+        for _ in 0..2 { carry_structural_pending_damage(&mut pending, SceneInvalidation::Hierarchy, &HashSet::from([42])); }
+        assert_eq!(pending, HashSet::from([42]));
+    }
+
+    #[test]
+    fn failed_candidate_keeps_damage_pending() {
+        let mut pending = HashSet::new();
+        carry_structural_pending_damage(&mut pending, SceneInvalidation::Hierarchy, &HashSet::from([42]));
+        assert!(pending.contains(&42));
+        assert_eq!(subtract_plan(&pending), vec![42]);
+    }
+
+    #[test]
+    fn repeated_structural_dominance_does_not_erase_damage() {
+        let mut pending = HashSet::new();
+        for damage in [41_u32, 42_u32] {
+            carry_structural_pending_damage(&mut pending, SceneInvalidation::Hierarchy, &HashSet::from([damage]));
+        }
+        assert_eq!(pending, HashSet::from([41, 42]));
+    }
+
+    #[test]
+    fn duplicate_damage_id_has_one_subtract_plan() {
+        let mut pending = HashSet::new();
+        let batch = HashSet::from([42_u32, 42_u32]);
+        carry_structural_pending_damage(&mut pending, SceneInvalidation::Hierarchy, &batch);
+        assert_eq!(subtract_plan(&pending), vec![42]);
+    }
+
+    #[test]
+    fn multiple_damage_ids_have_one_subtract_each() {
+        let mut pending = HashSet::new();
+        carry_structural_pending_damage(&mut pending, SceneInvalidation::Hierarchy, &HashSet::from([41, 42]));
+        assert_eq!(subtract_plan(&pending).len(), 2);
+    }
+
+    #[test]
+    fn create_survivor_damage_is_carried() {
+        let mut pending = HashSet::new();
+        carry_structural_pending_damage(&mut pending, SceneInvalidation::Hierarchy, &HashSet::from([7]));
+        assert_eq!(pending, HashSet::from([7]));
+    }
+
+    #[test]
+    fn destroy_survivor_damage_is_carried() {
+        let mut pending = HashSet::new();
+        carry_structural_pending_damage(&mut pending, SceneInvalidation::Hierarchy, &HashSet::from([8]));
+        assert_eq!(subtract_plan(&pending).len(), 1);
+    }
+
+    #[test]
     fn candidate_pixel_gate_accepts_without_retry() {
         assert_eq!(
             candidate_gate_decision(SceneInvalidation::PixelDamage(42), false, true, false),
@@ -5843,6 +8003,234 @@ mod tests {
             translated.downcast_ref::<CandidateBuildError>(),
             Some(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
         ));
+        assert!(is_hierarchy_stale_candidate_error(translated.as_ref()));
+    }
+
+    #[test]
+    fn resizeonly_hierarchy_stale_is_nonfatal_control_flow() {
+        let hierarchy = Box::new(CandidateBuildError::Stale(SceneInvalidation::Hierarchy));
+        let geometry = Box::new(CandidateBuildError::Stale(SceneInvalidation::Geometry(7)));
+        assert!(is_hierarchy_stale_candidate_error(hierarchy.as_ref()));
+        assert!(!is_hierarchy_stale_candidate_error(geometry.as_ref()));
+    }
+
+    #[test]
+    fn resizeonly_direction_classes_are_mutually_exclusive() {
+        let previous = WindowGeometry { x: 10, y: 20, width: 800, height: 600, border_width: 0 };
+        let update = |x, y, width, height| PendingGeometry {
+            surface_xid: 1,
+            x,
+            y,
+            width,
+            height,
+            border_width: 0,
+            override_redirect: false,
+        };
+        assert_eq!(classify_resizeonly_direction(previous, update(10, 20, 810, 600)), (ResizeOnlyDirection::Grow, false));
+        assert_eq!(classify_resizeonly_direction(previous, update(10, 20, 800, 590)), (ResizeOnlyDirection::Shrink, false));
+        assert_eq!(classify_resizeonly_direction(previous, update(10, 20, 810, 590)), (ResizeOnlyDirection::Mixed, false));
+        assert_eq!(classify_resizeonly_direction(previous, update(11, 21, 810, 600)), (ResizeOnlyDirection::Grow, true));
+        assert_eq!(classify_resizeonly_direction(previous, update(11, 21, 800, 590)), (ResizeOnlyDirection::Shrink, true));
+    }
+
+    #[test]
+    fn resizeonly_fallback_reason_accounting_is_one_per_reason() {
+        let reasons = [
+            ResizeOnlyFallbackReason::UnavailableState,
+            ResizeOnlyFallbackReason::IdentityMismatch,
+            ResizeOnlyFallbackReason::NoSizeChange,
+            ResizeOnlyFallbackReason::GeometrySuperseded,
+            ResizeOnlyFallbackReason::UnsupportedVisual,
+            ResizeOnlyFallbackReason::MissingDamage,
+            ResizeOnlyFallbackReason::PrecommitRejected,
+            ResizeOnlyFallbackReason::Hierarchy,
+        ];
+        let mut counts = ResizeOnlyFallbackReasons::default();
+        for reason in reasons {
+            counts.record(reason);
+        }
+        assert_eq!(counts.unavailable_state, 1);
+        assert_eq!(counts.identity_mismatch, 1);
+        assert_eq!(counts.no_size_change, 1);
+        assert_eq!(counts.geometry_superseded, 1);
+        assert_eq!(counts.unsupported_visual, 1);
+        assert_eq!(counts.missing_damage, 1);
+        assert_eq!(counts.precommit_rejected, 1);
+        assert_eq!(counts.hierarchy, 1);
+        assert_eq!(counts.total(), reasons.len() as u64);
+    }
+
+    #[test]
+    fn resizeonly_structural_provenance_accounts_terminal_publish() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        diagnostics.record_resizeonly_attempt(ResizeOnlyDirection::Shrink, true);
+        diagnostics.record_resizeonly_fallback(
+            ResizeOnlyDirection::Shrink,
+            true,
+            ResizeOnlyFallbackReason::PrecommitRejected,
+        );
+        diagnostics.begin_resizeonly_structural_fallback();
+        diagnostics.record_structural_snapshot(Duration::from_micros(3));
+        diagnostics.record_structural_terminal(true, false, false);
+        let stats = &diagnostics.resizeonly_shrink;
+        assert_eq!(stats.fallback_to_structural, 1);
+        assert_eq!(stats.fallback_full_snapshot, 1);
+        assert_eq!(stats.structural_candidates_started, 1);
+        assert_eq!(stats.structural_published, 1);
+        assert_eq!(stats.structural_stale, 0);
+        assert_eq!(stats.structural_total.samples, 1);
+        assert_eq!(stats.structural_full_snapshot.total_us, 3);
+    }
+
+    #[test]
+    fn resizeonly_early_fallback_has_explicit_direction_unknown_bucket() {
+        let mut diagnostics = Diagnostics3a3f8b3a::default();
+        diagnostics.record_resizeonly_early_fallback();
+        assert_eq!(diagnostics.resizeonly_fallback, 1);
+        assert_eq!(diagnostics.resizeonly_fallback_early_unclassified, 1);
+    }
+
+    #[test]
+    fn resizeonly_direction_reason_totals_match_fallback_totals() {
+        for direction in [
+            ResizeOnlyDirection::Grow,
+            ResizeOnlyDirection::Shrink,
+            ResizeOnlyDirection::Mixed,
+        ] {
+            let mut diagnostics = ResizeOnlyDirectionDiagnostics::default();
+            for reason in [
+                ResizeOnlyFallbackReason::UnavailableState,
+                ResizeOnlyFallbackReason::IdentityMismatch,
+                ResizeOnlyFallbackReason::NoSizeChange,
+            ] {
+                diagnostics.fallback_reasons.record(reason);
+                diagnostics.fallback += 1;
+            }
+            assert_eq!(diagnostics.fallback, diagnostics.fallback_reasons.total(), "direction={direction:?}");
+        }
+    }
+
+    #[test]
+    fn pre_resizeonly_provenance_classifies_surface_and_semantic_sources() {
+        let mut entry = visibility_test_entry(window(0, 0, 80, 60, 0), false);
+        entry.semantic_client_xid = Some(20);
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
+        let event = |window| Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 0, sequence: 0, event: 1, window, above_sibling: 0,
+            x: 0, y: 0, width: 81, height: 60, border_width: 0, override_redirect: false,
+        });
+        assert_eq!(geometry_event_source(&event(0x0040_0000), &snapshot), GeometryEventSource::CanonicalSurface);
+        assert_eq!(geometry_event_source(&event(20), &snapshot), GeometryEventSource::SemanticClient);
+    }
+
+    #[test]
+    fn pre_resizeonly_provenance_bypass_reasons_are_one_per_dispatch() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        diagnostics.record_pre_attempt_bypass(GeometryEventSource::SemanticClient, PreResizeOnlyBypassReason::SemanticClientNoSurfacePendingGeometry, Some(ResizeOnlyDirection::Shrink), true);
+        diagnostics.record_pre_attempt_bypass(GeometryEventSource::CanonicalSurface, PreResizeOnlyBypassReason::NoPendingGeometry, Some(ResizeOnlyDirection::Grow), false);
+        assert_eq!(diagnostics.resizeonly_pre_attempt_bypass_total, 2);
+        assert_eq!(diagnostics.resizeonly_pre_attempt_bypass_semantic_client_no_surface_pending_geometry, 1);
+        assert_eq!(diagnostics.resizeonly_pre_attempt_bypass_no_pending_geometry, 1);
+        assert_eq!(diagnostics.resizeonly_shrink_pre_attempt_bypass, 1);
+        assert_eq!(diagnostics.resizeonly_grow_pre_attempt_bypass, 1);
+        assert_eq!(diagnostics.pre_resizeonly_bypass_move_resize, 1);
+    }
+
+    #[test]
+    fn pre_resizeonly_provenance_dispatch_outcomes_are_disjoint() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        diagnostics.record_resize_dispatch(GeometryEventSource::CanonicalSurface, false);
+        diagnostics.record_resize_dispatch(GeometryEventSource::SemanticClient, true);
+        diagnostics.resize_dispatch_deferred += 1;
+        diagnostics.resize_dispatch_hierarchy_dominated += 1;
+        assert_eq!(diagnostics.resize_dispatch_total, 2);
+        assert_eq!(diagnostics.resize_dispatch_resizeonly_selected + diagnostics.resize_dispatch_structural_selected, diagnostics.resize_dispatch_total);
+        assert_eq!(diagnostics.resize_dispatch_deferred, 1);
+        assert_eq!(diagnostics.resize_dispatch_hierarchy_dominated, 1);
+    }
+
+    #[test]
+    fn pre_resizeonly_provenance_structural_origin_and_stale_are_accounted() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        diagnostics.begin_structural_origin(StructuralOrigin::GeometrySemanticClient);
+        diagnostics.record_snapshot_origin();
+        diagnostics.record_stale_origin(SceneInvalidation::Geometry(10), false);
+        diagnostics.record_stale_origin(SceneInvalidation::Geometry(10), true);
+        assert_eq!(diagnostics.structural_origin_geometry_semantic_client, 1);
+        assert_eq!(diagnostics.snapshot_geometry_semantic_client, 1);
+        assert_eq!(diagnostics.stale_geometry_from_semantic_client_configure, 2);
+        assert_eq!(diagnostics.stale_geometry_retry, 1);
+        assert_eq!(diagnostics.stale_geometry_deferred, 1);
+    }
+
+    #[test]
+    fn pre_resizeonly_provenance_source_and_pending_buckets_are_complete() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        for source in [GeometryEventSource::CanonicalSurface, GeometryEventSource::SemanticClient, GeometryEventSource::Other, GeometryEventSource::Unknown] { diagnostics.record_geometry_source(source); }
+        diagnostics.record_pending_geometry(GeometryEventSource::CanonicalSurface, false, true);
+        diagnostics.record_pending_geometry(GeometryEventSource::CanonicalSurface, true, true);
+        diagnostics.record_geometry_rejected(GeometryEventSource::CanonicalSurface);
+        assert_eq!(diagnostics.configure_from_surface, 1);
+        assert_eq!(diagnostics.configure_from_semantic_client, 1);
+        assert_eq!(diagnostics.configure_from_other, 1);
+        assert_eq!(diagnostics.configure_from_unknown, 1);
+        assert_eq!(diagnostics.pending_geometry_created, 1);
+        assert_eq!(diagnostics.pending_geometry_updated, 1);
+        assert_eq!(diagnostics.pending_geometry_superseded, 1);
+        assert_eq!(diagnostics.pending_geometry_surface_match, 2);
+        assert_eq!(diagnostics.surface_geometry_update_accepted, 2);
+        assert_eq!(diagnostics.surface_geometry_update_rejected, 1);
+    }
+
+    #[test]
+    fn pre_resizeonly_provenance_all_bypass_reasons_are_reported() {
+        let reasons = [
+            PreResizeOnlyBypassReason::NoPresentComplete,
+            PreResizeOnlyBypassReason::HierarchyPriority,
+            PreResizeOnlyBypassReason::NoPendingGeometry,
+            PreResizeOnlyBypassReason::SemanticClientNoSurfacePendingGeometry,
+            PreResizeOnlyBypassReason::PendingGeometryOtherSurface,
+            PreResizeOnlyBypassReason::NoSizeOrBorderChange,
+            PreResizeOnlyBypassReason::AmbiguousOrSuperseded,
+            PreResizeOnlyBypassReason::StructuralAlreadyRequired,
+            PreResizeOnlyBypassReason::Other,
+            PreResizeOnlyBypassReason::DirectionUnknown,
+        ];
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        for (index, reason) in reasons.into_iter().enumerate() { diagnostics.record_pre_attempt_bypass(GeometryEventSource::Other, reason, [Some(ResizeOnlyDirection::Grow), Some(ResizeOnlyDirection::Shrink), Some(ResizeOnlyDirection::Mixed), None][index % 4], false); }
+        assert_eq!(diagnostics.resizeonly_pre_attempt_bypass_total, 10);
+        assert_eq!(diagnostics.resizeonly_pre_attempt_bypass_no_present_complete + diagnostics.resizeonly_pre_attempt_bypass_hierarchy_priority + diagnostics.resizeonly_pre_attempt_bypass_no_pending_geometry + diagnostics.resizeonly_pre_attempt_bypass_semantic_client_no_surface_pending_geometry + diagnostics.resizeonly_pre_attempt_bypass_pending_geometry_other_surface + diagnostics.resizeonly_pre_attempt_bypass_no_size_or_border_change + diagnostics.resizeonly_pre_attempt_bypass_ambiguous_or_superseded + diagnostics.resizeonly_pre_attempt_bypass_structural_already_required + diagnostics.resizeonly_pre_attempt_bypass_other + diagnostics.resizeonly_pre_attempt_bypass_direction_unknown, 10);
+    }
+
+    #[test]
+    fn pre_resizeonly_provenance_structural_origin_buckets_are_complete() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        for origin in [StructuralOrigin::NormalLifecycle, StructuralOrigin::Hierarchy, StructuralOrigin::GeometrySurface, StructuralOrigin::GeometrySemanticClient, StructuralOrigin::GeometryNoPending, StructuralOrigin::Other] { diagnostics.begin_structural_origin(origin); }
+        assert_eq!(diagnostics.structural_origin_normal + diagnostics.structural_origin_hierarchy + diagnostics.structural_origin_geometry_surface + diagnostics.structural_origin_geometry_semantic_client + diagnostics.structural_origin_geometry_no_pending + diagnostics.structural_origin_other, 6);
+    }
+
+    #[test]
+    fn pre_resizeonly_provenance_snapshot_buckets_are_complete() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        for origin in [StructuralOrigin::GeometrySurface, StructuralOrigin::GeometrySemanticClient, StructuralOrigin::GeometryNoPending, StructuralOrigin::Hierarchy, StructuralOrigin::Other] { diagnostics.structural_origin = Some(origin); diagnostics.record_snapshot_origin(); }
+        assert_eq!(diagnostics.snapshot_geometry_surface + diagnostics.snapshot_geometry_semantic_client + diagnostics.snapshot_geometry_no_pending + diagnostics.snapshot_hierarchy + diagnostics.snapshot_other, 5);
+    }
+
+    #[test]
+    fn pre_resizeonly_provenance_reporter_contains_all_new_aggregates() {
+        let source = include_str!("scene.rs");
+        for name in ["3a3f8b5o_event_provenance", "3a3f8b5o_resize_dispatch", "3a3f8b5o_structural_origin", "semantic_client_without_surface_pending_geometry", "resizeonly_pre_attempt_bypass_total", "pending_geometry_missing_at_dispatch"] { assert!(source.contains(name), "reporter must contain {name}"); }
+    }
+
+    #[test]
+    fn stable_resize_damage_remains_routable_when_pending() {
+        let damage = 17;
+        let surface = 42;
+        let registry = HashMap::from([(damage, surface)]);
+        let mut pending = HashSet::from([damage]);
+        retain_pending_for_registry(&mut pending, &registry);
+        assert_eq!(pending, HashSet::from([damage]));
+        assert_eq!(registry.get(&damage), Some(&surface));
     }
 
     #[test]
@@ -5942,6 +8330,26 @@ mod tests {
         client_root_geometry: None,
         resolved_blur_request: BlurRequest::None,
         }
+    }
+
+    #[test]
+    fn resource_identity_allows_position_only_metadata_change() {
+        let previous = visibility_test_entry(geo(100, 100, 400, 300), false);
+        let mut candidate = previous.clone();
+        candidate.geometry.x = 120;
+        candidate.geometry.y = 140;
+        assert!(resource_identity_fields_match(&previous, &candidate));
+    }
+
+    #[test]
+    fn resource_identity_rejects_resize_and_visual_change() {
+        let previous = visibility_test_entry(geo(100, 100, 400, 300), false);
+        let mut resized = previous.clone();
+        resized.geometry.width += 1;
+        assert!(!resource_identity_fields_match(&previous, &resized));
+        let mut visual_changed = previous.clone();
+        visual_changed.visual += 1;
+        assert!(!resource_identity_fields_match(&previous, &visual_changed));
     }
 
     #[test]
@@ -7404,6 +9812,16 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_candidate_does_not_require_a_published_live_snapshot() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn build_candidate(").expect("candidate builder exists");
+        let end = start + source[start..].find("\n    fn refresh_resize_state_before_acquisition").expect("early checkpoint follows candidate setup");
+        let setup = &source[start..end];
+        assert!(setup.contains("self.snapshot.as_ref().is_some_and"));
+        assert!(!setup.contains("candidate_has_resized_target(self.current_snapshot()"));
+    }
+
+    #[test]
     fn move_only_fast_path_has_zero_validation_queries() {
         let source = include_str!("scene.rs");
         let start = source.find("fn try_move_only(").expect("move-only helper exists");
@@ -7412,6 +9830,294 @@ mod tests {
         for forbidden in ["get_geometry", "get_window_attributes", "get_input_focus", "verify_ownership", "translate_coordinates"] {
             assert!(!body.contains(forbidden), "move-only path must not call {forbidden}");
         }
+    }
+
+    #[test]
+    fn early_resize_obsolescence_rejects_only_dimension_changes() {
+        let candidate = window(10, 20, 800, 600, 2);
+        let move_update = PendingGeometry { surface_xid: 10, x: 30, y: 40, width: 800, height: 600, border_width: 2, override_redirect: false };
+        let resize_update = PendingGeometry { width: 801, ..move_update };
+        assert!(!resize_geometry_is_obsolete(candidate, move_update));
+        assert!(resize_geometry_is_obsolete(candidate, resize_update));
+    }
+
+    #[test]
+    fn early_resize_checkpoint_is_before_damage_acquisition() {
+        let source = include_str!("scene.rs");
+        let checkpoint = source.find("refresh_resize_state_before_acquisition").expect("early resize checkpoint exists");
+        let acquisition = source[checkpoint..].find("DamageLease::acquire").expect("resize acquisition exists");
+        assert!(source[checkpoint..].find("return Err(Box::new(CandidateBuildError::Stale").is_some());
+        assert!(acquisition > 0);
+    }
+
+    #[test]
+    fn present_history_records_single_and_repeated_deferral_buckets() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        let once = GeometryPresentHistory::default().deferred();
+        let multiple = once.deferred();
+        diagnostics.record_pending_present_history(once);
+        diagnostics.record_pending_present_history(multiple);
+        diagnostics.record_final_resize_history(once, ResizeOnlyDirection::Grow, false);
+        diagnostics.record_final_resize_history(multiple, ResizeOnlyDirection::Shrink, true);
+        assert_eq!(diagnostics.geometry_pending_ever_present_deferred, 2);
+        assert_eq!(diagnostics.geometry_pending_present_deferred_once, 1);
+        assert_eq!(diagnostics.geometry_pending_present_deferred_multiple, 1);
+        assert_eq!(diagnostics.final_resize_was_present_deferred, 2);
+        assert_eq!(diagnostics.final_resize_never_present_deferred, 0);
+        assert_eq!(diagnostics.final_resize_deferrals_1, 1);
+        assert_eq!(diagnostics.final_resize_deferrals_2_3, 1);
+    }
+
+    #[test]
+    fn present_history_outcome_cohorts_are_partitioned() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        let deferred = GeometryPresentHistory::default().deferred();
+        let immediate = GeometryPresentHistory::default();
+        diagnostics.record_final_resize_history(deferred, ResizeOnlyDirection::Grow, false);
+        diagnostics.record_final_resize_history(immediate, ResizeOnlyDirection::Shrink, false);
+        diagnostics.record_final_resize_selection(deferred, false);
+        diagnostics.record_final_resize_selection(immediate, true);
+        assert_eq!(diagnostics.final_resize_was_present_deferred + diagnostics.final_resize_never_present_deferred, 2);
+        assert_eq!(diagnostics.resizeonly_selected_after_present_defer, 1);
+        assert_eq!(diagnostics.structural_selected_without_present_defer, 1);
+        assert_eq!(diagnostics.resizeonly_selected_after_present_defer + diagnostics.resizeonly_selected_without_present_defer, 1);
+        assert_eq!(diagnostics.structural_selected_after_present_defer + diagnostics.structural_selected_without_present_defer, 1);
+    }
+
+    #[test]
+    fn present_history_partitions_resizeonly_success_and_precommit_fallback() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        diagnostics.resizeonly_present_deferred = Some(true);
+        diagnostics.record_resizeonly_cohort_outcome(true, None);
+        diagnostics.resizeonly_present_deferred = Some(false);
+        diagnostics.record_resizeonly_cohort_outcome(false, Some(ResizeOnlyFallbackReason::PrecommitRejected));
+        assert_eq!(diagnostics.resizeonly_success_after_present_defer, 1);
+        assert_eq!(diagnostics.resizeonly_fallback_without_present_defer, 1);
+        assert_eq!(diagnostics.precommit_rejected_after_present_defer, 0);
+        assert_eq!(diagnostics.precommit_rejected_without_present_defer, 1);
+    }
+
+    #[test]
+    fn present_history_saturates_deferral_histogram() {
+        let mut history = GeometryPresentHistory::default();
+        for _ in 0..32 { history = history.deferred(); }
+        assert_eq!(history.deferrals, 8);
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        diagnostics.record_final_resize_history(history, ResizeOnlyDirection::Mixed, false);
+        assert_eq!(diagnostics.final_resize_deferrals_8_plus, 1);
+    }
+
+    #[test]
+    fn present_history_pending_updates_are_explicit() {
+        let mut batch = InvalidationBatch::default();
+        batch.present_history = GeometryPresentHistory::default().deferred();
+        batch.push_geometry_update(Some(PendingGeometry { surface_xid: 10, x: 0, y: 0, width: 20, height: 20, border_width: 0, override_redirect: false }));
+        assert!(batch.present_history.updated_while_deferred);
+        assert!(batch.present_history.superseded_while_deferred);
+    }
+
+    #[test]
+    fn present_history_reporter_has_separate_population_sections() {
+        let source = include_str!("scene.rs");
+        for section in ["3a3f8b5q_scheduling", "3a3f8b5q_pending_geometry_cohort", "3a3f8b5q_final_resize", "3a3f8b5q_outcome_present_history", "3a3f8b5q_structural_present_history"] {
+            assert!(source.contains(section), "reporter must contain {section}");
+        }
+        assert!(source.contains("not_final_resize_decisions"));
+    }
+
+    #[test]
+    fn hierarchy_raw_event_sources_are_complete_and_disjoint() {
+        let sources = [
+            HierarchyEventSource::UnknownConfigure,
+            HierarchyEventSource::Create,
+            HierarchyEventSource::Map,
+            HierarchyEventSource::Unmap,
+            HierarchyEventSource::Destroy,
+            HierarchyEventSource::Reparent,
+            HierarchyEventSource::Circulate,
+        ];
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        for source in sources { diagnostics.record_hierarchy_event(source, false, HierarchyEventRelation::Unknown); }
+        assert_eq!(diagnostics.hierarchy_event_total, 7);
+        assert_eq!(diagnostics.hierarchy_event_unknown_configure, 1);
+        assert_eq!(diagnostics.hierarchy_event_create + diagnostics.hierarchy_event_map + diagnostics.hierarchy_event_unmap + diagnostics.hierarchy_event_destroy + diagnostics.hierarchy_event_reparent + diagnostics.hierarchy_event_circulate, 6);
+    }
+
+    #[test]
+    fn hierarchy_decision_source_bitset_distinguishes_single_and_multi_source() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        diagnostics.record_hierarchy_decision(HierarchyEventSource::Map.bit(), false, None);
+        diagnostics.record_hierarchy_decision(HierarchyEventSource::Map.bit() | HierarchyEventSource::Reparent.bit(), false, None);
+        assert_eq!(diagnostics.hierarchy_decision_total, 2);
+        assert_eq!(diagnostics.hierarchy_decision_only_map, 1);
+        assert_eq!(diagnostics.hierarchy_decision_multi_source, 1);
+        assert_eq!(diagnostics.hierarchy_decision_only_map + diagnostics.hierarchy_decision_multi_source, 2);
+    }
+
+    #[test]
+    fn hierarchy_pending_geometry_is_counted_when_hierarchy_wins() {
+        let mut batch = InvalidationBatch::default();
+        batch.push(SceneInvalidation::Geometry(10));
+        batch.push_geometry_update(Some(PendingGeometry { surface_xid: 10, x: 0, y: 0, width: 21, height: 20, border_width: 0, override_redirect: false }));
+        batch.note_hierarchy_source(HierarchyEventSource::Create);
+        batch.push(SceneInvalidation::Hierarchy);
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        diagnostics.record_hierarchy_decision(batch.hierarchy_source_bits, batch.hierarchy_geometry_pending, None);
+        assert_eq!(batch.decision(), SceneInvalidation::Hierarchy);
+        assert_eq!(diagnostics.hierarchy_decision_with_geometry_pending, 1);
+        assert_eq!(diagnostics.hierarchy_decision_cleared_pending_geometry, 1);
+        assert_eq!(diagnostics.hierarchy_selected_while_resize_geometry_pending, 1);
+    }
+
+    #[test]
+    fn hierarchy_source_stage_preserves_retry_and_deferred_provenance() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        diagnostics.hierarchy_source_bits = HierarchyEventSource::UnknownConfigure.bit();
+        diagnostics.begin_structural_origin(StructuralOrigin::Hierarchy);
+        diagnostics.record_stale_origin(SceneInvalidation::Geometry(10), false);
+        diagnostics.record_stale_origin(SceneInvalidation::Geometry(10), true);
+        assert_eq!(diagnostics.hierarchy_unknown_configure_candidate_stale_geometry, 2);
+        assert_eq!(diagnostics.hierarchy_unknown_configure_retry, 1);
+        assert_eq!(diagnostics.hierarchy_unknown_configure_deferred, 1);
+    }
+
+    #[test]
+    fn hierarchy_reporter_separates_raw_decisions_and_source_dimensions() {
+        let source = include_str!("scene.rs");
+        for field in ["hierarchy_event_total", "hierarchy_decision_total", "hierarchy_decision_multi_source", "hierarchy_decision_with_geometry_pending", "hierarchy_from_internal_window", "snapshot_hierarchy_unknown_configure", "hierarchy_unknown_configure_candidate_stale_geometry"] {
+            assert!(source.contains(field), "hierarchy reporter/accounting must contain {field}");
+        }
+        assert!(source.contains("raw_event_population_separate_from_scheduler_decisions"));
+    }
+
+    fn compound_test_snapshot(entry: SurfaceEntry) -> SceneSnapshot {
+        SceneSnapshot { root: 1, root_geometry: RootGeometry { width: 1920, height: 1080, depth: 24, visual: 7 }, entries: vec![entry] }
+    }
+
+    #[test]
+    fn compound_identity_accepts_geometry_only_change() {
+        let entry = visibility_test_entry(window(10, 20, 100, 80, 0), true);
+        let live = compound_test_snapshot(entry.clone());
+        let mut candidate_entry = entry;
+        rebase_candidate_geometry_fields(&mut candidate_entry, PendingGeometry { surface_xid: 0, x: 30, y: 40, width: 140, height: 120, border_width: 2, override_redirect: false });
+        let candidate = compound_test_snapshot(candidate_entry);
+        assert!(structural_identity_matches(&live, &candidate));
+        assert!(target_geometry_rebase_compatible(&live, &candidate, PendingGeometry { surface_xid: 0x0040_0000, x: 30, y: 40, width: 140, height: 120, border_width: 2, override_redirect: true }));
+    }
+
+    #[test]
+    fn compound_identity_rejects_root_change() {
+        let entry = visibility_test_entry(window(10, 20, 100, 80, 0), true);
+        let live = compound_test_snapshot(entry.clone());
+        let mut candidate = compound_test_snapshot(entry);
+        candidate.root = 2;
+        assert!(!structural_identity_matches(&live, &candidate));
+    }
+
+    #[test]
+    fn compound_identity_rejects_scene_addition() {
+        let entry = visibility_test_entry(window(10, 20, 100, 80, 0), true);
+        let live = compound_test_snapshot(entry.clone());
+        let mut candidate = compound_test_snapshot(entry.clone());
+        candidate.entries.push(entry);
+        assert!(!structural_identity_matches(&live, &candidate));
+    }
+
+    #[test]
+    fn compound_identity_rejects_stacking_change() {
+        let entry = visibility_test_entry(window(10, 20, 100, 80, 0), true);
+        let live = compound_test_snapshot(entry.clone());
+        let mut candidate = compound_test_snapshot(entry);
+        candidate.entries[0].stacking_index += 1;
+        assert!(!structural_identity_matches(&live, &candidate));
+    }
+
+    #[test]
+    fn compound_identity_rejects_visual_depth_backend_changes() {
+        let entry = visibility_test_entry(window(10, 20, 100, 80, 0), true);
+        let live = compound_test_snapshot(entry.clone());
+        let mut visual = compound_test_snapshot(entry.clone());
+        visual.entries[0].visual += 1;
+        assert!(!structural_identity_matches(&live, &visual));
+        let mut depth = compound_test_snapshot(entry.clone());
+        depth.entries[0].depth += 1;
+        assert!(!structural_identity_matches(&live, &depth));
+        let mut backend = compound_test_snapshot(entry);
+        backend.entries[0].backend = BackendCompatibility::Renderable;
+        assert!(!structural_identity_matches(&live, &backend));
+    }
+
+    #[test]
+    fn compound_identity_rejects_map_state_change() {
+        let entry = visibility_test_entry(window(10, 20, 100, 80, 0), true);
+        let live = compound_test_snapshot(entry.clone());
+        let mut candidate = compound_test_snapshot(entry);
+        candidate.entries[0].map_state = xproto::MapState::UNMAPPED;
+        assert!(!structural_identity_matches(&live, &candidate));
+        assert!(!target_geometry_rebase_compatible(&live, &candidate, PendingGeometry { surface_xid: 0, x: 1, y: 1, width: 101, height: 81, border_width: 0, override_redirect: false }));
+    }
+
+    #[test]
+    fn compound_identity_rejects_target_surface_and_client_changes() {
+        let entry = visibility_test_entry(window(10, 20, 100, 80, 0), true);
+        let live = compound_test_snapshot(entry.clone());
+        let mut surface = compound_test_snapshot(entry.clone());
+        surface.entries[0].surface_xid = 11;
+        assert!(!target_geometry_rebase_compatible(&live, &surface, PendingGeometry { surface_xid: 10, x: 1, y: 1, width: 101, height: 81, border_width: 0, override_redirect: false }));
+        let mut client = compound_test_snapshot(entry);
+        client.entries[0].semantic_client_xid = Some(99);
+        assert!(!structural_identity_matches(&live, &client));
+    }
+
+    #[test]
+    fn compound_identity_rejects_lifecycle_change() {
+        let entry = visibility_test_entry(window(10, 20, 100, 80, 0), true);
+        let live = compound_test_snapshot(entry.clone());
+        let mut candidate = compound_test_snapshot(entry);
+        candidate.entries[0].lifecycle_xid = 77;
+        assert!(!structural_identity_matches(&live, &candidate));
+    }
+
+    #[test]
+    fn compound_rebase_rejections_are_bounded_and_accountable() {
+        let mut diagnostics = Diagnostics3a3f8b3a { enabled: true, ..Default::default() };
+        diagnostics.compound_rebase_attempted = 3;
+        diagnostics.compound_rebase_success = 1;
+        diagnostics.compound_rebase_rejected_scene_membership = 1;
+        diagnostics.compound_rebase_rejected_newer_hierarchy = 1;
+        assert_eq!(diagnostics.compound_rebase_attempted, diagnostics.compound_rebase_success + diagnostics.compound_rebase_rejected_scene_membership + diagnostics.compound_rebase_rejected_newer_hierarchy);
+        assert_eq!(MAX_CANDIDATE_RETRIES, 1);
+    }
+
+    #[test]
+    fn damage_identity_ignores_geometry_but_not_visual_compatibility() {
+        let entry = visibility_test_entry(window(10, 20, 100, 80, 0), true);
+        let mut resized = entry.clone();
+        resized.geometry.width += 20;
+        resized.geometry.height += 10;
+        assert!(damage_identity_compatible(&entry, &resized));
+        resized.visual += 1;
+        assert!(!damage_identity_compatible(&entry, &resized));
+    }
+
+    #[test]
+    fn damage_identity_rejects_lifecycle_and_map_changes() {
+        let entry = visibility_test_entry(window(10, 20, 100, 80, 0), true);
+        let mut lifecycle = entry.clone();
+        lifecycle.lifecycle_xid = 77;
+        assert!(!damage_identity_compatible(&entry, &lifecycle));
+        let mut unmapped = entry;
+        unmapped.map_state = xproto::MapState::UNMAPPED;
+        assert!(!damage_identity_compatible(&lifecycle, &unmapped));
+    }
+
+    #[test]
+    fn resized_compound_resource_path_uses_damage_identity_split() {
+        let source = include_str!("scene.rs");
+        assert!(source.contains("damage_identity_compatible(previous, &entry)"));
+        assert!(source.contains("compound_rebase_damage_reused"));
+        assert!(source.contains("NamedSurfacePixmap::acquire"));
+        assert!(source.contains("egl.import_pixmap"));
     }
 
 }
