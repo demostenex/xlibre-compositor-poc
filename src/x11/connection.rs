@@ -66,6 +66,10 @@ impl X11Connection {
         self.screen_num
     }
 
+    pub fn screen_root(&self) -> Window {
+        self.inner.setup().roots[self.screen_num].root
+    }
+
     pub fn create_damage(&self, drawable: Window) -> Result<damage::Damage, Box<dyn Error>> {
         let version = self.inner.damage_query_version(1, 1)?.reply()?;
         println!(

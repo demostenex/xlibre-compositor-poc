@@ -4,6 +4,7 @@ mod graphics;
 mod x11;
 
 use std::error::Error;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq)]
 struct ShadowCliArgs {
@@ -132,13 +133,46 @@ fn apply_shadow_config(
         .transpose()?
         .unwrap_or(defaults.color);
     Ok(config.with_shadow(
-        args.enabled,
+        args.enabled || defaults.enabled,
         color,
         args.extent.unwrap_or(defaults.extent),
         args.offset_x.unwrap_or(defaults.offset_x),
         args.offset_y.unwrap_or(defaults.offset_y),
         args.strength.unwrap_or(defaults.strength),
     )?)
+}
+
+fn scene_config_from_cli(
+    base: config::CompositorConfig,
+    corner_radius: Option<f32>,
+    border_width: Option<f32>,
+    border_color: Option<&str>,
+    inactive_color: Option<&str>,
+    focused_color: Option<&str>,
+    urgent_color: Option<&str>,
+    shadow_args: &ShadowCliArgs,
+    opacity_args: &OpacityCliArgs,
+) -> Result<config::CompositorConfig, Box<dyn Error>> {
+    let mut config = base;
+    if let Some(radius) = corner_radius {
+        config.visuals.corner_radius = config::CompositorConfig::with_corner_radius(radius)?.visuals.corner_radius;
+    }
+    if border_width.is_some() || border_color.is_some() || inactive_color.is_some()
+        || focused_color.is_some() || urgent_color.is_some()
+    {
+        let defaults = config.visuals.border;
+        let legacy_color = border_color.map(config::CompositorConfig::parse_color).transpose()?;
+        let inactive = inactive_color.map(config::CompositorConfig::parse_color).transpose()?.or(legacy_color).unwrap_or(defaults.inactive_color);
+        let focused = focused_color.map(config::CompositorConfig::parse_color).transpose()?.or(legacy_color).unwrap_or(defaults.focused_color);
+        let urgent = urgent_color.map(config::CompositorConfig::parse_color).transpose()?.or(legacy_color).unwrap_or(defaults.urgent_color);
+        config = config.with_border_colors(border_width.unwrap_or(defaults.width), inactive, focused, urgent)?;
+    }
+    if shadow_args.enabled || shadow_args.color.is_some() || shadow_args.extent.is_some()
+        || shadow_args.offset_x.is_some() || shadow_args.offset_y.is_some() || shadow_args.strength.is_some()
+    {
+        config = apply_shadow_config(config, shadow_args)?;
+    }
+    apply_opacity_config(config, opacity_args)
 }
 
 fn main() {
@@ -165,6 +199,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut compositor_overlay_probe = None;
     let mut compositor_manual_probe = None;
     let mut compositor_scene_x11_probe = None;
+    let mut config_path: Option<PathBuf> = None;
     let mut compositor_corner_radius = None;
     let mut compositor_border_width = None;
     let mut compositor_border_color = None;
@@ -179,6 +214,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut compositor_shadow_strength = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--config" => {
+                config_path = Some(PathBuf::from(args.next().ok_or("--config requires PATH")?));
+            }
+            value if value.starts_with("--config=") => {
+                let path = value.strip_prefix("--config=").unwrap_or_default();
+                if path.is_empty() {
+                    return Err("--config= requires PATH".into());
+                }
+                config_path = Some(PathBuf::from(path));
+            }
             "--diagnostics" => diagnostics_only = true,
             "--compositor-probe" => compositor_probe = true,
             "--claim-compositor" => claim_compositor = true,
@@ -280,19 +325,24 @@ fn run() -> Result<(), Box<dyn Error>> {
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
+    let _ = (
+        &compositor_shadow_enabled,
+        &compositor_shadow_color,
+        &compositor_shadow_extent,
+        &compositor_shadow_offset_x,
+        &compositor_shadow_offset_y,
+        &compositor_shadow_strength,
+    );
+    let startup_config = match config::load_startup_config(config::StartupConfigRequest {
+        explicit_path: config_path,
+        environment: config::ConfigPathEnvironment::from_process(),
+    })? {
+        config::ConfigLoadOutcome::DefaultsBecauseMissingImplicitFile => {
+            std::sync::Arc::new(config::ValidatedConfig::default())
+        }
+        config::ConfigLoadOutcome::Loaded { config, .. } => config,
+    };
     let connection = x11::connection::X11Connection::connect()?;
-
-    if (compositor_corner_radius.is_some() || compositor_border_width.is_some() || compositor_border_color.is_some()
-        || compositor_border_inactive_color.is_some() || compositor_border_focused_color.is_some()
-        || compositor_border_urgent_color.is_some() || compositor_shadow_enabled
-        || compositor_shadow_color.is_some() || compositor_shadow_extent.is_some()
-        || compositor_shadow_offset_x.is_some() || compositor_shadow_offset_y.is_some()
-        || compositor_shadow_strength.is_some() || opacity_args.focused.is_some()
-        || opacity_args.inactive.is_some() || opacity_args.urgent.is_some())
-        && compositor_scene_x11_probe.is_none()
-    {
-        return Err("visual overrides require --compositor-scene-x11-probe".into());
-    }
 
     if let Some(value) = compositor_scene_x11_probe {
         if compositor_probe
@@ -309,40 +359,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             return Err("--compositor-scene-x11-probe cannot be combined with another mode".into());
         }
-        let mut config = match compositor_corner_radius {
-            Some(radius) => config::CompositorConfig::with_corner_radius(radius)?,
-            None => config::CompositorConfig::defaults(),
-        };
-        if compositor_border_width.is_some() || compositor_border_color.is_some()
-            || compositor_border_inactive_color.is_some() || compositor_border_focused_color.is_some()
-            || compositor_border_urgent_color.is_some()
-        {
-            let width = compositor_border_width.unwrap_or(0.0);
-            let legacy_color = match compositor_border_color {
-                Some(color) => config::CompositorConfig::parse_color(&color)?,
-                None => config.visuals.border.inactive_color,
-            };
-            let inactive = match compositor_border_inactive_color {
-                Some(color) => config::CompositorConfig::parse_color(&color)?,
-                None => legacy_color,
-            };
-            let focused = match compositor_border_focused_color {
-                Some(color) => config::CompositorConfig::parse_color(&color)?,
-                None => legacy_color,
-            };
-            let urgent = match compositor_border_urgent_color {
-                Some(color) => config::CompositorConfig::parse_color(&color)?,
-                None => legacy_color,
-            };
-            config = config.with_border_colors(width, inactive, focused, urgent)?;
-        }
-        if compositor_shadow_enabled || compositor_shadow_color.is_some() || compositor_shadow_extent.is_some()
-            || compositor_shadow_offset_x.is_some() || compositor_shadow_offset_y.is_some()
-            || compositor_shadow_strength.is_some()
-        {
-            config = apply_shadow_config(config, &shadow_args)?;
-        }
-        config = apply_opacity_config(config, &opacity_args)?;
+        let config = scene_config_from_cli(
+            config::CompositorConfig { visuals: startup_config.visuals, blur_enabled: startup_config.blur_enabled },
+            compositor_corner_radius,
+            compositor_border_width,
+            compositor_border_color.as_deref(),
+            compositor_border_inactive_color.as_deref(),
+            compositor_border_focused_color.as_deref(),
+            compositor_border_urgent_color.as_deref(),
+            &shadow_args,
+            &opacity_args,
+        )?;
         return x11::scene::run(&connection, &value, config);
     }
 
@@ -474,6 +501,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         let graphics = graphics::egl::EglContext::diagnostics(&connection)?;
         graphics.print();
         return Ok(());
+    }
+
+    if capture_window.is_none() {
+        let config = scene_config_from_cli(
+            config::CompositorConfig { visuals: startup_config.visuals, blur_enabled: startup_config.blur_enabled },
+            compositor_corner_radius,
+            compositor_border_width,
+            compositor_border_color.as_deref(),
+            compositor_border_inactive_color.as_deref(),
+            compositor_border_focused_color.as_deref(),
+            compositor_border_urgent_color.as_deref(),
+            &shadow_args,
+            &opacity_args,
+        )?;
+        return x11::scene::run_with_root(&connection, connection.screen_root(), config);
     }
 
     let capture = capture_window
@@ -758,5 +800,28 @@ mod tests {
             ])).unwrap();
             assert!(apply_opacity_config(CompositorConfig::defaults(), &parsed).is_err());
         }
+    }
+
+    #[test]
+    fn normal_scene_config_uses_existing_defaults_without_probe_argument() {
+        let config = super::scene_config_from_cli(
+            CompositorConfig::defaults(),
+            None, None, None, None, None, None,
+            &super::ShadowCliArgs { enabled: false, color: None, extent: None, offset_x: None, offset_y: None, strength: None },
+            &super::OpacityCliArgs { focused: None, inactive: None, urgent: None },
+        ).unwrap();
+        assert_eq!(config, CompositorConfig::defaults());
+    }
+
+    #[test]
+    fn normal_scene_config_keeps_visual_cli_overrides_without_probe_argument() {
+        let config = super::scene_config_from_cli(
+            CompositorConfig::defaults(),
+            Some(16.0), Some(2.0), None, Some("555555"), Some("4C7899"), Some("FF3030"),
+            &super::ShadowCliArgs { enabled: false, color: None, extent: None, offset_x: None, offset_y: None, strength: None },
+            &super::OpacityCliArgs { focused: None, inactive: None, urgent: None },
+        ).unwrap();
+        assert_eq!(config.visuals.corner_radius, 16.0);
+        assert_eq!(config.visuals.border.width, 2.0);
     }
 }

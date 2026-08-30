@@ -2041,9 +2041,22 @@ fn resolved_blur_request(
         .unwrap_or(BlurRequest::None)
 }
 
+fn permitted_blur_request(
+    entry: &SurfaceEntry,
+    urgency: &HashMap<Window, CachedClientVisualState>,
+    blur_enabled: bool,
+) -> BlurRequest {
+    if blur_enabled {
+        resolved_blur_request(entry, urgency)
+    } else {
+        BlurRequest::None
+    }
+}
+
 fn resolve_snapshot_fullscreen(
     snapshot: &mut SceneSnapshot,
     urgency: &HashMap<Window, CachedClientVisualState>,
+    blur_enabled: bool,
     style: crate::config::ShadowConfig,
 ) {
     for entry in &mut snapshot.entries {
@@ -2052,7 +2065,7 @@ fn resolve_snapshot_fullscreen(
             .and_then(|client| urgency.get(&client))
             .is_some_and(|state| state.fullscreen);
         entry.shadow_eligible = shadow_eligible_for_entry(style, entry);
-        entry.resolved_blur_request = resolved_blur_request(entry, urgency);
+        entry.resolved_blur_request = permitted_blur_request(entry, urgency, blur_enabled);
     }
 }
 
@@ -2966,6 +2979,30 @@ enum SceneState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FirstPublishStep {
+    Rebuild,
+    AwaitEvent,
+    Published,
+    Shutdown,
+}
+
+fn first_publish_step(
+    snapshot_present: bool,
+    rebuild_deferred: bool,
+    shutdown: bool,
+) -> FirstPublishStep {
+    if shutdown {
+        FirstPublishStep::Shutdown
+    } else if snapshot_present {
+        FirstPublishStep::Published
+    } else if rebuild_deferred {
+        FirstPublishStep::AwaitEvent
+    } else {
+        FirstPublishStep::Rebuild
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShutdownReason {
     RootConfigure,
     SelectionLost,
@@ -3541,7 +3578,10 @@ impl<'a> SceneSession<'a> {
     fn prepare_scene(&mut self) -> Result<(), Box<dyn Error>> {
         self.refresh_background()?;
         self.rebuild_and_present()?;
-        self.arm_next_presentation(0)
+        if self.snapshot.is_some() {
+            self.arm_next_presentation(0)?;
+        }
+        Ok(())
     }
 
     fn initialize_visual_state(&mut self, snapshot: &SceneSnapshot) -> Result<(), Box<dyn Error>> {
@@ -3629,7 +3669,7 @@ impl<'a> SceneSession<'a> {
             &self.urgency,
         )?;
         resolve_snapshot_border_colors(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
-        resolve_snapshot_fullscreen(&mut snapshot, &self.urgency, self.shadow_style);
+        resolve_snapshot_fullscreen(&mut snapshot, &self.urgency, self._config.blur_enabled, self.shadow_style);
         resolve_snapshot_opacity(&mut snapshot, &self._config.visuals, self.active_window, &self.urgency);
         prune_invisible_entries(&mut snapshot.entries, self.shadow_style, snapshot.root_geometry);
         if let Some(start) = resizeonly_snapshot_start {
@@ -4235,6 +4275,13 @@ impl<'a> SceneSession<'a> {
 
     fn wait_live_pixel(&mut self) -> Result<(), Box<dyn Error>> {
         loop {
+            if self.snapshot.is_none() {
+                if !self.await_first_publish()? {
+                    return Ok(());
+                }
+                self.arm_next_presentation(0)?;
+                continue;
+            }
             let present_enabled = self.present.is_some();
             let mut opportunity_msc = None;
             let mut batch = InvalidationBatch::default();
@@ -4489,6 +4536,34 @@ impl<'a> SceneSession<'a> {
                         ),
                 );
                 self.arm_next_presentation(msc.saturating_add(1))?;
+            }
+        }
+    }
+
+    fn await_first_publish(&mut self) -> Result<bool, Box<dyn Error>> {
+        let mut rebuild_deferred = false;
+        loop {
+            match first_publish_step(self.snapshot.is_some(), rebuild_deferred, false) {
+                FirstPublishStep::Published => return Ok(true),
+                FirstPublishStep::Rebuild => {
+                    self.rebuild_and_present()?;
+                    if self.snapshot.is_some() {
+                        return Ok(true);
+                    }
+                    rebuild_deferred = true;
+                }
+                FirstPublishStep::AwaitEvent => {
+                    match wait_for_event_or_shutdown(self.connection, &mut self.signal)? {
+                        WaitResult::Event(_) => {}
+                        WaitResult::Shutdown => return Ok(false),
+                    }
+                    self.observe_invalidation(SceneInvalidation::Hierarchy);
+                    self.pending_background = true;
+                    self.refresh_background()?;
+                    self.rebuild_and_present()?;
+                    rebuild_deferred = self.snapshot.is_none();
+                }
+                FirstPublishStep::Shutdown => return Ok(false),
             }
         }
     }
@@ -4949,10 +5024,14 @@ impl<'a> SceneSession<'a> {
             // candidate rebuild — mirrors the net_wm_state block above
             // exactly, but touches only `resolved_blur_request` (blur has
             // no effect on fullscreen/shadow_eligible).
+            let blur_enabled = self._config.blur_enabled;
             if let Some(entry) = self.current_snapshot_mut().entries.iter_mut()
                 .find(|candidate| candidate.semantic_client_xid == Some(property.window))
             {
                 entry.resolved_blur_request = updated_blur_requested.clone();
+                if !blur_enabled {
+                    entry.resolved_blur_request = BlurRequest::None;
+                }
             }
         }
         let before = (entry.resolved_border_color, entry.resolved_opacity_bits);
@@ -6538,6 +6617,14 @@ pub(crate) fn run(
     SceneSession::run(connection, parse_root(expected_root_value)?, config)
 }
 
+pub(crate) fn run_with_root(
+    connection: &X11Connection,
+    root: Window,
+    config: CompositorConfig,
+) -> Result<(), Box<dyn Error>> {
+    SceneSession::run(connection, root, config)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -6573,6 +6660,7 @@ mod tests {
         batch_damage_requires_subtraction,
         carry_structural_pending_damage,
         structural_generation_state, StructuralGenerationState,
+        first_publish_step, FirstPublishStep,
         FrameScheduler, FrameSchedulerState,
         classify_retired_damage_destroy, DamageDestroyClassification, DamageReleaseOutcome,
         DamageState, shadow_eligible_for_entry, shadow_params_from_plan, resolved_surface_opacity,
@@ -6590,7 +6678,7 @@ mod tests {
         resource_identity_fields_match,
         damage_identity_compatible,
         BlurRequest, BlurRegionRect, parse_blur_behind_region, is_visual_property_notify,
-        resolved_blur_request, resolve_snapshot_fullscreen,
+        permitted_blur_request, resolved_blur_request, resolve_snapshot_fullscreen,
         ClientRootGeometry, client_root_geometry_from_translation,
         region_request_requires_client_origin, translate_coordinates_reply_error,
         RootRect, intersect_root_rect, plan_region_backdrop,
@@ -8771,6 +8859,27 @@ mod tests {
     }
 
     #[test]
+    fn first_publish_deferral_waits_without_faking_a_scene() {
+        assert_eq!(first_publish_step(false, false, false), FirstPublishStep::Rebuild);
+        assert_eq!(first_publish_step(false, true, false), FirstPublishStep::AwaitEvent);
+        assert_eq!(first_publish_step(true, true, false), FirstPublishStep::Published);
+        assert_eq!(first_publish_step(false, true, true), FirstPublishStep::Shutdown);
+    }
+
+    #[test]
+    fn first_publish_state_machine_preserves_deferred_then_stable_publish_sequence() {
+        let mut snapshot_present = false;
+        let mut rebuild_deferred = false;
+        assert_eq!(first_publish_step(snapshot_present, rebuild_deferred, false), FirstPublishStep::Rebuild);
+        rebuild_deferred = true;
+        assert_eq!(first_publish_step(snapshot_present, rebuild_deferred, false), FirstPublishStep::AwaitEvent);
+        rebuild_deferred = false;
+        assert_eq!(first_publish_step(snapshot_present, rebuild_deferred, false), FirstPublishStep::Rebuild);
+        snapshot_present = true;
+        assert_eq!(first_publish_step(snapshot_present, rebuild_deferred, false), FirstPublishStep::Published);
+    }
+
+    #[test]
     fn copy_plan_has_zero_intersection() {
         assert_eq!(build_copy_plan(window(100, 80, 10, 10, 0), pixmap(10, 10), root()), None);
     }
@@ -9552,6 +9661,47 @@ mod tests {
     }
 
     #[test]
+    fn global_blur_permission_preserves_only_existing_requests() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let none = HashMap::new();
+        assert_eq!(permitted_blur_request(&entry, &none, true), BlurRequest::None);
+        assert_eq!(permitted_blur_request(&entry, &none, false), BlurRequest::None);
+        let regions = vec![BlurRegionRect { x: 1, y: 2, width: 3, height: 4 }];
+        let mut requested = HashMap::new();
+        requested.insert(20, CachedClientVisualState { blur_requested: BlurRequest::Regions(regions.clone()), ..CachedClientVisualState::default() });
+        assert_eq!(permitted_blur_request(&entry, &requested, true), BlurRequest::Regions(regions));
+        assert_eq!(permitted_blur_request(&entry, &requested, false), BlurRequest::None);
+    }
+
+    #[test]
+    fn no_request_with_global_blur_enabled_stays_none() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        assert_eq!(permitted_blur_request(&entry, &HashMap::new(), true), BlurRequest::None);
+    }
+
+    #[test]
+    fn application_request_with_global_blur_enabled_is_preserved() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let mut cache = HashMap::new();
+        cache.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
+        assert_eq!(permitted_blur_request(&entry, &cache, true), BlurRequest::FullWindow);
+    }
+
+    #[test]
+    fn application_request_with_global_blur_disabled_is_suppressed() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        let mut cache = HashMap::new();
+        cache.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
+        assert_eq!(permitted_blur_request(&entry, &cache, false), BlurRequest::None);
+    }
+
+    #[test]
+    fn no_request_with_global_blur_disabled_stays_none() {
+        let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        assert_eq!(permitted_blur_request(&entry, &HashMap::new(), false), BlurRequest::None);
+    }
+
+    #[test]
     fn resolved_blur_request_reflects_cached_full_window() {
         let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
         let mut urgency = HashMap::new();
@@ -9591,13 +9741,13 @@ mod tests {
         urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
         urgency.insert(30, CachedClientVisualState::default());
         let style = crate::config::CompositorConfig::defaults().visuals.shadow;
-        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, true, style);
         assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::FullWindow);
         assert_eq!(snapshot.entries[1].resolved_blur_request, BlurRequest::None);
 
         let regions = vec![BlurRegionRect { x: 1, y: 1, width: 2, height: 2 }];
         urgency.insert(30, CachedClientVisualState { blur_requested: BlurRequest::Regions(regions.clone()), ..CachedClientVisualState::default() });
-        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, true, style);
         assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::FullWindow, "C1's owner must be unaffected by C2's change");
         assert_eq!(snapshot.entries[1].resolved_blur_request, BlurRequest::Regions(regions));
     }
@@ -9609,12 +9759,12 @@ mod tests {
         let style = crate::config::CompositorConfig::defaults().visuals.shadow;
         let mut urgency = HashMap::new();
         urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
-        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, true, style);
         assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::FullWindow);
         // Client deletes the property; Phase 2A's re-query (unchanged)
         // caches None for it.
         urgency.insert(20, CachedClientVisualState::default());
-        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, true, style);
         assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::None);
     }
 
@@ -9643,12 +9793,12 @@ mod tests {
         let mut snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
         let mut urgency = HashMap::new();
         urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, fullscreen: false, ..CachedClientVisualState::default() });
-        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, true, style);
         assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::FullWindow);
         assert!(!snapshot.entries[0].fullscreen);
 
         urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, fullscreen: true, ..CachedClientVisualState::default() });
-        resolve_snapshot_fullscreen(&mut snapshot, &urgency, style);
+        resolve_snapshot_fullscreen(&mut snapshot, &urgency, true, style);
         assert_eq!(snapshot.entries[0].resolved_blur_request, BlurRequest::FullWindow, "request identity must survive a fullscreen transition");
         assert!(snapshot.entries[0].fullscreen);
     }
