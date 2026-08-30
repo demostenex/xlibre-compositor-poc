@@ -330,8 +330,6 @@ struct BackgroundBlurResources {
 /// assembling a candidate resource set. `Drop` deletes whatever has been
 /// created so far (GL delete calls silently ignore zero/absent names, so a
 /// partially populated guard cleans up exactly the names that exist).
-/// `std::mem::forget` is used once construction fully succeeds so ownership
-/// passes to `BackgroundBlurResources` without a double free.
 #[allow(dead_code)]
 struct PendingBlurResources {
     textures: [u32; 2],
@@ -350,6 +348,28 @@ impl PendingBlurResources {
             program: 0,
             vao: 0,
             buffer: 0,
+        }
+    }
+
+    fn into_resources(
+        mut self,
+        texture_size_uniform: i32,
+        direction_uniform: i32,
+        radius_uniform: i32,
+        width: i32,
+        height: i32,
+    ) -> BackgroundBlurResources {
+        BackgroundBlurResources {
+            textures: std::mem::replace(&mut self.textures, [0; 2]),
+            framebuffers: std::mem::replace(&mut self.framebuffers, [0; 2]),
+            program: std::mem::replace(&mut self.program, 0),
+            vao: std::mem::replace(&mut self.vao, 0),
+            buffer: std::mem::replace(&mut self.buffer, 0),
+            texture_size_uniform,
+            direction_uniform,
+            radius_uniform,
+            width,
+            height,
         }
     }
 }
@@ -477,22 +497,13 @@ impl BackgroundBlurResources {
             check_gl_error("background blur vertex buffer setup")?;
         }
 
-        let resources = Self {
-            textures: pending.textures,
-            framebuffers: pending.framebuffers,
-            program: pending.program,
-            vao: pending.vao,
-            buffer: pending.buffer,
+        let resources = pending.into_resources(
             texture_size_uniform,
             direction_uniform,
             radius_uniform,
             width,
             height,
-        };
-        // Ownership of every raw GL name has transferred to `resources`,
-        // whose own `Drop` frees them exactly once; disarm the pending guard
-        // so it does not also delete them.
-        std::mem::forget(pending);
+        );
         Ok(resources)
     }
 
@@ -1726,11 +1737,10 @@ mod tests {
             .expect("new() body ends before ensure_size");
         let new_body = &source[new_start..new_end];
         assert!(new_body.contains("let mut pending = PendingBlurResources"));
-        // Ownership only transfers to the committed resource struct once
-        // every fallible step above has already returned `Ok`.
-        let forget_index = new_body.find("std::mem::forget(pending)").expect("disarms the pending guard");
-        let ok_resources_index = new_body.find("Ok(resources)").expect("returns the committed resources");
-        assert!(forget_index < ok_resources_index);
+        // Ownership transfers by consuming the guard; its fields are empty
+        // before its normal Drop runs.
+        assert!(new_body.contains("pending.into_resources("));
+        assert!(!new_body.contains("std::mem::forget(pending)"));
     }
 
     #[test]
