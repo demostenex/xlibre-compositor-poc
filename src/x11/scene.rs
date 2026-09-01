@@ -1760,9 +1760,17 @@ impl SceneSnapshot {
                 BindingStatus::SingleClient(client) => Some(*client),
                 BindingStatus::NoClient | BindingStatus::Ambiguous(_) => None,
             };
-            if let Some(entry) = eligible_surface(
+            let semantic_metadata = semantic_client_xid.and_then(|client| {
+                if client == metadata.window {
+                    Some(metadata)
+                } else {
+                    binding.descendants.iter().find(|candidate| candidate.window == client)
+                }
+            });
+            if let Some(entry) = eligible_surface_with_semantic_metadata(
                 metadata,
                 semantic_client_xid,
+                semantic_metadata,
                 root_geometry,
                 surface_xid,
                 stacking_index,
@@ -1813,9 +1821,28 @@ fn known_non_renderable_windows(
     ignored
 }
 
+#[cfg(test)]
 fn eligible_surface(
     metadata: &WindowMetadata,
     semantic_client_xid: Option<Window>,
+    root_geometry: RootGeometry,
+    surface_xid: Window,
+    stacking_index: usize,
+) -> Option<SurfaceEntry> {
+    eligible_surface_with_semantic_metadata(
+        metadata,
+        semantic_client_xid,
+        None,
+        root_geometry,
+        surface_xid,
+        stacking_index,
+    )
+}
+
+fn eligible_surface_with_semantic_metadata(
+    metadata: &WindowMetadata,
+    semantic_client_xid: Option<Window>,
+    semantic_metadata: Option<&WindowMetadata>,
     root_geometry: RootGeometry,
     surface_xid: Window,
     stacking_index: usize,
@@ -1861,7 +1888,7 @@ fn eligible_surface(
         override_redirect: metadata.override_redirect,
         stacking_index,
         backend,
-        visual_class: classify_surface_visual_class(metadata.window_type.as_deref()),
+        visual_class: classify_surface_visual_class(effective_window_type(metadata, semantic_metadata)),
         fullscreen: false,
         shadow_eligible: false,
         resolved_border_color: [0.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits()],
@@ -1869,6 +1896,15 @@ fn eligible_surface(
         client_root_geometry: None,
         resolved_blur_request: BlurRequest::None,
     })
+}
+
+fn effective_window_type<'a>(
+    capture_metadata: &'a WindowMetadata,
+    semantic_metadata: Option<&'a WindowMetadata>,
+) -> Option<&'a str> {
+    semantic_metadata
+        .and_then(|metadata| metadata.window_type.as_deref())
+        .or(capture_metadata.window_type.as_deref())
 }
 
 fn classify_surface_visual_class(window_type: Option<&str>) -> SurfaceVisualClass {
@@ -2198,6 +2234,54 @@ fn stale_damage_create_reply(error: &ReplyError) -> bool {
     )
 }
 
+/// The outcome of classifying a DAMAGE/Subtract error against the issuing
+/// lease's own, independently-tracked ownership state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DamageSubtractClassification {
+    /// The lease was Active (proven, by construction of DamageState's
+    /// transition graph, to have never gone through this lease's own
+    /// local destroy path -- see DamageLease::destroy/Drop) and the
+    /// server replied DamageBadDamage, the DAMAGE extension's only
+    /// defined error. Subtract's `repair`/`parts` arguments are always
+    /// the fixed x11rb::NONE constants at this call site, so `damage`
+    /// (this lease's own, immutable, singly-owned, never-reused XID) is
+    /// the only externally-influenced argument. Together these facts
+    /// prove the server invalidated this specific resource independently
+    /// of any action Xomposite itself took -- the same disappearance
+    /// race already treated as non-fatal for DamageCreate
+    /// (stale_damage_create_reply above).
+    AlreadyGone,
+    /// Either the error was not DamageBadDamage (a real backend/program
+    /// defect for this call, per the same argument-domain reasoning), or
+    /// the lease was not Active when the error was classified -- in
+    /// which case the Active-lease invariant that justifies AlreadyGone
+    /// does not hold, and this reply must not be treated as stale.
+    Fatal,
+}
+
+/// Classifies a DAMAGE/Subtract error using two independent signals: the
+/// server's reply (`error`) and this lease's own ownership state at the
+/// moment the request was issued (`state`, captured by the caller before
+/// the request -- see DamageLease::subtract()). Neither signal alone is
+/// sufficient: `state` says nothing about what the server just reported,
+/// and `error` alone cannot distinguish a legitimate external
+/// disappearance from a hypothetical use of an already locally-retired
+/// lease. Only their conjunction resolves AlreadyGone.
+fn classify_damage_subtract_error(
+    state: DamageState,
+    error: &ReplyError,
+) -> DamageSubtractClassification {
+    let is_bad_damage = matches!(
+        error,
+        ReplyError::X11Error(inner) if inner.error_kind == ErrorKind::DamageBadDamage
+    );
+    if state == DamageState::Active && is_bad_damage {
+        DamageSubtractClassification::AlreadyGone
+    } else {
+        DamageSubtractClassification::Fatal
+    }
+}
+
 fn translate_damage_lease_acquire_error(error: DamageLeaseAcquireError) -> Box<dyn Error> {
     match error {
         DamageLeaseAcquireError::StaleDrawable => {
@@ -2255,14 +2339,29 @@ impl<'a> DamageLease<'a> {
     }
 
     fn subtract(&self) -> Result<(), Box<dyn Error>> {
-        if self.state.get() != DamageState::Active {
+        let state = self.state.get();
+        if state != DamageState::Active {
             return Ok(());
         }
-        self.connection
+        match self
+            .connection
             .inner
             .damage_subtract(self.damage_xid, x11rb::NONE, x11rb::NONE)?
-            .check()?;
-        Ok(())
+            .check()
+        {
+            Ok(()) => Ok(()),
+            Err(error) => match classify_damage_subtract_error(state, &error) {
+                DamageSubtractClassification::AlreadyGone => {
+                    self.mark_already_gone();
+                    println!(
+                        "DamageSubtract already gone: surface=0x{:08x} damage=0x{:08x}",
+                        self.surface_xid, self.damage_xid
+                    );
+                    Ok(())
+                }
+                DamageSubtractClassification::Fatal => Err(Box::new(error)),
+            },
+        }
     }
 
     fn destroy(&self) -> Result<DamageReleaseOutcome, Box<dyn Error>> {
@@ -6635,11 +6734,11 @@ mod tests {
         parse_background_property, build_background_render_quad_plan,
         effective_corner_radius,
         effective_border_width,
-        classify_surface_visual_class, apply_surface_visual_policy, border_visual_state,
+        classify_surface_visual_class, effective_window_type, apply_surface_visual_policy, border_visual_state,
         rendered_border_color, BorderVisualState, CachedClientVisualState, SurfaceVisualClass,
         wm_hints_urgency, state_demands_attention,
         is_background_property_notify, BackgroundAtoms, BackgroundCandidate, BackgroundPixmap,
-        classify_event, coordinator_requires_cleanup, eligible_surface,
+        classify_event, coordinator_requires_cleanup, eligible_surface, eligible_surface_with_semantic_metadata,
         is_internal_xid, root_guard, BackendCompatibility, CandidateBuildError, CopyPlan,
         PixmapGeometry, RootGeometry,
         bounded_batch_requires_retry, candidate_gate_decision, candidate_render_allowed,
@@ -6669,6 +6768,7 @@ mod tests {
         validate_named_pixmap_dimensions, translate_named_pixmap_acquire_error,
         DamageLeaseAcquireError, stale_damage_create_reply, translate_damage_lease_acquire_error,
         is_hierarchy_stale_candidate_error,
+        classify_damage_subtract_error, DamageSubtractClassification,
         Diagnostics3a3f8b3a,
         ResizeOnlyDirectionDiagnostics,
         ResizeOnlyFallbackReason, ResizeOnlyFallbackReasons,
@@ -8375,6 +8475,214 @@ mod tests {
     }
 
     // ========================================================
+    // post-3a3fa1i R2 — active-invariant DamageSubtract classifier. Two
+    // independent signals (this lease's own, provably-tamper-proof
+    // DamageState, and the server's reply) must both hold before a
+    // DamageBadDamage on Subtract is treated as a stale, already-gone
+    // resource rather than a fatal error. Root cause, ownership proof,
+    // and design rationale are in
+    // xomposite-design-reports/milestone-post-3a3fa1i-xdamage-active-lease-invalidation-proof-audit.txt.
+    // ========================================================
+
+    fn damage_subtract_x11_error(error_kind: ErrorKind) -> ReplyError {
+        // Shape matches the actually-reproduced fatal trace (DAMAGE/Subtract,
+        // major/minor opcode, sequence, bad_value) with only `error_kind`
+        // varied per case.
+        ReplyError::X11Error(X11Error {
+            error_kind,
+            error_code: 152,
+            sequence: 60393,
+            bad_value: 0x00a00a4b,
+            minor_opcode: 3,
+            major_opcode: 132,
+            extension_name: Some("DAMAGE".to_string()),
+            request_name: Some("Subtract"),
+        })
+    }
+
+    #[test]
+    fn active_bad_damage_is_already_gone() {
+        // Required test A.
+        assert_eq!(
+            classify_damage_subtract_error(
+                DamageState::Active,
+                &damage_subtract_x11_error(ErrorKind::DamageBadDamage),
+            ),
+            DamageSubtractClassification::AlreadyGone
+        );
+    }
+
+    #[test]
+    fn active_other_error_is_fatal() {
+        // Required test B.
+        for kind in [
+            ErrorKind::Match,
+            ErrorKind::Value,
+            ErrorKind::IDChoice,
+            ErrorKind::Alloc,
+            ErrorKind::Window,
+            ErrorKind::Drawable,
+        ] {
+            assert_eq!(
+                classify_damage_subtract_error(DamageState::Active, &damage_subtract_x11_error(kind)),
+                DamageSubtractClassification::Fatal,
+                "{kind:?} must remain Fatal even while the lease is Active"
+            );
+        }
+    }
+
+    #[test]
+    fn non_active_bad_damage_is_fatal() {
+        // Required test C. Production subtract() never actually reaches
+        // the classifier in these states (its own top guard returns
+        // before issuing any request), but the classifier itself -- in
+        // isolation -- must not launder a DamageBadDamage into
+        // AlreadyGone just because the error kind matches; the Active
+        // precondition must independently hold too.
+        for state in [
+            DamageState::DestroyAttempted,
+            DamageState::Released,
+            DamageState::AlreadyGone,
+            DamageState::Disarmed,
+        ] {
+            assert_eq!(
+                classify_damage_subtract_error(state, &damage_subtract_x11_error(ErrorKind::DamageBadDamage)),
+                DamageSubtractClassification::Fatal,
+                "{state:?} + DamageBadDamage must not produce AlreadyGone"
+            );
+        }
+    }
+
+    #[test]
+    fn state_input_determines_classification_for_identical_error() {
+        // Required test D (MANDATORY): this is the direct proof that
+        // DamageBadDamage alone is insufficient -- the identical error
+        // value classifies differently purely as a function of the
+        // second, independent `state` parameter.
+        let active_result = classify_damage_subtract_error(
+            DamageState::Active,
+            &damage_subtract_x11_error(ErrorKind::DamageBadDamage),
+        );
+        let non_active_result = classify_damage_subtract_error(
+            DamageState::DestroyAttempted,
+            &damage_subtract_x11_error(ErrorKind::DamageBadDamage),
+        );
+        assert_eq!(active_result, DamageSubtractClassification::AlreadyGone);
+        assert_eq!(non_active_result, DamageSubtractClassification::Fatal);
+        assert_ne!(
+            active_result, non_active_result,
+            "identical DamageBadDamage must classify differently depending on lease state alone"
+        );
+    }
+
+    #[test]
+    fn already_gone_state_matches_mark_already_gone_semantics() {
+        // Executable state-machine proxy (Section 11 of the R2 tasking).
+        // DamageLease cannot be constructed in a unit test without a live
+        // X11Connection (its sole constructor, acquire(), requires one,
+        // and no test anywhere in this file's existing suite constructs a
+        // real DamageLease or NamedSurfacePixmap either) -- this is a
+        // pre-existing limitation of the whole test architecture, not
+        // introduced by this fix. mark_already_gone()'s entire body is
+        // `self.state.set(DamageState::AlreadyGone)`; this test executes
+        // that exact primitive against a bare Cell<DamageState> seeded at
+        // Active (the only state subtract() ever calls it from) and
+        // proves the classify -> transition contract end to end at the
+        // data-type level.
+        let state = std::cell::Cell::new(DamageState::Active);
+        let classification = classify_damage_subtract_error(
+            state.get(),
+            &damage_subtract_x11_error(ErrorKind::DamageBadDamage),
+        );
+        assert_eq!(classification, DamageSubtractClassification::AlreadyGone);
+        if classification == DamageSubtractClassification::AlreadyGone {
+            state.set(DamageState::AlreadyGone);
+        }
+        assert_eq!(state.get(), DamageState::AlreadyGone);
+        assert_ne!(state.get(), DamageState::Active);
+    }
+
+    #[test]
+    fn subtract_wires_classifier_output_to_mark_already_gone_and_fatal_err() {
+        // Secondary structural guardrail (not the primary proof -- see
+        // the classifier-level tests above for that): confirms the wiring
+        // inside subtract() dispatches on classify_damage_subtract_error's
+        // two variants correctly and issues exactly one request.
+        let source = include_str!("scene.rs");
+        let impl_start = source.find("impl<'a> DamageLease<'a> {").expect("DamageLease impl exists");
+        let fn_start = impl_start + source[impl_start..].find("fn subtract(").expect("subtract exists");
+        let fn_end = fn_start + source[fn_start..].find("\n    fn destroy").expect("subtract body ends before destroy");
+        let body = &source[fn_start..fn_end];
+        assert!(body.contains("let state = self.state.get();"));
+        assert!(body.contains("classify_damage_subtract_error(state, &error)"));
+        assert!(body.contains("DamageSubtractClassification::AlreadyGone"));
+        assert!(body.contains("DamageSubtractClassification::Fatal"));
+        assert!(body.contains("mark_already_gone"));
+        assert!(body.contains("Err(Box::new(error))"));
+        assert_eq!(body.matches("damage_subtract(").count(), 1);
+    }
+
+    #[test]
+    fn subtract_fix_contains_no_transient_specific_conditions() {
+        let source = include_str!("scene.rs");
+        let impl_start = source.find("impl<'a> DamageLease<'a> {").expect("DamageLease impl exists");
+        let fn_start = impl_start + source[impl_start..].find("fn subtract(").expect("subtract exists");
+        let fn_end = fn_start + source[fn_start..].find("\n    fn destroy").expect("subtract body ends before destroy");
+        let body = &source[fn_start..fn_end];
+        for token in ["xbar", "360", "88", "notification", "WM_CLASS", "wm_class", "geometry"] {
+            assert!(
+                !body.contains(token),
+                "subtract() must not encode a {token}-specific condition"
+            );
+        }
+    }
+
+    #[test]
+    fn subtract_fix_does_not_touch_registry_commit_or_resize_paths() {
+        let source = include_str!("scene.rs");
+        let impl_start = source.find("impl<'a> DamageLease<'a> {").expect("DamageLease impl exists");
+        let fn_start = impl_start + source[impl_start..].find("fn subtract(").expect("subtract exists");
+        let fn_end = fn_start + source[fn_start..].find("\n    fn destroy").expect("subtract body ends before destroy");
+        let body = &source[fn_start..fn_end];
+        assert!(!body.contains("damage_registry"));
+        assert!(!body.contains("commit_candidate"));
+        assert!(!body.contains("moveonly"));
+        assert!(!body.contains("resizeonly"));
+        assert!(!body.contains("surface_removed"));
+        assert!(!body.contains("DestroyNotify"));
+    }
+
+    #[test]
+    fn already_gone_lease_short_circuits_destroy_before_any_request() {
+        // Secondary guardrail for the cleanup no-second-request property
+        // (Section 12 of the R2 tasking). destroy() itself is UNCHANGED by
+        // this candidate; this proves its pre-existing guard still checks
+        // state before issuing any request, which combined with the
+        // AlreadyGone terminal classification proven above (test A /
+        // already_gone_state_matches_mark_already_gone_semantics) is what
+        // makes cleanup's later retire_damage_lease() call emit zero
+        // DamageDestroy requests for a lease this fix marked AlreadyGone.
+        // A full mock-connection integration test proving "zero requests
+        // observed on the wire" would require introducing a connection
+        // trait/mock seam not present anywhere in this codebase's existing
+        // test suite (no test here constructs a live or mocked
+        // DamageLease/NamedSurfacePixmap) -- that is a genuine scope
+        // expansion beyond this fix and was deliberately not pursued, per
+        // instruction not to redesign solely for testing.
+        let source = include_str!("scene.rs");
+        let impl_start = source.find("impl<'a> DamageLease<'a> {").expect("DamageLease impl exists");
+        let fn_start = impl_start + source[impl_start..].find("fn destroy(").expect("destroy exists");
+        let fn_end = fn_start + source[fn_start..].find("\n    fn mark_already_gone").expect("destroy body ends before mark_already_gone");
+        let body = &source[fn_start..fn_end];
+        let guard_index = body.find("DamageState::Active").expect("guards on Active state");
+        let request_index = body.find("damage_destroy(").expect("issues DamageDestroy");
+        assert!(
+            guard_index < request_index,
+            "destroy() must check state before issuing a request"
+        );
+    }
+
+    // ========================================================
     // 3a3f6a V2 — BUG B: early visual-contribution filter.
     // ========================================================
 
@@ -9842,6 +10150,84 @@ mod tests {
         assert_eq!(classify_surface_visual_class(Some("_NET_WM_WINDOW_TYPE_DESKTOP")), SurfaceVisualClass::Desktop);
         assert_eq!(classify_surface_visual_class(Some("_NET_WM_WINDOW_TYPE_NORMAL")), SurfaceVisualClass::Normal);
         assert_eq!(classify_surface_visual_class(None), SurfaceVisualClass::Normal);
+    }
+
+    #[test]
+    fn semantic_window_type_precedes_capture_type_for_visual_classification() {
+        let mut capture = metadata();
+        capture.window_type = Some("_NET_WM_WINDOW_TYPE_DOCK".to_string());
+        let mut semantic = metadata();
+        semantic.window = 20;
+        semantic.window_type = Some("_NET_WM_WINDOW_TYPE_NORMAL".to_string());
+        let entry = eligible_surface_with_semantic_metadata(&capture, Some(20), Some(&semantic), root(), 10, 0).unwrap();
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Normal);
+    }
+
+    #[test]
+    fn semantic_dock_behind_presentation_frame_is_classified_as_dock() {
+        let mut capture = metadata();
+        capture.window_type = None;
+        let mut semantic = metadata();
+        semantic.window = 20;
+        semantic.window_type = Some("_NET_WM_WINDOW_TYPE_DOCK".to_string());
+        let entry = eligible_surface_with_semantic_metadata(&capture, Some(20), Some(&semantic), root(), 10, 0).unwrap();
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Dock);
+        let config = crate::config::CompositorConfig::with_corner_radius(16.0).unwrap();
+        let mut plan = build_render_quad_plan(capture.geometry, pixmap(20, 20), root()).unwrap();
+        apply_surface_visual_policy(&mut plan, &config.visuals, entry.visual_class);
+        assert_eq!(plan.corner_radius, 0.0);
+    }
+
+    #[test]
+    fn capture_type_is_used_without_semantic_client() {
+        let mut capture = metadata();
+        capture.window_type = Some("_NET_WM_WINDOW_TYPE_DOCK".to_string());
+        assert_eq!(effective_window_type(&capture, None), Some("_NET_WM_WINDOW_TYPE_DOCK"));
+        let entry = eligible_surface_with_semantic_metadata(&capture, None, None, root(), 10, 0).unwrap();
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Dock);
+    }
+
+    #[test]
+    fn absent_semantic_type_falls_back_to_capture_type() {
+        let mut capture = metadata();
+        capture.window_type = Some("_NET_WM_WINDOW_TYPE_DOCK".to_string());
+        let mut semantic = metadata();
+        semantic.window = 20;
+        semantic.window_type = None;
+        assert_eq!(effective_window_type(&capture, Some(&semantic)), Some("_NET_WM_WINDOW_TYPE_DOCK"));
+        let entry = eligible_surface_with_semantic_metadata(&capture, Some(20), Some(&semantic), root(), 10, 0).unwrap();
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Dock);
+    }
+
+    #[test]
+    fn semantic_desktop_preserves_zero_radius_policy() {
+        let mut semantic = metadata();
+        semantic.window = 20;
+        semantic.window_type = Some("_NET_WM_WINDOW_TYPE_DESKTOP".to_string());
+        let entry = eligible_surface_with_semantic_metadata(&metadata(), Some(20), Some(&semantic), root(), 10, 0).unwrap();
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Desktop);
+        let config = crate::config::CompositorConfig::with_corner_radius(16.0).unwrap();
+        let mut plan = build_render_quad_plan(window(0, 0, 20, 20, 0), pixmap(20, 20), root()).unwrap();
+        apply_surface_visual_policy(&mut plan, &config.visuals, entry.visual_class);
+        assert_eq!(plan.corner_radius, 0.0);
+    }
+
+    #[test]
+    fn no_semantic_client_with_absent_capture_type_remains_normal() {
+        let capture = metadata();
+        let entry = eligible_surface_with_semantic_metadata(&capture, None, None, root(), 10, 0).unwrap();
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Normal);
+    }
+
+    #[test]
+    fn semantic_type_classification_is_independent_of_capture_geometry() {
+        let mut capture = metadata();
+        capture.geometry = window(0, 0, 1920, 26, 0);
+        let mut semantic = metadata();
+        semantic.window = 20;
+        semantic.window_type = Some("_NET_WM_WINDOW_TYPE_NORMAL".to_string());
+        let entry = eligible_surface_with_semantic_metadata(&capture, Some(20), Some(&semantic), root(), 10, 0).unwrap();
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Normal);
     }
 
     #[test]
