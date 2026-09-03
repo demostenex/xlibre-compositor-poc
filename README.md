@@ -1,8 +1,17 @@
 # Xomposite
 
-Xomposite is an experimental X11 compositor written in Rust. It is currently developed
-and tested primarily with XLibre and i3. It is a compositor, not a window manager: window
-management remains the responsibility of i3 or another window manager.
+Xomposite is a modern, lightweight X11 compositor written in Rust from scratch. Developed and tested primarily with **XLibre** and **i3**, it replaces legacy compositor stacks with a clean, analytical GPU-driven rendering pipeline and strict transactional resource management.
+
+> [!NOTE]
+> Xomposite is a compositor, not a window manager. Window placement, tiling, and keyboard navigation remain the responsibility of i3 or another window manager.
+
+## Why Xomposite?
+
+- **Real-world stress test for XLibre:** Rather than relying on changelogs or synthetic tests, Xomposite was engineered to put the XLibre XServer fork through its paces under demanding desktop workloads using `XComposite`, `XDamage`, `DRI3`, and `Present`.
+- **Written from scratch in Rust:** Free from 20+ years of accumulated legacy hacks found in traditional X11 compositors. Xomposite speaks directly to X11 protocols via `x11rb`, manages EGL contexts via `khronos-egl`, and renders directly in OpenGL—with zero intermediate bloated compositor frameworks.
+- **Analytical GPU rendering:** Rounded corners, window borders, drop shadows, and background blurs are evaluated analytically inside GL shaders rather than using pre-rendered sprite slices or CPU blits.
+- **Transactional scene lifecycle & early obsolescence checks:** Window hierarchy updates and pixel damage are staged transactionally. By detecting obsolete geometry before expensive resource acquisition, Xomposite eliminates stale-candidate backpressure and stutter during rapid floating window resizes.
+- **Predictable, application-driven blur:** Background blur is strictly opt-in via the standard `_KDE_NET_WM_BLUR_BEHIND_REGION` property. The compositor never guesses or forces blur based on opacity heuristics.
 
 ## Current status
 
@@ -26,16 +35,52 @@ X11 server, application, or visual configuration.
 The implementation is still being validated against the author's XLibre+i3 session and
 should be treated accordingly.
 
-## Building
+## Prerequisites & Installation
+
+### System Requirements
+
+- **Linux** running an X11 server with DRI3 and EGL support (e.g., **XLibre** >= 25.1 or modern Xorg).
+- **Rust toolchain:** Latest stable Rust/Cargo (2024 edition support).
+- **System development libraries:**
+  - `libxcb` and X11 development headers (including `composite`, `damage`, `dri3`, `present`, `randr`, `xfixes`).
+  - `libEGL` and `libGL` (Mesa / GPU vendor drivers).
+
+#### Installing System Dependencies
+
+On Arch Linux / Artix Linux:
+```bash
+sudo pacman -S base-devel rust libxcb libx11 mesa
+```
+
+On Debian / Ubuntu:
+```bash
+sudo apt install build-essential cargo libxcb1-dev libxcb-composite0-dev libxcb-damage0-dev libxcb-dri3-dev libxcb-present-dev libxcb-randr0-dev libxcb-xfixes0-dev libegl1-mesa-dev libgl1-mesa-dev
+```
+
+### Building
+
+To build the development binary:
 
 ```bash
 cargo build --locked
 ```
 
-The development executable is:
+To build an optimized release binary for daily use:
 
-```text
-target/debug/xlibre-compositor-poc
+```bash
+cargo build --release --locked
+```
+
+The resulting executables are:
+- Development: `target/debug/xlibre-compositor-poc`
+- Release: `target/release/xlibre-compositor-poc`
+
+### Installing
+
+To install the binary directly to your Cargo binary path (`~/.cargo/bin`):
+
+```bash
+cargo install --path . --locked
 ```
 
 ## Running
@@ -168,3 +213,17 @@ published speculatively.
 3. Transitions and animations.
 4. Improved logging and a stable installation workflow.
 5. Live configuration reload and runtime window-rule integration.
+
+## Contributing
+
+Contributions, issues, and discussions are welcome!
+
+### Development Principles
+
+- **Design & Audit First:** Architecture decisions, protocol handshakes, and lifecycle changes should be documented and audited before landing invasive patches.
+- **Strict RAII & Zero Leaks:** Manual leak workarounds (such as `std::mem::forget`) are prohibited. All GL, EGL, and X11 resources use deterministic ownership-transfer semantics.
+- **Automated Verification:** Always ensure the test suite passes before submitting changes:
+  ```bash
+  cargo test --locked
+  ```
+- **Target Environment:** When reporting bugs or proposing features, please specify your X server version (`XLibre` or `Xorg`), GPU driver, and window manager.
