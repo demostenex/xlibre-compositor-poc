@@ -1298,6 +1298,7 @@ struct VisualAtoms {
     demands_attention: xproto::Atom,
     fullscreen: xproto::Atom,
     blur_behind_region: xproto::Atom,
+    effect_owner: xproto::Atom,
 }
 
 /// One `x, y, width, height` group from a `_KDE_NET_WM_BLUR_BEHIND_REGION`
@@ -1365,6 +1366,14 @@ enum BackgroundCandidate {
 struct SurfaceEntry {
     surface_xid: Window,
     semantic_client_xid: Option<Window>,
+    /// Raw `_XOMPOSITE_EFFECT_OWNER` property value from this surface. This
+    /// is an effect-authority reference only; it is never semantic identity
+    /// and never owns compositor resources.
+    effect_owner: Option<Window>,
+    /// The surface's own explicit blur request. This is populated only for
+    /// surfaces without a usable semantic client; managed-client blur stays
+    /// on the existing semantic-client cache path.
+    own_blur_request: BlurRequest,
     client_root_geometry: Option<ClientRootGeometry>,
     lifecycle_xid: Window,
     geometry: WindowGeometry,
@@ -3367,6 +3376,8 @@ fn eligible_surface_with_semantic_metadata(
     Some(SurfaceEntry {
         surface_xid,
         semantic_client_xid,
+        effect_owner: None,
+        own_blur_request: BlurRequest::None,
         lifecycle_xid: surface_xid,
         geometry: metadata.geometry,
         depth: metadata.depth,
@@ -3498,6 +3509,33 @@ fn client_bounds_from_hierarchy(
     bounds
 }
 
+/// Reads effect-owner metadata from already-tracked capture surfaces. A
+/// surface without a semantic client also reads its own blur request here;
+/// managed-client requests remain on the existing semantic-client cache path.
+/// BadWindow is a safe no-relationship result for this metadata read. The
+/// surrounding hierarchy/resource candidate still owns lifecycle truth.
+fn initialize_surface_effect_metadata(
+    connection: &X11Connection,
+    snapshot: &mut SceneSnapshot,
+    atoms: VisualAtoms,
+) -> Result<(), Box<dyn Error>> {
+    for entry in &mut snapshot.entries {
+        entry.effect_owner = match read_effect_owner(connection, entry.surface_xid, atoms.effect_owner) {
+            Ok(owner) => owner,
+            Err(error) if super::capture::is_bad_window_error(error.as_ref()) => None,
+            Err(error) => return Err(error),
+        };
+        if entry.semantic_client_xid.is_none() {
+            entry.own_blur_request = match read_client_blur_request(connection, entry.surface_xid, atoms) {
+                Ok(request) => request,
+                Err(error) if super::capture::is_bad_window_error(error.as_ref()) => BlurRequest::None,
+                Err(error) => return Err(error),
+            };
+        }
+    }
+    Ok(())
+}
+
 fn translate_coordinates_reply_error(error: ReplyError) -> Box<dyn Error> {
     if matches!(
         error,
@@ -3537,6 +3575,17 @@ fn resolve_regions_client_geometry(
     let mut translated = HashMap::new();
     for entry in &snapshot.entries {
         let Some(client) = entry.semantic_client_xid else {
+            if matches!(entry.own_blur_request, BlurRequest::Regions(_)) {
+                translated.insert(
+                    entry.surface_xid,
+                    ClientRootGeometry {
+                        root_x: i32::from(entry.geometry.x),
+                        root_y: i32::from(entry.geometry.y),
+                        width: i32::from(entry.geometry.width),
+                        height: i32::from(entry.geometry.height),
+                    },
+                );
+            }
             continue;
         };
         let Some(state) = urgency.get(&client) else {
@@ -3564,6 +3613,8 @@ fn resolve_regions_client_geometry(
     for entry in &mut snapshot.entries {
         if let Some(client) = entry.semantic_client_xid {
             entry.client_root_geometry = translated.get(&client).copied();
+        } else if matches!(entry.own_blur_request, BlurRequest::Regions(_)) {
+            entry.client_root_geometry = translated.get(&entry.surface_xid).copied();
         }
     }
     Ok(())
@@ -3589,6 +3640,24 @@ fn resolved_blur_request(
         .unwrap_or(BlurRequest::None)
 }
 
+fn resolved_blur_request_with_auxiliary(
+    entry: &SurfaceEntry,
+    urgency: &HashMap<Window, CachedClientVisualState>,
+    tracked_semantic_clients: &HashSet<Window>,
+) -> BlurRequest {
+    if entry.semantic_client_xid.is_some() {
+        return resolved_blur_request(entry, urgency);
+    }
+    if entry
+        .effect_owner
+        .is_some_and(|owner| tracked_semantic_clients.contains(&owner))
+    {
+        entry.own_blur_request.clone()
+    } else {
+        BlurRequest::None
+    }
+}
+
 fn permitted_blur_request(
     entry: &SurfaceEntry,
     urgency: &HashMap<Window, CachedClientVisualState>,
@@ -3601,19 +3670,44 @@ fn permitted_blur_request(
     }
 }
 
+fn permitted_blur_request_with_auxiliary(
+    entry: &SurfaceEntry,
+    urgency: &HashMap<Window, CachedClientVisualState>,
+    tracked_semantic_clients: &HashSet<Window>,
+    blur_enabled: bool,
+) -> BlurRequest {
+    if entry.semantic_client_xid.is_some() {
+        permitted_blur_request(entry, urgency, blur_enabled)
+    } else if blur_enabled {
+        resolved_blur_request_with_auxiliary(entry, urgency, tracked_semantic_clients)
+    } else {
+        BlurRequest::None
+    }
+}
+
 fn resolve_snapshot_fullscreen(
     snapshot: &mut SceneSnapshot,
     urgency: &HashMap<Window, CachedClientVisualState>,
     blur_enabled: bool,
     style: crate::config::ShadowConfig,
 ) {
+    let tracked_semantic_clients: HashSet<Window> = snapshot
+        .entries
+        .iter()
+        .filter_map(|entry| entry.semantic_client_xid)
+        .collect();
     for entry in &mut snapshot.entries {
         entry.fullscreen = entry
             .semantic_client_xid
             .and_then(|client| urgency.get(&client))
             .is_some_and(|state| state.fullscreen);
         entry.shadow_eligible = shadow_eligible_for_entry(style, entry);
-        entry.resolved_blur_request = permitted_blur_request(entry, urgency, blur_enabled);
+        entry.resolved_blur_request = permitted_blur_request_with_auxiliary(
+            entry,
+            urgency,
+            &tracked_semantic_clients,
+            blur_enabled,
+        );
     }
 }
 
@@ -5766,6 +5860,11 @@ impl<'a> SceneSession<'a> {
             owner,
         )?;
         self.diagnostics.record_snapshot_origin();
+        initialize_surface_effect_metadata(
+            self.connection,
+            &mut snapshot,
+            self.visual_atoms,
+        )?;
         let mut compound_target = None;
         if let Some(update) = self.pending_hierarchy_geometry {
             self.diagnostics.compound_hierarchy_geometry_observed += 1;
@@ -6254,6 +6353,8 @@ impl<'a> SceneSession<'a> {
         if live.root != candidate.snapshot.root
             || live_entry.surface_xid != candidate_entry.surface_xid
             || live_entry.semantic_client_xid != candidate_entry.semantic_client_xid
+            || live_entry.effect_owner != candidate_entry.effect_owner
+            || live_entry.own_blur_request != candidate_entry.own_blur_request
             || live_entry.lifecycle_xid != candidate_entry.lifecycle_xid
             || live_entry.geometry.width != candidate_entry.geometry.width
             || live_entry.geometry.height != candidate_entry.geometry.height
@@ -7382,6 +7483,78 @@ impl<'a> SceneSession<'a> {
             self.active_window = active_window;
             let changed = affected && self.refresh_resolved_visual_state(&[previous, active_window]);
             return Ok(changed.then_some(SceneInvalidation::VisualState));
+        }
+        if property.atom == self.visual_atoms.effect_owner {
+            let Some(entry) = entries.iter().find(|entry| entry.surface_xid == property.window) else {
+                return Ok(None);
+            };
+            let old_owner = entry.effect_owner;
+            let owner = match read_effect_owner(self.connection, property.window, self.visual_atoms.effect_owner) {
+                Ok(owner) => owner,
+                Err(error) if super::capture::is_bad_window_error(error.as_ref()) => None,
+                Err(error) => return Err(error),
+            };
+            let tracked_semantic_clients: HashSet<Window> = self
+                .current_snapshot()
+                .entries
+                .iter()
+                .filter_map(|candidate| candidate.semantic_client_xid)
+                .collect();
+            let urgency = self.urgency.clone();
+            let blur_enabled = self._config.blur_enabled;
+            let Some(current) = self.current_snapshot_mut().entries.iter_mut()
+                .find(|candidate| candidate.surface_xid == property.window)
+            else {
+                return Ok(None);
+            };
+            let old_request = current.resolved_blur_request.clone();
+            current.effect_owner = owner;
+            current.resolved_blur_request = permitted_blur_request_with_auxiliary(
+                current,
+                &urgency,
+                &tracked_semantic_clients,
+                blur_enabled,
+            );
+            let changed = old_owner != owner || old_request != current.resolved_blur_request;
+            return Ok(changed.then_some(SceneInvalidation::VisualState));
+        }
+        if property.atom == self.visual_atoms.blur_behind_region
+            && entries.iter().any(|entry| {
+                entry.surface_xid == property.window && entry.semantic_client_xid.is_none()
+            })
+        {
+            let own_blur_request = match read_client_blur_request(
+                self.connection,
+                property.window,
+                self.visual_atoms,
+            ) {
+                Ok(request) => request,
+                Err(error) if super::capture::is_bad_window_error(error.as_ref()) => BlurRequest::None,
+                Err(error) => return Err(error),
+            };
+            let tracked_semantic_clients: HashSet<Window> = self
+                .current_snapshot()
+                .entries
+                .iter()
+                .filter_map(|candidate| candidate.semantic_client_xid)
+                .collect();
+            let urgency = self.urgency.clone();
+            let blur_enabled = self._config.blur_enabled;
+            let Some(current) = self.current_snapshot_mut().entries.iter_mut()
+                .find(|candidate| candidate.surface_xid == property.window)
+            else {
+                return Ok(None);
+            };
+            let old_request = current.resolved_blur_request.clone();
+            current.own_blur_request = own_blur_request;
+            current.resolved_blur_request = permitted_blur_request_with_auxiliary(
+                current,
+                &urgency,
+                &tracked_semantic_clients,
+                blur_enabled,
+            );
+            return Ok((old_request != current.resolved_blur_request)
+                .then_some(SceneInvalidation::VisualState));
         }
         let Some(entry) = entries.iter().find(|entry| entry.semantic_client_xid == Some(property.window)) else {
             return Ok(None);
@@ -8590,6 +8763,7 @@ fn acquire_visual_atoms(connection: &X11Connection) -> Result<VisualAtoms, Box<d
         demands_attention: intern(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
         fullscreen: intern(b"_NET_WM_STATE_FULLSCREEN")?,
         blur_behind_region: intern(b"_KDE_NET_WM_BLUR_BEHIND_REGION")?,
+        effect_owner: intern(b"_XOMPOSITE_EFFECT_OWNER")?,
     })
 }
 
@@ -8648,6 +8822,41 @@ fn read_client_blur_request(
         .get_property(false, client, atoms.blur_behind_region, xproto::AtomEnum::CARDINAL, 0, u32::MAX)?
         .reply()?;
     Ok(parse_blur_behind_region(reply.value32()))
+}
+
+/// Parses the exact single-XID representation required by
+/// `_XOMPOSITE_EFFECT_OWNER(WINDOW)`. A malformed or absent property is
+/// deliberately indistinguishable from no relationship.
+fn parse_effect_owner_property(
+    property_type: xproto::Atom,
+    window_type: xproto::Atom,
+    format: u8,
+    value_len: u32,
+    value: &[u8],
+) -> Option<Window> {
+    if property_type != window_type || format != 32 || value_len != 1 || value.len() != 4 {
+        return None;
+    }
+    let xid = u32::from_ne_bytes(value.try_into().ok()?);
+    (xid != x11rb::NONE).then_some(xid)
+}
+
+fn read_effect_owner(
+    connection: &X11Connection,
+    surface: Window,
+    atom: xproto::Atom,
+) -> Result<Option<Window>, Box<dyn Error>> {
+    let reply = connection
+        .inner
+        .get_property(false, surface, atom, xproto::AtomEnum::WINDOW, 0, u32::MAX)?
+        .reply()?;
+    Ok(parse_effect_owner_property(
+        reply.type_,
+        xproto::AtomEnum::WINDOW.into(),
+        reply.format,
+        reply.value_len,
+        &reply.value,
+    ))
 }
 
 /// Pure parser for a `_KDE_NET_WM_BLUR_BEHIND_REGION` payload, already
@@ -8936,10 +9145,14 @@ fn is_visual_property_notify(
         return true;
     }
     snapshot.entries.iter().any(|entry| {
-        entry.semantic_client_xid == Some(event.window)
-            && (event.atom == atoms.wm_hints
-                || event.atom == atoms.net_wm_state
-                || event.atom == atoms.blur_behind_region)
+        (entry.surface_xid == event.window && event.atom == atoms.effect_owner)
+            || (entry.surface_xid == event.window
+                && entry.semantic_client_xid.is_none()
+                && event.atom == atoms.blur_behind_region)
+            || (entry.semantic_client_xid == Some(event.window)
+                && (event.atom == atoms.wm_hints
+                    || event.atom == atoms.net_wm_state
+                    || event.atom == atoms.blur_behind_region))
     })
 }
 
@@ -9086,6 +9299,8 @@ fn structural_identity_matches(left: &SceneSnapshot, right: &SceneSnapshot) -> b
         && left.entries.iter().zip(&right.entries).all(|(left, right)| {
             left.surface_xid == right.surface_xid
                 && left.semantic_client_xid == right.semantic_client_xid
+                && left.effect_owner == right.effect_owner
+                && left.own_blur_request == right.own_blur_request
                 && left.lifecycle_xid == right.lifecycle_xid
                 && left.depth == right.depth
                 && left.visual == right.visual
@@ -9421,7 +9636,8 @@ mod tests {
         entry_has_visible_contribution, prune_invisible_entries,
         resource_identity_fields_match,
         damage_identity_compatible,
-        BlurRequest, BlurRegionRect, parse_blur_behind_region, is_visual_property_notify,
+        BlurRequest, BlurRegionRect, parse_blur_behind_region, parse_effect_owner_property,
+        is_visual_property_notify, resolved_blur_request_with_auxiliary,
         permitted_blur_request, resolved_blur_request, resolve_snapshot_fullscreen,
         ClientRootGeometry, client_root_geometry_from_translation,
         region_request_requires_client_origin, translate_coordinates_reply_error,
@@ -11401,6 +11617,8 @@ mod tests {
         SurfaceEntry {
             surface_xid: 0x0040_0000,
             semantic_client_xid: None,
+            effect_owner: None,
+            own_blur_request: BlurRequest::None,
             lifecycle_xid: 0x0040_0000,
             geometry,
             depth: 24,
@@ -11433,6 +11651,8 @@ mod tests {
         SurfaceEntry {
             surface_xid,
             semantic_client_xid: None,
+            effect_owner: None,
+            own_blur_request: BlurRequest::None,
             lifecycle_xid: surface_xid,
             geometry: geo(0, 0, 100, 100),
             depth: 24,
@@ -16266,6 +16486,7 @@ mod tests {
             demands_attention: 42,
             fullscreen: 43,
             blur_behind_region: 44,
+            effect_owner: 45,
         };
         let state = read_net_wm_state(Some([7, 43, 42].into_iter()), atoms);
         assert!(state.demands_attention);
@@ -16371,10 +16592,86 @@ mod tests {
     }
 
     #[test]
+    fn effect_owner_property_requires_exact_window_single_xid() {
+        let window_type: xproto::Atom = xproto::AtomEnum::WINDOW.into();
+        assert_eq!(parse_effect_owner_property(window_type, window_type, 32, 1, &20u32.to_ne_bytes()), Some(20));
+        assert_eq!(parse_effect_owner_property(xproto::AtomEnum::NONE.into(), window_type, 0, 0, &[]), None);
+        assert_eq!(parse_effect_owner_property(window_type, window_type, 16, 1, &[20, 0]), None);
+        assert_eq!(parse_effect_owner_property(window_type, window_type, 32, 0, &[]), None);
+        assert_eq!(parse_effect_owner_property(window_type, window_type, 32, 2, &20u32.to_ne_bytes()), None);
+        assert_eq!(parse_effect_owner_property(window_type, window_type, 32, 1, &0u32.to_ne_bytes()), None);
+        assert_eq!(parse_effect_owner_property(99, window_type, 32, 1, &20u32.to_ne_bytes()), None);
+    }
+
+    #[test]
+    fn auxiliary_blur_requires_owner_and_preserves_popup_request() {
+        let mut popup = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        popup.effect_owner = Some(20);
+        popup.own_blur_request = BlurRequest::Regions(vec![BlurRegionRect { x: 7, y: 8, width: 9, height: 10 }]);
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState {
+            blur_requested: BlurRequest::Regions(vec![BlurRegionRect { x: 100, y: 100, width: 1, height: 1 }]),
+            ..CachedClientVisualState::default()
+        });
+        let valid = HashSet::from([20]);
+        assert_eq!(
+            resolved_blur_request_with_auxiliary(&popup, &urgency, &valid),
+            popup.own_blur_request,
+            "owner authorizes the popup's request; it does not supply the owner's request"
+        );
+        assert_eq!(resolved_blur_request_with_auxiliary(&popup, &urgency, &HashSet::new()), BlurRequest::None);
+        popup.own_blur_request = BlurRequest::None;
+        assert_eq!(resolved_blur_request_with_auxiliary(&popup, &urgency, &valid), BlurRequest::None);
+    }
+
+    #[test]
+    fn effect_owner_never_overloads_semantic_client_or_managed_blur() {
+        let mut managed = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
+        managed.effect_owner = Some(30);
+        managed.own_blur_request = BlurRequest::Regions(vec![BlurRegionRect { x: 90, y: 90, width: 2, height: 2 }]);
+        let mut urgency = HashMap::new();
+        urgency.insert(20, CachedClientVisualState { blur_requested: BlurRequest::FullWindow, ..CachedClientVisualState::default() });
+        urgency.insert(30, CachedClientVisualState { blur_requested: BlurRequest::Regions(vec![BlurRegionRect { x: 1, y: 1, width: 1, height: 1 }]), ..CachedClientVisualState::default() });
+        assert_eq!(managed.semantic_client_xid, Some(20));
+        assert_eq!(resolved_blur_request_with_auxiliary(&managed, &urgency, &HashSet::from([30])), BlurRequest::FullWindow);
+    }
+
+    #[test]
+    fn auxiliary_property_notify_is_scoped_to_tracked_surface() {
+        let atoms = VisualAtoms {
+            active_window: 1, wm_hints: 2, net_wm_state: 3,
+            demands_attention: 42, fullscreen: 43, blur_behind_region: 44, effect_owner: 45,
+        };
+        let mut popup = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        popup.override_redirect = true;
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![popup] };
+        for atom in [44, 45] {
+            let event = Event::PropertyNotify(xproto::PropertyNotifyEvent {
+                response_type: 28, sequence: 0, window: 10, atom, time: 0,
+                state: xproto::Property::NEW_VALUE,
+            });
+            assert!(is_visual_property_notify(&event, 1, atoms, &snapshot));
+        }
+        let unrelated = Event::PropertyNotify(xproto::PropertyNotifyEvent {
+            response_type: 28, sequence: 0, window: 999, atom: 45, time: 0,
+            state: xproto::Property::NEW_VALUE,
+        });
+        assert!(!is_visual_property_notify(&unrelated, 1, atoms, &snapshot));
+    }
+
+    #[test]
+    fn effect_owner_does_not_make_override_redirect_animation_eligible() {
+        let mut popup = animation_test_entry(10, SurfaceVisualClass::Normal, true);
+        popup.effect_owner = Some(20);
+        assert!(!eligible_for_open_animation(&popup));
+        assert_eq!(popup.effective_override_redirect, true);
+    }
+
+    #[test]
     fn blur_behind_region_property_notify_is_visual_state_scoped() {
         let atoms = VisualAtoms {
             active_window: 1, wm_hints: 2, net_wm_state: 3,
-            demands_attention: 42, fullscreen: 43, blur_behind_region: 44,
+            demands_attention: 42, fullscreen: 43, blur_behind_region: 44, effect_owner: 45,
         };
         let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
         let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
