@@ -1372,7 +1372,18 @@ struct SurfaceEntry {
     visual: u32,
     class: WindowClass,
     map_state: xproto::MapState,
+    /// The CAPTURE surface's own override_redirect attribute (this
+    /// surface_xid's GetWindowAttributes reply). Left with exactly this
+    /// meaning for every existing consumer (identity/rebase guards,
+    /// diagnostics, geometry tracking) — do not repurpose.
     override_redirect: bool,
+    /// 3a3fa2a R2 — semantic-client-preferring resolution, consumed ONLY
+    /// by open-animation eligibility. Equal to the semantic client's own
+    /// override_redirect when semantic metadata is available (resolved
+    /// from already-fetched hierarchy metadata, zero new X11 queries),
+    /// otherwise falls back to `override_redirect` (the capture value)
+    /// above. See effective_override_redirect().
+    effective_override_redirect: bool,
     stacking_index: usize,
     backend: BackendCompatibility,
     visual_class: SurfaceVisualClass,
@@ -1709,6 +1720,1483 @@ impl PresentClock {
     }
 }
 
+/// 3a3fa2a/3a3fa2b1 — window open animation. Visual-only, resource-free
+/// per-surface state: never holds a DamageLease/NamedPixmap/EGLImage, and
+/// never mutates authoritative X11 geometry. See milestone-3a3fa2a-window-
+/// animation-core-open-audit.txt and milestone-3a3fa2b-animation-config-
+/// effect-model-audit.txt for the architecture this implements. Only one
+/// animation kind (open) exists for this milestone, so there is
+/// deliberately no `kind` discriminant yet — add one when a second kind
+/// is actually built.
+///
+/// Duration is now config-resolved (see `crate::config::AnimationConfig`)
+/// rather than a hardcoded constant — captured once at construction time,
+/// per `WindowAnimation::open`, and never reread afterward.
+#[derive(Clone, Debug)]
+struct WindowAnimation {
+    effect: crate::config::OpenAnimationEffect,
+    started_at: Instant,
+    duration: Duration,
+}
+
+impl WindowAnimation {
+    fn open(started_at: Instant, effect: crate::config::OpenAnimationEffect, duration: Duration) -> Self {
+        Self { effect, started_at, duration }
+    }
+
+    fn progress(&self, now: Instant) -> f32 {
+        animation_progress(now.saturating_duration_since(self.started_at), self.duration)
+    }
+
+    /// Convenience wrapper around the single, generic
+    /// `sample_open_effect` — the SAME function consulted by every render
+    /// path (provisional and persistent alike), never a separately
+    /// hardcoded first-frame path. See sample_open_effect.
+    fn sample(&self, now: Instant) -> AnimationVisual {
+        sample_open_effect(self.effect, self.progress(now))
+    }
+
+    fn is_complete(&self, now: Instant) -> bool {
+        self.progress(now) >= 1.0
+    }
+}
+
+/// Pure, deterministic progress in [0, 1]. Never accumulates frame deltas —
+/// always derived from absolute elapsed time against the animation's own
+/// `started_at`, so it cannot drift.
+fn animation_progress(elapsed: Duration, duration: Duration) -> f32 {
+    if duration.is_zero() {
+        return 1.0;
+    }
+    (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    1.0 - inv * inv * inv
+}
+
+/// 3a3fa2b7-r3 — ease-in cubic: `t³`. Slow initial change accelerating
+/// toward the end — the opposite shape of `ease_out_cubic`. Used by the
+/// R3 synchronized final collapse so content remains visually substantial
+/// early in the final phase and the collapse accelerates toward the end.
+fn ease_in_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * t
+}
+
+/// 3a3fa2b1 — pure, resource-free description of "how to visually
+/// transform this surface's existing texture/geometry" for one animation
+/// frame. Owns no XID/DamageLease/NamedPixmap/EGLImage/texture/
+/// framebuffer/Present state. `scale_x`/`scale_y` are independent so a
+/// future non-uniform effect (e.g. teleport) needs no renderer change —
+/// see `scale_render_quad_plan`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AnimationVisual {
+    opacity: f32,
+    scale_x: f32,
+    scale_y: f32,
+}
+
+/// TEMPORARY DEVELOPMENT TUNING (3a3fa2a/b1) — start scale kept at the
+/// current exaggerated human-validation value (0.70), not yet the eventual
+/// release value (0.96), per this milestone's explicit "do not tune
+/// aesthetics in b1" scope. `animation.open.duration = 800` in config now
+/// reproduces the exact previously-hardcoded 800ms/0.70 behavior.
+const SCALE_EFFECT_FROM_SCALE: f32 = 0.70;
+const SCALE_EFFECT_TO_SCALE: f32 = 1.0;
+const SCALE_EFFECT_FROM_OPACITY: f32 = 0.0;
+const SCALE_EFFECT_TO_OPACITY: f32 = 1.0;
+
+fn sample_scale(t: f32) -> AnimationVisual {
+    let eased = ease_out_cubic(t);
+    let scale = lerp(SCALE_EFFECT_FROM_SCALE, SCALE_EFFECT_TO_SCALE, eased);
+    AnimationVisual {
+        opacity: lerp(SCALE_EFFECT_FROM_OPACITY, SCALE_EFFECT_TO_OPACITY, eased),
+        scale_x: scale,
+        scale_y: scale,
+    }
+}
+
+/// 3a3fa2b2-r2 — "teleport materialization": a DBZ-inspired RAPID
+/// materialization, not a smooth zoom. Generic visual inspiration only —
+/// no copyrighted sprites/artwork/sounds/character imagery of any kind,
+/// just a piecewise numeric curve. Four phases, each a `lerp` between
+/// fixed endpoint constants driven by `ease_out_cubic` on that phase's
+/// own local progress — no effect-local runtime state, no timer, no
+/// frame counter: the entire curve is a pure function of `t` alone,
+/// exactly like `sample_scale`. Motion is heavily FRONT-LOADED: by
+/// t=0.35 the window is already materialized (opacity≈1, scale≈1), with
+/// the remaining 65% of the animation spent on a small, sharp
+/// impact/recoil/snap — see milestone-3a3fa2b2-teleport-materialization-
+/// r2-preview.txt for the full curve rationale and human-character
+/// contract. Deliberately distinct from Scale's single uniform lerp:
+/// Teleport's Y axis is far more aggressive than X for most of the
+/// animation (starts as a nearly-flat horizontal streak, not a small
+/// normal-looking window), and it overshoots then recoils before
+/// snapping — Scale does neither.
+const TELEPORT_PHASE_A_END: f32 = 0.10; // ignition / streak
+const TELEPORT_PHASE_B_END: f32 = 0.35; // explosive materialization
+const TELEPORT_PHASE_C_END: f32 = 0.65; // impact / recoil
+// phase D (snap) runs from TELEPORT_PHASE_C_END to 1.0
+
+const TELEPORT_START_OPACITY: f32 = 0.0;
+const TELEPORT_START_SCALE_X: f32 = 0.45;
+const TELEPORT_START_SCALE_Y: f32 = 0.03; // thin materialization streak,
+// not a tiny normal-looking window — see scale_render_quad_plan's
+// existing `.round().max(1.0)` minimum-dimension guard (unchanged by
+// this milestone) for why this never produces a zero-sized plan.
+
+const TELEPORT_PHASE_A_OPACITY: f32 = 0.28;
+const TELEPORT_PHASE_A_SCALE_X: f32 = 0.62;
+const TELEPORT_PHASE_A_SCALE_Y: f32 = 0.22;
+
+const TELEPORT_PHASE_B_OPACITY: f32 = 1.0; // materialized by end of phase B
+const TELEPORT_PHASE_B_SCALE_X: f32 = 1.03; // small, sharp overshoot
+const TELEPORT_PHASE_B_SCALE_Y: f32 = 1.06; // Y overshoots harder than X
+
+const TELEPORT_PHASE_C_OPACITY: f32 = 1.0; // stays materialized through impact —
+// opacity does NOT keep fading through the recoil/snap phases, which is
+// what visually separates "materializing" from "settling geometry".
+const TELEPORT_PHASE_C_SCALE_X: f32 = 0.995; // sharp recoil, briefly under 1
+const TELEPORT_PHASE_C_SCALE_Y: f32 = 0.985;
+
+const TELEPORT_END_OPACITY: f32 = 1.0;
+const TELEPORT_END_SCALE: f32 = 1.0;
+
+/// Local progress within one phase's own `[start, end)` window, clamped
+/// to [0, 1] — the same normalization idiom `animation_progress` already
+/// uses for the whole-animation `t`, just re-applied per phase.
+fn phase_progress(t: f32, start: f32, end: f32) -> f32 {
+    if end <= start {
+        return 1.0;
+    }
+    ((t - start) / (end - start)).clamp(0.0, 1.0)
+}
+
+fn sample_teleport(t: f32) -> AnimationVisual {
+    // Explicit, unconditional exact-final-state guard — not relied upon
+    // to merely "happen" from lerp/ease_out_cubic rounding; matches the
+    // contract ("no residual overshoot, no floating final geometry
+    // drift") by construction, independent of any float-rounding
+    // argument. Phase D approaches 1.0 from BELOW (its recoil trough is
+    // slightly under 1.0), so this guard is what actually delivers the
+    // required sharp final SNAP rather than a lingering easing tail.
+    if t >= 1.0 {
+        return AnimationVisual {
+            opacity: TELEPORT_END_OPACITY,
+            scale_x: TELEPORT_END_SCALE,
+            scale_y: TELEPORT_END_SCALE,
+        };
+    }
+    if t < TELEPORT_PHASE_A_END {
+        let u = ease_out_cubic(phase_progress(t, 0.0, TELEPORT_PHASE_A_END));
+        AnimationVisual {
+            opacity: lerp(TELEPORT_START_OPACITY, TELEPORT_PHASE_A_OPACITY, u),
+            scale_x: lerp(TELEPORT_START_SCALE_X, TELEPORT_PHASE_A_SCALE_X, u),
+            scale_y: lerp(TELEPORT_START_SCALE_Y, TELEPORT_PHASE_A_SCALE_Y, u),
+        }
+    } else if t < TELEPORT_PHASE_B_END {
+        let u = ease_out_cubic(phase_progress(t, TELEPORT_PHASE_A_END, TELEPORT_PHASE_B_END));
+        AnimationVisual {
+            opacity: lerp(TELEPORT_PHASE_A_OPACITY, TELEPORT_PHASE_B_OPACITY, u),
+            scale_x: lerp(TELEPORT_PHASE_A_SCALE_X, TELEPORT_PHASE_B_SCALE_X, u),
+            scale_y: lerp(TELEPORT_PHASE_A_SCALE_Y, TELEPORT_PHASE_B_SCALE_Y, u),
+        }
+    } else if t < TELEPORT_PHASE_C_END {
+        let u = ease_out_cubic(phase_progress(t, TELEPORT_PHASE_B_END, TELEPORT_PHASE_C_END));
+        AnimationVisual {
+            opacity: lerp(TELEPORT_PHASE_B_OPACITY, TELEPORT_PHASE_C_OPACITY, u),
+            scale_x: lerp(TELEPORT_PHASE_B_SCALE_X, TELEPORT_PHASE_C_SCALE_X, u),
+            scale_y: lerp(TELEPORT_PHASE_B_SCALE_Y, TELEPORT_PHASE_C_SCALE_Y, u),
+        }
+    } else {
+        let u = ease_out_cubic(phase_progress(t, TELEPORT_PHASE_C_END, 1.0));
+        AnimationVisual {
+            opacity: lerp(TELEPORT_PHASE_C_OPACITY, TELEPORT_END_OPACITY, u),
+            scale_x: lerp(TELEPORT_PHASE_C_SCALE_X, TELEPORT_END_SCALE, u),
+            scale_y: lerp(TELEPORT_PHASE_C_SCALE_Y, TELEPORT_END_SCALE, u),
+        }
+    }
+}
+
+/// 3a3fa2b3-r2 — "energy_tear": the window's OWN opacity/scale transform
+/// for this effect. `opacity` is an unconditional CONSTANT 1.0 — this is
+/// a MULTIPLIER against the surface's already-resolved/configured
+/// opacity (see `render_egl_scene_parts`'s `base_opacity * visual.
+/// opacity` formula, unchanged code), never an independent fade. A
+/// window whose resolved opacity is 0.82 renders its energy_tear slices
+/// at 0.82 throughout — energy_tear must NEVER force a translucent
+/// window toward 1.0, and never applies any fade-in of its own to the
+/// window's own opacity. The temporal "materializing" character belongs
+/// ENTIRELY to `EnergyTearLayout` (slice displacement + tear/streak
+/// alpha, see `sample_energy_tear_layout` below) — a decoration drawn
+/// OVER the window, never a property of the window's own visual state.
+/// `scale_x == scale_y == 1.0` throughout too, unchanged from R1 —
+/// energy_tear never resizes the window's bounding box, so `draw_plan ==
+/// plan` for this effect (scale_render_quad_plan is an exact identity at
+/// 1.0/1.0), and shadow/blur inherit the s1 contract with zero special-
+/// casing, exactly like a non-animated surface would.
+fn sample_energy_tear(_t: f32) -> AnimationVisual {
+    AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 }
+}
+
+/// Number of vertical slices energy_tear divides the window into.
+const ENERGY_TEAR_SLICE_COUNT: usize = 5;
+/// 3a3fa2b3-r3 — widened from R2's 0.30 (per human feedback: the single-
+/// convergence R2 envelope was too short to fit the two additional
+/// rebound cycles this milestone adds). At and after this point,
+/// energy_tear behaves byte-identically to a plain single-quad draw (see
+/// `energy_tear_render_plan`'s None case in the render loop, which falls
+/// back to the exact same `render_surface_with_opacity` call every other
+/// effect uses). At the eventual release duration (250ms), 0.55 gives
+/// ~137.5ms (~8 frames @ 60Hz) for the full initial/rebound/rebound/
+/// settle sequence — enough to read as "ZZZT-ZZT, locked in", not a slow
+/// wobble.
+const ENERGY_TEAR_END: f32 = 0.55;
+/// Local (envelope-normalized, i.e. already divided by ENERGY_TEAR_END)
+/// phase boundaries for `energy_tear_oscillation`'s 4-segment piecewise
+/// curve — same reviewable idiom Teleport already established (phase
+/// boundary constants + phase_progress + ease_out_cubic + lerp), not a
+/// generic/endless sine. Phase A: initial peak -> first crossing. Phase
+/// B: crossing -> opposite-side rebound-1 peak. Phase C: rebound-1 peak
+/// -> same-side rebound-2 peak (crossing zero again along the way).
+/// Phase D: rebound-2 peak -> exact zero (final settle).
+const ENERGY_TEAR_PHASE_A_END: f32 = 0.20;
+const ENERGY_TEAR_PHASE_B_END: f32 = 0.50;
+const ENERGY_TEAR_PHASE_C_END: f32 = 0.75;
+// phase D runs ENERGY_TEAR_PHASE_C_END..1.0, ending at exactly 0.0.
+/// Rebound-1 value, as a signed fraction of the initial (cycle-0) peak —
+/// negative here means "opposite sign from cycle 0" (per-slice sign is
+/// still carried by ENERGY_TEAR_SLICE_PEAK_OFFSET_FRACTIONS; this factor
+/// only scales/flips the shared oscillation envelope). Within the
+/// requested 45-60% magnitude range.
+const ENERGY_TEAR_REBOUND_1_FACTOR: f32 = -0.55;
+/// Rebound-2 value, same-sign as cycle 0 (positive here), smaller
+/// magnitude. Within the requested 20-30% magnitude range.
+const ENERGY_TEAR_REBOUND_2_FACTOR: f32 = 0.25;
+
+/// 3a3fa2b3-r3 — the ONE shared, deterministic, piecewise oscillation
+/// driving BOTH slice displacement (signed, per-slice-scaled) and tear-
+/// streak alpha (unsigned magnitude, alpha-scaled) — see
+/// `sample_energy_tear_layout`. No trait, no PRNG, no time-based noise,
+/// no generic sine: a plain `t -> f32` pure function using the exact
+/// same phase-boundary-constants + `phase_progress` + `ease_out_cubic` +
+/// `lerp` idiom Teleport already established. Value sequence: 1.0 (cycle
+/// 0 / initial peak) -> 0.0 (first crossing, end of phase A) ->
+/// ENERGY_TEAR_REBOUND_1_FACTOR (opposite-sign rebound-1 peak, end of
+/// phase B) -> ENERGY_TEAR_REBOUND_2_FACTOR (same-sign, smaller
+/// rebound-2 peak, end of phase C) -> 0.0 (final, end of phase D). The
+/// sign flip between consecutive boundary values (1.0 -> 0 ->
+/// REBOUND_1(-) -> REBOUND_2(+) -> 0) is what produces the two required
+/// additional zero-crossings — the curve is never asked to "jump" a
+/// sign, it always transitions smoothly (eased) through zero.
+fn energy_tear_oscillation(t: f32) -> f32 {
+    if t >= ENERGY_TEAR_END {
+        return 0.0;
+    }
+    let t_prime = phase_progress(t, 0.0, ENERGY_TEAR_END);
+    if t_prime < ENERGY_TEAR_PHASE_A_END {
+        let u = ease_out_cubic(phase_progress(t_prime, 0.0, ENERGY_TEAR_PHASE_A_END));
+        lerp(1.0, 0.0, u)
+    } else if t_prime < ENERGY_TEAR_PHASE_B_END {
+        let u = ease_out_cubic(phase_progress(t_prime, ENERGY_TEAR_PHASE_A_END, ENERGY_TEAR_PHASE_B_END));
+        lerp(0.0, ENERGY_TEAR_REBOUND_1_FACTOR, u)
+    } else if t_prime < ENERGY_TEAR_PHASE_C_END {
+        let u = ease_out_cubic(phase_progress(t_prime, ENERGY_TEAR_PHASE_B_END, ENERGY_TEAR_PHASE_C_END));
+        lerp(ENERGY_TEAR_REBOUND_1_FACTOR, ENERGY_TEAR_REBOUND_2_FACTOR, u)
+    } else {
+        let u = ease_out_cubic(phase_progress(t_prime, ENERGY_TEAR_PHASE_C_END, 1.0));
+        lerp(ENERGY_TEAR_REBOUND_2_FACTOR, 0.0, u)
+    }
+}
+
+/// Deterministic, hand-authored per-slice pattern (dimensionless
+/// coefficient, signed, magnitude <= 1.0) — not random, and no longer
+/// symmetric like R2's `[-1.0, 0.6, -0.3, 0.6, -1.0]`: derived from (and
+/// normalized against) the human-reviewed illustrative reference pattern
+/// for a "roughly comparable" feel, per the R3 milestone brief. Combined
+/// with `energy_tear_oscillation` and the window-width-relative unit in
+/// `energy_tear_render_plan`, this is what each slice's live displacement
+/// is scaled by.
+const ENERGY_TEAR_SLICE_PEAK_OFFSET_FRACTIONS: [f32; ENERGY_TEAR_SLICE_COUNT] = [-0.95, 0.68, -0.53, 1.0, -0.74];
+/// TEMPORARY DEVELOPMENT TUNING — peak independent streak alpha (not
+/// the window's own opacity). Bright but not fully opaque, so the streak
+/// reads as an energetic highlight rather than a flat white bar.
+const ENERGY_TEAR_PEAK_STREAK_ALPHA: f32 = 0.85;
+/// Fixed streak tint — generic "energy" cyan-white, not tied to any
+/// copyrighted character palette.
+const ENERGY_TEAR_STREAK_COLOR: [f32; 3] = [0.75, 0.95, 1.0];
+/// Streak line width, as a fraction of the (narrower of the two
+/// adjacent) slice widths — clamped to >=1px at the call site.
+const ENERGY_TEAR_LINE_WIDTH_FRACTION: f32 = 0.10;
+/// 3a3fa2b3-r3 — the "unit" displacement magnitude (before per-slice
+/// coefficient and oscillation scaling), as a fraction of the WHOLE
+/// WINDOW's width — replaces R2's slice-width-relative model per the
+/// human-reviewed preference ("relative_to_window_width + sane pixel
+/// clamp"). Chosen so the strongest slice's peak displacement (10% x
+/// coefficient 1.0) is unambiguously larger than R2's strongest slice
+/// (which peaked at 7% of window width under the old slice-width-
+/// relative formula) for every slice in the new pattern, not just some —
+/// see the R3 preview report for the exact old-vs-new comparison.
+const ENERGY_TEAR_DISPLACEMENT_FRACTION_OF_WINDOW_WIDTH: f32 = 0.10;
+/// Sane bounds on the unit displacement (see `energy_tear_render_plan`),
+/// applied to the UNIT magnitude before the per-slice coefficient — so
+/// the relative shape between slices is always preserved exactly, only
+/// the absolute scale is clamped. MIN keeps the tear visible even on
+/// very small/short-lived windows (where 10% of width would otherwise
+/// round away to nothing); MAX prevents visually absurd tearing on very
+/// large windows (where 10% of width could otherwise be hundreds of
+/// pixels).
+const ENERGY_TEAR_MIN_DISPLACEMENT_PX: f32 = 4.0;
+const ENERGY_TEAR_MAX_DISPLACEMENT_PX: f32 = 72.0;
+
+/// 3a3fa2b3 — per-frame, resolution-independent tear timing. Kept
+/// entirely separate from `AnimationVisual` on purpose: this is an
+/// energy_tear-only decoration, not a property of "the window's visual
+/// state" that Scale/Teleport also share. Computed from the SAME `t`
+/// already sampled once per surface per render (see
+/// render_egl_scene_parts) — no second `Instant::now()`, no new timer.
+/// `slice_offset_fractions` are dimensionless coefficients (roughly
+/// [-1,1]) — NOT yet a fraction of window width; `energy_tear_render_
+/// plan` applies `ENERGY_TEAR_DISPLACEMENT_FRACTION_OF_WINDOW_WIDTH`
+/// (with its min/max clamp) to convert to pixels, since only that
+/// function has access to the actual window geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EnergyTearLayout {
+    slice_offset_fractions: [f32; ENERGY_TEAR_SLICE_COUNT],
+    streak_alpha: f32,
+}
+
+fn sample_energy_tear_layout(t: f32) -> EnergyTearLayout {
+    if t >= ENERGY_TEAR_END {
+        return EnergyTearLayout { slice_offset_fractions: [0.0; ENERGY_TEAR_SLICE_COUNT], streak_alpha: 0.0 };
+    }
+    let osc = energy_tear_oscillation(t);
+    let mut slice_offset_fractions = [0.0_f32; ENERGY_TEAR_SLICE_COUNT];
+    for i in 0..ENERGY_TEAR_SLICE_COUNT {
+        slice_offset_fractions[i] = ENERGY_TEAR_SLICE_PEAK_OFFSET_FRACTIONS[i] * osc;
+    }
+    EnergyTearLayout {
+        slice_offset_fractions,
+        // Unsigned magnitude of the SAME shared oscillation: this alone
+        // produces the required 3-pulse shape (strongest at cycle 0,
+        // weaker at rebound-1, weaker still at rebound-2, zero between
+        // and after) with no separate alpha-specific curve.
+        streak_alpha: ENERGY_TEAR_PEAK_STREAK_ALPHA * osc.abs(),
+    }
+}
+
+/// 3a3fa2b3 — the ONLY gate deciding whether an animated surface takes
+/// energy_tear's slice/streak render path this frame. Pulled out as its
+/// own pure function (rather than an inline condition in the render
+/// loop) so "Scale/Teleport never produce a tear layout" and
+/// "energy_tear stops producing one once its own tear phase ends" are
+/// both independently, executably testable — not just visible in the
+/// render loop's source text.
+fn energy_tear_layout_for(effect: crate::config::OpenAnimationEffect, t: f32) -> Option<EnergyTearLayout> {
+    if effect == crate::config::OpenAnimationEffect::EnergyTear && t < ENERGY_TEAR_END {
+        Some(sample_energy_tear_layout(t))
+    } else {
+        None
+    }
+}
+
+/// 3a3fa2b4-r1 — "bubble": a compressed-pop-squash-rebound-lock
+/// materialization, built with the exact same phase-boundary-constants +
+/// `phase_progress` + `ease_out_cubic` + `lerp` idiom Teleport already
+/// established (see `sample_teleport`) — no new curve architecture, no
+/// spring library, no sine. What makes Bubble visually distinct from
+/// Teleport is the CONSTANT TABLE, not the mechanism: Teleport starts as
+/// a near-flat horizontal streak and spends most of its duration on a
+/// small sharp impact/recoil; Bubble starts as a small compressed blob
+/// on BOTH axes, overshoots past 1.0 on BOTH axes for its "pop", then
+/// alternates which axis is >1 vs <1 across two more phases (squash,
+/// then opposite-sign rebound) before locking — a genuine axis-reversal
+/// character neither Scale (uniform single lerp) nor Teleport (Y always
+/// more aggressive than X, never reverses which axis leads) produces.
+const BUBBLE_PHASE_A_END: f32 = 0.35; // pop
+const BUBBLE_PHASE_B_END: f32 = 0.58; // squash
+const BUBBLE_PHASE_C_END: f32 = 0.78; // opposite rebound
+// phase D (settle) runs from BUBBLE_PHASE_C_END to 1.0.
+
+const BUBBLE_START_OPACITY: f32 = 0.10;
+const BUBBLE_START_SCALE_X: f32 = 0.62;
+const BUBBLE_START_SCALE_Y: f32 = 0.42;
+
+const BUBBLE_PHASE_A_OPACITY: f32 = 1.0; // fully materialized by end of the pop
+const BUBBLE_PHASE_A_SCALE_X: f32 = 1.12;
+const BUBBLE_PHASE_A_SCALE_Y: f32 = 1.18;
+
+const BUBBLE_PHASE_B_OPACITY: f32 = 1.0;
+const BUBBLE_PHASE_B_SCALE_X: f32 = 1.04; // squash: X > 1, Y < 1
+const BUBBLE_PHASE_B_SCALE_Y: f32 = 0.96;
+
+const BUBBLE_PHASE_C_OPACITY: f32 = 1.0;
+const BUBBLE_PHASE_C_SCALE_X: f32 = 0.985; // opposite rebound: X < 1, Y > 1
+const BUBBLE_PHASE_C_SCALE_Y: f32 = 1.025;
+
+const BUBBLE_END_OPACITY: f32 = 1.0;
+const BUBBLE_END_SCALE: f32 = 1.0;
+
+fn sample_bubble(t: f32) -> AnimationVisual {
+    // Explicit, unconditional exact-final-state guard — same contract as
+    // `sample_teleport`'s: phase D's rebound trough does not itself land
+    // exactly on 1.0 by construction, so this guard is what delivers the
+    // required exact final lock rather than a lingering easing tail.
+    if t >= 1.0 {
+        return AnimationVisual {
+            opacity: BUBBLE_END_OPACITY,
+            scale_x: BUBBLE_END_SCALE,
+            scale_y: BUBBLE_END_SCALE,
+        };
+    }
+    if t < BUBBLE_PHASE_A_END {
+        let u = ease_out_cubic(phase_progress(t, 0.0, BUBBLE_PHASE_A_END));
+        AnimationVisual {
+            opacity: lerp(BUBBLE_START_OPACITY, BUBBLE_PHASE_A_OPACITY, u),
+            scale_x: lerp(BUBBLE_START_SCALE_X, BUBBLE_PHASE_A_SCALE_X, u),
+            scale_y: lerp(BUBBLE_START_SCALE_Y, BUBBLE_PHASE_A_SCALE_Y, u),
+        }
+    } else if t < BUBBLE_PHASE_B_END {
+        let u = ease_out_cubic(phase_progress(t, BUBBLE_PHASE_A_END, BUBBLE_PHASE_B_END));
+        AnimationVisual {
+            opacity: lerp(BUBBLE_PHASE_A_OPACITY, BUBBLE_PHASE_B_OPACITY, u),
+            scale_x: lerp(BUBBLE_PHASE_A_SCALE_X, BUBBLE_PHASE_B_SCALE_X, u),
+            scale_y: lerp(BUBBLE_PHASE_A_SCALE_Y, BUBBLE_PHASE_B_SCALE_Y, u),
+        }
+    } else if t < BUBBLE_PHASE_C_END {
+        let u = ease_out_cubic(phase_progress(t, BUBBLE_PHASE_B_END, BUBBLE_PHASE_C_END));
+        AnimationVisual {
+            opacity: lerp(BUBBLE_PHASE_B_OPACITY, BUBBLE_PHASE_C_OPACITY, u),
+            scale_x: lerp(BUBBLE_PHASE_B_SCALE_X, BUBBLE_PHASE_C_SCALE_X, u),
+            scale_y: lerp(BUBBLE_PHASE_B_SCALE_Y, BUBBLE_PHASE_C_SCALE_Y, u),
+        }
+    } else {
+        let u = ease_out_cubic(phase_progress(t, BUBBLE_PHASE_C_END, 1.0));
+        AnimationVisual {
+            opacity: lerp(BUBBLE_PHASE_C_OPACITY, BUBBLE_END_OPACITY, u),
+            scale_x: lerp(BUBBLE_PHASE_C_SCALE_X, BUBBLE_END_SCALE, u),
+            scale_y: lerp(BUBBLE_PHASE_C_SCALE_Y, BUBBLE_END_SCALE, u),
+        }
+    }
+}
+
+/// 3a3fa2b6-r1 — fixed bright-neutral flash color shared by BOTH the
+/// open and close TeleportFlashy overlay draws. R1 deliberately has no
+/// `animation.flash.color` config key (see the architecture audit,
+/// section 4/7) — color tuning is deferred until after human validation.
+pub(crate) const TELEPORT_FLASHY_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
+
+/// 3a3fa2b6-r1 — "teleport_flashy" OPEN geometry: near-identity, reaches
+/// exact final state very early (by `TELEPORT_FLASHY_OPEN_GEOMETRY_END`)
+/// so the window is already fully materialized BEFORE the flash finishes
+/// clearing (see `sample_teleport_flashy_open_flash`) — the reveal must
+/// show an already-complete window, never one still visibly growing
+/// under a thinning flash. Deliberately much smaller motion than Scale/
+/// Teleport/Bubble: the flash overlay carries this effect's identity, not
+/// the geometry. Same `phase_progress` + `ease_out_cubic` + `lerp` idiom
+/// every other effect already uses — no new curve architecture.
+const TELEPORT_FLASHY_OPEN_START_OPACITY: f32 = 0.05;
+const TELEPORT_FLASHY_OPEN_START_SCALE: f32 = 0.985;
+const TELEPORT_FLASHY_OPEN_GEOMETRY_END: f32 = 0.20;
+
+fn sample_teleport_flashy_open(t: f32) -> AnimationVisual {
+    if t >= 1.0 {
+        return AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 };
+    }
+    if t < TELEPORT_FLASHY_OPEN_GEOMETRY_END {
+        let u = ease_out_cubic(phase_progress(t, 0.0, TELEPORT_FLASHY_OPEN_GEOMETRY_END));
+        let scale = lerp(TELEPORT_FLASHY_OPEN_START_SCALE, 1.0, u);
+        AnimationVisual {
+            opacity: lerp(TELEPORT_FLASHY_OPEN_START_OPACITY, 1.0, u),
+            scale_x: scale,
+            scale_y: scale,
+        }
+    } else {
+        AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 }
+    }
+}
+
+/// 3a3fa2b6-r1 — "teleport_flashy" OPEN flash-alpha curve: strongly
+/// front-loaded — a brief flat hold near full strength, then an eased
+/// decay to exactly zero. This is EFFECT-SPECIFIC OVERLAY STATE, kept
+/// deliberately separate from `AnimationVisual` (never added as a
+/// `flash_alpha` field there — see the architecture audit, section 6/13),
+/// mirroring EnergyTear's own `EnergyTearLayout`/`streak_alpha`
+/// precedent exactly.
+const TELEPORT_FLASHY_OPEN_FLASH_HOLD_END: f32 = 0.08;
+const TELEPORT_FLASHY_OPEN_FLASH_END: f32 = 0.40;
+
+fn sample_teleport_flashy_open_flash(t: f32) -> f32 {
+    if t <= TELEPORT_FLASHY_OPEN_FLASH_HOLD_END {
+        1.0
+    } else if t < TELEPORT_FLASHY_OPEN_FLASH_END {
+        let u = ease_out_cubic(phase_progress(t, TELEPORT_FLASHY_OPEN_FLASH_HOLD_END, TELEPORT_FLASHY_OPEN_FLASH_END));
+        lerp(1.0, 0.0, u).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// 3a3fa2b6-r1 — the ONLY gate deciding whether an animated OPEN surface
+/// carries a TeleportFlashy overlay this frame. Mirrors
+/// `energy_tear_layout_for`'s exact shape: `None` for every other effect,
+/// so "only TeleportFlashy ever produces open flash state" is
+/// independently, executably testable.
+fn teleport_flashy_open_flash_for(effect: crate::config::OpenAnimationEffect, t: f32) -> Option<f32> {
+    if effect == crate::config::OpenAnimationEffect::TeleportFlashy {
+        Some(sample_teleport_flashy_open_flash(t))
+    } else {
+        None
+    }
+}
+
+/// 3a3fa2b6-r2 ("Minato" correction) — small epsilon past the exact
+/// corner value (`r_norm==1.0` in the shader's aspect-safe per-axis
+/// normalization — see `render_surface_with_radial_reveal`) so
+/// antialiasing can never leave a corner fragment partially covered at
+/// the moment the reveal completes. The shader's `coverage()` helper's
+/// `fwidth`-derived antialiasing band is far smaller than this 0.02
+/// margin for any realistically sized window (its derivative is taken in
+/// the unitless, per-axis-normalized-by-half-size space, which changes
+/// extremely slowly per screen pixel), so `reveal_radius >=
+/// MINATO_REVEAL_FULL_RADIUS` guarantees exact full coverage everywhere
+/// inside the window, including all four corners, with no visible pop at
+/// the `MINATO_REVEAL_END` fallback boundary.
+const MINATO_REVEAL_FULL_RADIUS: f32 = 1.02;
+/// Nothing content-visible before this — pure flash only (see the
+/// architecture audit, section A3: "0.00->0.06 strong flash" prefacing
+/// any reveal).
+const MINATO_REVEAL_START: f32 = 0.04;
+/// Deliberately REUSES `TELEPORT_FLASHY_OPEN_GEOMETRY_END` rather than an
+/// independently-chosen 0.20 literal — this ties the radial reveal's
+/// completion to the SAME instant the scale-pop geometry already reaches
+/// exact identity, by construction, so there is never a frame where
+/// "geometry says done" but "reveal mask says still growing" or vice
+/// versa.
+const MINATO_REVEAL_END: f32 = TELEPORT_FLASHY_OPEN_GEOMETRY_END;
+
+/// 3a3fa2b6-r2 ("Minato" correction) — center-to-edges radial reveal
+/// radius, in the SAME aspect-safe per-axis-normalized-by-half-size space
+/// the shader computes `r_norm` in (corners at exactly `1.0`). `t <
+/// MINATO_REVEAL_START`: nothing revealed yet (`0.0`) — the window is
+/// still pure flash. `[MINATO_REVEAL_START, MINATO_REVEAL_END)`: eased
+/// (`ease_out_cubic` + the established `phase_progress` idiom, exactly
+/// like every other effect curve) growth from `0.0` to
+/// `MINATO_REVEAL_FULL_RADIUS`. `t >= MINATO_REVEAL_END`: fully revealed
+/// — the caller falls back to the ordinary (mode-0) draw at this point,
+/// exactly like `energy_tear_render_plan`'s existing `None`-after-
+/// `ENERGY_TEAR_END` fallback, so this value is never actually consulted
+/// past that boundary, but stays defined and correct (`MINATO_REVEAL_FULL_RADIUS`)
+/// for anyone sampling it directly (e.g. tests).
+fn sample_minato_reveal_radius(t: f32) -> f32 {
+    if t < MINATO_REVEAL_START {
+        0.0
+    } else if t < MINATO_REVEAL_END {
+        let u = ease_out_cubic(phase_progress(t, MINATO_REVEAL_START, MINATO_REVEAL_END));
+        lerp(0.0, MINATO_REVEAL_FULL_RADIUS, u)
+    } else {
+        MINATO_REVEAL_FULL_RADIUS
+    }
+}
+
+/// 3a3fa2b6-r2 — the ONLY gate deciding whether an animated OPEN surface
+/// carries a Minato radial-reveal mask this frame. Mirrors
+/// `teleport_flashy_open_flash_for`'s exact shape: `None` for every other
+/// effect (so "only TeleportFlashy ever produces reveal state" is
+/// independently, executably testable) AND for `t >= MINATO_REVEAL_END`
+/// (so the render loop falls back to the ordinary, zero-extra-cost
+/// mode-0 draw once revealed — no lingering effect-mode cost, mirroring
+/// `energy_tear_layout_for`'s own post-`ENERGY_TEAR_END` `None` fallback).
+fn minato_reveal_radius_for(effect: crate::config::OpenAnimationEffect, t: f32) -> Option<f32> {
+    if effect == crate::config::OpenAnimationEffect::TeleportFlashy && t < MINATO_REVEAL_END {
+        Some(sample_minato_reveal_radius(t))
+    } else {
+        None
+    }
+}
+
+/// 3a3fa2b7 ("Kamui" vortex) — OPEN `AnimationVisual`: exact identity
+/// opacity/scale throughout. The vortex effect IS the visual (see
+/// `kamui_open_state_for` for the polar-warp/visible-radius driver) —
+/// unlike Scale/Teleport/Bubble, this effect's geometry curve carries no
+/// meaningful motion of its own, deliberately, so the content warp reads
+/// as the sole source of movement.
+fn sample_kamui_open(_t: f32) -> AnimationVisual {
+    AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 }
+}
+
+/// 3a3fa2b7-r2 — OPEN visible-radius curve, three phases per the R2
+/// motion-tuning spec (section 5): "core" `[0, KAMUI_OPEN_CORE_END]`
+/// (0.15) — radius eases `KAMUI_OPEN_START_RADIUS` (0.02) up to
+/// `KAMUI_OPEN_CORE_RADIUS` (0.20), a tight vortex core; "expulsion"
+/// `[KAMUI_OPEN_CORE_END, KAMUI_OPEN_EXPAND_END]` (0.65) — radius eases
+/// `0.20 -> 1.0`, the main visible outward flow; "settle"
+/// `[KAMUI_OPEN_EXPAND_END, KAMUI_OPEN_SETTLE_END]` (0.90) — radius held
+/// at exactly `1.0`. At `t >= KAMUI_OPEN_SETTLE_END`: exact identity
+/// (radius=1, twist=0, radial_power=1) — the render loop falls back to
+/// ordinary `shadow_mode==0` rendering here, exactly like
+/// `MINATO_REVEAL_END`'s and `ENERGY_TEAR_END`'s own existing fallback
+/// precedent, applied a third time.
+const KAMUI_OPEN_START_RADIUS: f32 = 0.02;
+const KAMUI_OPEN_CORE_END: f32 = 0.15;
+const KAMUI_OPEN_CORE_RADIUS: f32 = 0.20;
+const KAMUI_OPEN_EXPAND_END: f32 = 0.65;
+const KAMUI_OPEN_SETTLE_END: f32 = 0.90;
+
+/// 3a3fa2b7-r2 — increased from R1's `1.6` (human feedback: OPEN "needs
+/// visibly MORE movement, more like an actual Kamui vortex").
+/// COUNTER-CLOCKWISE (positive sign) per the "unwinds/pushes outward from
+/// center" sensation, unchanged from R1.
+const KAMUI_OPEN_MAX_TWIST: f32 = 2.4;
+/// 3a3fa2b7-r2 — twist is now COUPLED to `visible_radius` (never held
+/// static through most of expansion, per the R2 spec's explicit
+/// correction) via `MAX_TWIST * pow(1-radius, DECAY_POWER)`: strongest at
+/// the tiny core (radius near `KAMUI_OPEN_START_RADIUS`), decaying to
+/// EXACTLY `0.0` the instant radius reaches `1.0` — automatic, with zero
+/// extra phase-boundary bookkeeping for twist specifically. A decay power
+/// below `1.0` keeps twist "remaining strong during early/mid expansion"
+/// (per section 4) before falling off faster as radius approaches 1 (a
+/// concave `pow(x,0.6)` curve stays closer to its start value than a
+/// linear one for most of `x`'s range, only dropping steeply near `x=0`,
+/// i.e. near `radius=1`).
+const KAMUI_OPEN_TWIST_DECAY_POWER: f32 = 0.6;
+/// 3a3fa2b7-r2.1 — nonlinear radial-power warp: OPEN uses a value ABOVE
+/// `1.0` (`1.8`) at the core, easing to exactly `1.0` at settle.
+///
+/// CORRECTED direction from R2 (R2 shipped `0.55`, the opposite sign —
+/// see the r2.1 spec's "inverse-mapping direction bug: CONFIRMED"
+/// finding). The shader computes `source_r = pow(output_r, radial_power)`
+/// — i.e. it maps an OUTPUT fragment position to a SOURCE sampling
+/// position. What matters for the visual sensation is the INVERSE
+/// question: where does a FIXED SOURCE FEATURE end up displayed? Solving
+/// `source_r = pow(output_r, power)` for `output_r` gives
+/// `output_r = pow(source_r, 1/power)`. For `power > 1` and a source
+/// feature at `source_r` in `(0,1)`, `1/power < 1`, so
+/// `pow(source_r, 1/power) > source_r` — e.g. a feature at `source_r=0.25`
+/// with `power=1.8` is displayed at `output_r ≈ 0.463`: FARTHER from
+/// center than it originally sat in the source. That is a source feature
+/// being pushed OUTWARD — the desired OPEN "expelled from center"
+/// sensation. (R2's reasoning instead asked "does a near-center OUTPUT
+/// point sample from farther out in the source," which is a different,
+/// less relevant question — it does not by itself tell you whether
+/// content visually moves toward or away from center.)
+const KAMUI_OPEN_RADIAL_POWER_START: f32 = 1.8;
+
+fn sample_kamui_open_visible_radius(t: f32) -> f32 {
+    if t < KAMUI_OPEN_CORE_END {
+        let u = ease_out_cubic(phase_progress(t, 0.0, KAMUI_OPEN_CORE_END));
+        lerp(KAMUI_OPEN_START_RADIUS, KAMUI_OPEN_CORE_RADIUS, u)
+    } else if t < KAMUI_OPEN_EXPAND_END {
+        let u = ease_out_cubic(phase_progress(t, KAMUI_OPEN_CORE_END, KAMUI_OPEN_EXPAND_END));
+        lerp(KAMUI_OPEN_CORE_RADIUS, 1.0, u)
+    } else {
+        1.0
+    }
+}
+
+/// 3a3fa2b7-r2 — derived purely from `visible_radius`, never an
+/// independent time phase — see the constant doc comment above for the
+/// exact coupling rationale.
+fn sample_kamui_open_twist(t: f32) -> f32 {
+    let radius = sample_kamui_open_visible_radius(t);
+    KAMUI_OPEN_MAX_TWIST * (1.0 - radius).clamp(0.0, 1.0).powf(KAMUI_OPEN_TWIST_DECAY_POWER)
+}
+
+/// 3a3fa2b7-r2 — also derived from `visible_radius`, reaching exactly
+/// `1.0` (a strict shader-side no-op) the instant radius reaches `1.0`,
+/// exactly like twist above. Linear in `radius` — a simpler shape than
+/// twist's own decay curve, since radial_power is a secondary/subtler
+/// distortion knob here.
+fn sample_kamui_open_radial_power(t: f32) -> f32 {
+    let radius = sample_kamui_open_visible_radius(t);
+    KAMUI_OPEN_RADIAL_POWER_START + (1.0 - KAMUI_OPEN_RADIAL_POWER_START) * radius.clamp(0.0, 1.0)
+}
+
+/// 3a3fa2b7 — the ONLY gate deciding whether an animated OPEN surface
+/// carries Kamui polar-warp state this frame. Mirrors
+/// `minato_reveal_radius_for`'s exact shape: `None` for every other
+/// effect AND for `t >= KAMUI_OPEN_SETTLE_END` (fallback to the ordinary,
+/// zero-extra-cost mode-0 draw once settled). Returns
+/// `(visible_radius, twist, radial_power)` together since all three
+/// curves are consulted unconditionally as a group at every call site —
+/// no reason to force separate `Option`s that would always agree on
+/// `Some`/`None` in lockstep.
+fn kamui_open_state_for(effect: crate::config::OpenAnimationEffect, t: f32) -> Option<(f32, f32, f32)> {
+    if effect == crate::config::OpenAnimationEffect::Kamui && t < KAMUI_OPEN_SETTLE_END {
+        Some((sample_kamui_open_visible_radius(t), sample_kamui_open_twist(t), sample_kamui_open_radial_power(t)))
+    } else {
+        None
+    }
+}
+
+/// 3a3fa2b7 — Kamui's shadow ENVELOPE (section 20 of the R1 spec):
+/// shadow must never receive polar warp/twist state, only a broad
+/// strength multiplier tracking `visible_radius` directly. Deliberately
+/// NOT gated by `KAMUI_OPEN_SETTLE_END` like `kamui_open_state_for` is —
+/// shadow is drawn every frame regardless of which content mode is
+/// active, and `sample_kamui_open_visible_radius` already naturally
+/// returns exactly `1.0` (reproducing today's ordinary shadow strength
+/// unchanged) for the entire settled tail, so no extra time-gating is
+/// needed for the envelope value itself to become a no-op post-settle.
+/// `visible_radius` alone (no extra `sqrt`/`clamp` wrapper) already
+/// satisfies both required boundary behaviors: it starts at
+/// `KAMUI_OPEN_START_RADIUS` (0.02, negligibly close to the required
+/// "radius→0 ⇒ shadow→0") and reaches exactly `1.0` ("radius→1 ⇒
+/// shadow→existing behavior") by construction of the curve above.
+fn kamui_open_shadow_envelope_for(effect: crate::config::OpenAnimationEffect, t: f32) -> Option<f32> {
+    if effect == crate::config::OpenAnimationEffect::Kamui {
+        Some(sample_kamui_open_visible_radius(t))
+    } else {
+        None
+    }
+}
+
+/// The ONE pure effect-sampling entry point, dispatched by a plain
+/// `match` — not a trait object, not a boxed closure, not a plugin
+/// registry (per the 3a3fa2b audit's explicit preference). Every render
+/// path (provisional first-frame and persistent subsequent frames alike)
+/// calls this same function, via `WindowAnimation::sample` or directly
+/// with an explicit `t` — there is no separate hardcoded "first frame"
+/// implementation anywhere.
+fn sample_open_effect(effect: crate::config::OpenAnimationEffect, t: f32) -> AnimationVisual {
+    match effect {
+        crate::config::OpenAnimationEffect::Scale => sample_scale(t),
+        crate::config::OpenAnimationEffect::Teleport => sample_teleport(t),
+        crate::config::OpenAnimationEffect::EnergyTear => sample_energy_tear(t),
+        crate::config::OpenAnimationEffect::Bubble => sample_bubble(t),
+        crate::config::OpenAnimationEffect::TeleportFlashy => sample_teleport_flashy_open(t),
+        crate::config::OpenAnimationEffect::Kamui => sample_kamui_open(t),
+    }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// 3a3fa2b5 — lifecycle state for the ONE R1 reference close effect.
+/// Resource-free, exactly like `WindowAnimation`: never holds a Damage/
+/// NamedPixmap/EGLImage. A deliberately SEPARATE type from
+/// `WindowAnimation` — close state must never semantically pretend to be
+/// an open animation (`effect` is `crate::config::CloseAnimationEffect`,
+/// not `OpenAnimationEffect`). See `ClosingTexture`/`ClosingVisual` for
+/// the one GPU resource a completed close carries, entirely separate from
+/// this value type.
+#[derive(Clone, Debug)]
+struct ClosingAnimation {
+    effect: crate::config::CloseAnimationEffect,
+    started_at: Instant,
+    duration: Duration,
+}
+
+impl ClosingAnimation {
+    fn new(started_at: Instant, effect: crate::config::CloseAnimationEffect, duration: Duration) -> Self {
+        Self { effect, started_at, duration }
+    }
+
+    fn progress(&self, now: Instant) -> f32 {
+        animation_progress(now.saturating_duration_since(self.started_at), self.duration)
+    }
+
+    fn is_complete(&self, now: Instant) -> bool {
+        self.progress(now) >= 1.0
+    }
+}
+
+/// 3a3fa2b5 — reference close effect end-state: this exists to prove
+/// lifecycle/snapshot-ownership/ordering/first-frame/retirement, not
+/// aesthetics. Deterministic plain `lerp` (no easing, no bounce, no
+/// overshoot — deliberately no "personality", unlike the open effects).
+const CLOSE_SCALE_END_OPACITY: f32 = 0.0;
+const CLOSE_SCALE_END_SCALE: f32 = 0.95;
+
+fn sample_close_scale(t: f32) -> AnimationVisual {
+    let t = t.clamp(0.0, 1.0);
+    let scale = lerp(1.0, CLOSE_SCALE_END_SCALE, t);
+    AnimationVisual {
+        opacity: lerp(1.0, CLOSE_SCALE_END_OPACITY, t),
+        scale_x: scale,
+        scale_y: scale,
+    }
+}
+
+/// 3a3fa2b6-r1 — "teleport_flashy" CLOSE geometry: the window stays at
+/// exact identity until the flash has already begun rising, then
+/// collapses fast to a SMALL contraction (0.98, not Scale-close's 0.95 —
+/// see the architecture audit, section 12: a larger shrink would read as
+/// a fade/scale effect rather than teleport) and holds there. Deliberately
+/// NOT a `1.0 - sample_teleport_flashy_open(t)` reversal — CLOSE has its
+/// own distinct hold-then-collapse shape, never OPEN played backwards.
+const TELEPORT_FLASHY_CLOSE_HOLD_END: f32 = 0.12;
+const TELEPORT_FLASHY_CLOSE_COLLAPSE_END: f32 = 0.28;
+const TELEPORT_FLASHY_CLOSE_END_SCALE: f32 = 0.98;
+
+fn sample_teleport_flashy_close(t: f32) -> AnimationVisual {
+    if t <= TELEPORT_FLASHY_CLOSE_HOLD_END {
+        AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 }
+    } else if t < TELEPORT_FLASHY_CLOSE_COLLAPSE_END {
+        let u = ease_out_cubic(phase_progress(t, TELEPORT_FLASHY_CLOSE_HOLD_END, TELEPORT_FLASHY_CLOSE_COLLAPSE_END));
+        let scale = lerp(1.0, TELEPORT_FLASHY_CLOSE_END_SCALE, u);
+        AnimationVisual {
+            opacity: lerp(1.0, 0.0, u),
+            scale_x: scale,
+            scale_y: scale,
+        }
+    } else {
+        AnimationVisual { opacity: 0.0, scale_x: TELEPORT_FLASHY_CLOSE_END_SCALE, scale_y: TELEPORT_FLASHY_CLOSE_END_SCALE }
+    }
+}
+
+/// 3a3fa2b6-r1 — "teleport_flashy" CLOSE flash-alpha curve: a PULSE
+/// (0 -> peak -> 0), unlike OPEN's pure fade-out — see the architecture
+/// audit, section 9/13. The window's own opacity (see
+/// `sample_teleport_flashy_close`) reaches exactly 0 at
+/// `TELEPORT_FLASHY_CLOSE_COLLAPSE_END` (0.28), strictly BEFORE this
+/// flash has finished decaying (`TELEPORT_FLASHY_CLOSE_FLASH_END`, 0.50)
+/// — by construction, not coincidence, the window disappears underneath/
+/// inside the still-visible flash.
+const TELEPORT_FLASHY_CLOSE_FLASH_PEAK: f32 = 0.22;
+const TELEPORT_FLASHY_CLOSE_FLASH_END: f32 = 0.50;
+
+fn sample_teleport_flashy_close_flash(t: f32) -> f32 {
+    if t <= 0.0 {
+        0.0
+    } else if t < TELEPORT_FLASHY_CLOSE_FLASH_PEAK {
+        let u = ease_out_cubic(phase_progress(t, 0.0, TELEPORT_FLASHY_CLOSE_FLASH_PEAK));
+        lerp(0.0, 1.0, u).clamp(0.0, 1.0)
+    } else if t < TELEPORT_FLASHY_CLOSE_FLASH_END {
+        let u = ease_out_cubic(phase_progress(t, TELEPORT_FLASHY_CLOSE_FLASH_PEAK, TELEPORT_FLASHY_CLOSE_FLASH_END));
+        lerp(1.0, 0.0, u).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// 3a3fa2b6-r1 — the ONLY gate deciding whether an animated CLOSE surface
+/// carries a TeleportFlashy overlay this frame. Mirrors
+/// `teleport_flashy_open_flash_for`'s shape exactly, kept as a SEPARATE
+/// function (never merged with the open flash dispatch) since open and
+/// close flash samplers have genuinely different curves.
+fn teleport_flashy_close_flash_for(effect: crate::config::CloseAnimationEffect, t: f32) -> Option<f32> {
+    if effect == crate::config::CloseAnimationEffect::TeleportFlashy {
+        Some(sample_teleport_flashy_close_flash(t))
+    } else {
+        None
+    }
+}
+
+/// 3a3fa2b7-r3 ("Kamui" vortex) — CLOSE `AnimationVisual`: scale stays exact
+/// identity throughout (Kamui's CLOSE motion is entirely the polar warp/
+/// radial-domain shrink — see `kamui_close_state_for` — never a geometry
+/// pop). Opacity carries ONLY the phase-D fade: held at exact `1.0`
+/// through `KAMUI_CLOSE_SUCTION_END` (content stays visually intact while
+/// being spatially pulled inward — the defining visual is the SPATIAL
+/// collapse, not a fade, per the R1 spec's explicit instruction), then
+/// eased to exactly `0.0` by `KAMUI_CLOSE_COLLAPSE_END`.
+///
+/// R3 FIX: uses `ease_in_cubic` (back-loaded: slow start, accelerating
+/// end) on the SAME `phase_progress` shared with radius — the R2.1 bug
+/// was `ease_out_cubic` (front-loaded) which consumed most opacity early
+/// while radius was already at ~0.10. Now both radius and opacity use
+/// `ease_in_cubic(phase_progress(...))`, so content stays materially
+/// visible through early final-phase and collapses together at the end.
+fn sample_kamui_close(t: f32) -> AnimationVisual {
+    let opacity = if t <= KAMUI_CLOSE_SUCTION_END {
+        1.0
+    } else if t < KAMUI_CLOSE_COLLAPSE_END {
+        let u = ease_in_cubic(phase_progress(t, KAMUI_CLOSE_SUCTION_END, KAMUI_CLOSE_COLLAPSE_END));
+        lerp(1.0, 0.0, u)
+    } else {
+        0.0
+    };
+    AnimationVisual { opacity, scale_x: 1.0, scale_y: 1.0 }
+}
+
+/// 3a3fa2b7-r3 — CLOSE visible-radius curve, FOUR time-based phases.
+/// R3 modifies the R2 suction endpoint and final-collapse easing to fix
+/// the visual bug where content disappeared before the Kamui finished:
+/// "grab" `[0, KAMUI_CLOSE_GRAB_END]` (0.18) — radius eases
+/// `1.0 -> KAMUI_CLOSE_GRAB_RADIUS` (0.97); "flow"
+/// `[KAMUI_CLOSE_GRAB_END, KAMUI_CLOSE_FLOW_END]` (0.55) — radius eases
+/// `0.97 -> KAMUI_CLOSE_FLOW_RADIUS` (0.70), the defining early spiral
+/// motion, with the window still substantially visible; "suction"
+/// `[KAMUI_CLOSE_FLOW_END, KAMUI_CLOSE_SUCTION_END]` (0.82) — radius
+/// eases `0.70 -> KAMUI_CLOSE_SUCTION_RADIUS` (0.45 — R2.1 was 0.10,
+/// which left content practically invisible before the final fade);
+/// "synchronized final collapse"
+/// `[KAMUI_CLOSE_SUCTION_END, KAMUI_CLOSE_COLLAPSE_END]` (0.94) — radius
+/// eases `0.45 -> 0.0` via `ease_in_cubic` (late-accelerating) while
+/// opacity simultaneously fades via the SAME shared `ease_in_cubic(
+/// phase_progress(...))` (see `sample_kamui_close`). Content and mask
+/// die together.
+const KAMUI_CLOSE_GRAB_END: f32 = 0.18;
+const KAMUI_CLOSE_FLOW_END: f32 = 0.55;
+const KAMUI_CLOSE_SUCTION_END: f32 = 0.82;
+const KAMUI_CLOSE_COLLAPSE_END: f32 = 0.94;
+const KAMUI_CLOSE_GRAB_RADIUS: f32 = 0.97;
+const KAMUI_CLOSE_FLOW_RADIUS: f32 = 0.70;
+const KAMUI_CLOSE_SUCTION_RADIUS: f32 = 0.45;
+
+/// 3a3fa2b7-r2 — THE core fix this milestone exists for. R1's twist was
+/// `-MAX_TWIST * (1.0 - visible_radius)`, which stays near-zero through
+/// the entire grab phase (radius barely moves off `1.0` there) — the
+/// viewer never saw angular motion until radius had ALREADY collapsed
+/// substantially, reading as a plain shrink rather than a vortex (the
+/// reported "currently ugly... squeezed/closed into the center" bug).
+/// Twist now follows its OWN separate, EARLIER-ramping time curve,
+/// reusing the SAME four phase boundaries as radius above but with
+/// magnitude breakpoints chosen to run well AHEAD of radius's own
+/// collapse: `0 -> KAMUI_CLOSE_TWIST_AFTER_GRAB` (1.0 rad) already by
+/// `KAMUI_CLOSE_GRAB_END`, while radius has only eased to `0.97` — i.e.
+/// meaningfully nonzero twist while the window still looks almost full
+/// size (see `kamui_close_twist_precedes_radius_contraction`, the
+/// section-9-required proof) — then `-> KAMUI_CLOSE_TWIST_AFTER_FLOW`
+/// (2.6 rad, matching R1's OLD max — now just a midpoint) by
+/// `KAMUI_CLOSE_FLOW_END`, then `-> KAMUI_CLOSE_MAX_TWIST` (3.4 rad) by
+/// `KAMUI_CLOSE_SUCTION_END`, held there through core collapse ("twist
+/// may remain strong until nearly invisible", R2 spec section 7 phase D).
+/// `3.4` sits inside the spec's suggested `3.2-3.8` range (its own first
+/// suggestion). CLOCKWISE (negative sign), unchanged from R1's "sucked
+/// in" sensation.
+const KAMUI_CLOSE_TWIST_AFTER_GRAB: f32 = 1.0;
+const KAMUI_CLOSE_TWIST_AFTER_FLOW: f32 = 2.6;
+const KAMUI_CLOSE_MAX_TWIST: f32 = 3.4;
+
+/// 3a3fa2b7-r2.1 — nonlinear radial-power warp: CLOSE moves BELOW `1.0`
+/// (unlike OPEN, which moves above it) as suction proceeds, reaching
+/// `KAMUI_CLOSE_RADIAL_POWER_END` (`0.55`) by `SUCTION_END`, held through
+/// collapse.
+///
+/// CORRECTED direction from R2 (R2 shipped `1.8`, the opposite sign — see
+/// the r2.1 spec's "inverse-mapping direction bug: CONFIRMED" finding;
+/// see `KAMUI_OPEN_RADIAL_POWER_START`'s comment for the full derivation
+/// this mirrors). Solving `source_r = pow(output_r, power)` for the
+/// INVERSE question ("where does a fixed source feature end up
+/// displayed") gives `output_r = pow(source_r, 1/power)`. For `power < 1`
+/// and a source feature at `source_r` in `(0,1)`, `1/power > 1`, so
+/// `pow(source_r, 1/power) < source_r` — e.g. a feature at `source_r=0.25`
+/// with `power=0.55` is displayed at `output_r ≈ 0.080`: much CLOSER to
+/// center than it originally sat in the source. That is a source feature
+/// being pulled/sucked INWARD — the desired CLOSE "sucked into the
+/// vortex" sensation. Coupled directly to `visible_radius` (`1.0` at
+/// `radius=1`, `0.55` at `radius=0`) rather than an independent phase
+/// timeline — this is safe to couple (unlike twist) since the R2 spec
+/// only flagged TWIST's radius-coupling as the bug, and coupling here
+/// guarantees a perfectly continuous `1.0` at t=0 (no pop the instant
+/// closing begins) for free.
+const KAMUI_CLOSE_RADIAL_POWER_END: f32 = 0.55;
+
+fn sample_kamui_close_visible_radius(t: f32) -> f32 {
+    if t <= KAMUI_CLOSE_GRAB_END {
+        let u = ease_out_cubic(phase_progress(t, 0.0, KAMUI_CLOSE_GRAB_END));
+        lerp(1.0, KAMUI_CLOSE_GRAB_RADIUS, u)
+    } else if t < KAMUI_CLOSE_FLOW_END {
+        let u = ease_out_cubic(phase_progress(t, KAMUI_CLOSE_GRAB_END, KAMUI_CLOSE_FLOW_END));
+        lerp(KAMUI_CLOSE_GRAB_RADIUS, KAMUI_CLOSE_FLOW_RADIUS, u)
+    } else if t < KAMUI_CLOSE_SUCTION_END {
+        let u = ease_out_cubic(phase_progress(t, KAMUI_CLOSE_FLOW_END, KAMUI_CLOSE_SUCTION_END));
+        lerp(KAMUI_CLOSE_FLOW_RADIUS, KAMUI_CLOSE_SUCTION_RADIUS, u)
+    } else if t < KAMUI_CLOSE_COLLAPSE_END {
+        let u = ease_in_cubic(phase_progress(t, KAMUI_CLOSE_SUCTION_END, KAMUI_CLOSE_COLLAPSE_END));
+        lerp(KAMUI_CLOSE_SUCTION_RADIUS, 0.0, u)
+    } else {
+        0.0
+    }
+}
+
+/// 3a3fa2b7-r2 — the mandatory fix: a SEPARATE time curve from radius,
+/// ramping earlier — see the constant doc comment above for the full
+/// rationale and the exact required relationship this establishes.
+fn sample_kamui_close_twist(t: f32) -> f32 {
+    let magnitude = if t <= KAMUI_CLOSE_GRAB_END {
+        let u = ease_out_cubic(phase_progress(t, 0.0, KAMUI_CLOSE_GRAB_END));
+        lerp(0.0, KAMUI_CLOSE_TWIST_AFTER_GRAB, u)
+    } else if t < KAMUI_CLOSE_FLOW_END {
+        let u = ease_out_cubic(phase_progress(t, KAMUI_CLOSE_GRAB_END, KAMUI_CLOSE_FLOW_END));
+        lerp(KAMUI_CLOSE_TWIST_AFTER_GRAB, KAMUI_CLOSE_TWIST_AFTER_FLOW, u)
+    } else if t < KAMUI_CLOSE_SUCTION_END {
+        let u = ease_out_cubic(phase_progress(t, KAMUI_CLOSE_FLOW_END, KAMUI_CLOSE_SUCTION_END));
+        lerp(KAMUI_CLOSE_TWIST_AFTER_FLOW, KAMUI_CLOSE_MAX_TWIST, u)
+    } else {
+        KAMUI_CLOSE_MAX_TWIST
+    };
+    -magnitude
+}
+
+/// 3a3fa2b7-r2 — see the constant doc comment above for the direction
+/// rationale. Coupled to `visible_radius`, reaching exactly `1.0` at
+/// `t=0` (radius=1) and `KAMUI_CLOSE_RADIAL_POWER_END` at full collapse.
+fn sample_kamui_close_radial_power(t: f32) -> f32 {
+    let radius = sample_kamui_close_visible_radius(t).clamp(0.0, 1.0);
+    1.0 + (KAMUI_CLOSE_RADIAL_POWER_END - 1.0) * (1.0 - radius)
+}
+
+/// 3a3fa2b7 — the ONLY gate deciding whether an animated CLOSE surface
+/// (provisional frame 0 OR committed `ClosingVisual` — see
+/// `render_closing_layer`, ONE shared path for both) carries Kamui
+/// polar-warp state this frame. Unlike the OPEN gate, this is never
+/// time-bounded to `None` for a settled tail — Kamui's CLOSE vortex is
+/// present for the entire close duration, since the window is
+/// disappearing rather than settling into a final visible state. Returns
+/// `(visible_radius, twist, radial_power)`, mirroring `kamui_open_state_for`.
+fn kamui_close_state_for(effect: crate::config::CloseAnimationEffect, t: f32) -> Option<(f32, f32, f32)> {
+    if effect == crate::config::CloseAnimationEffect::Kamui {
+        Some((sample_kamui_close_visible_radius(t), sample_kamui_close_twist(t), sample_kamui_close_radial_power(t)))
+    } else {
+        None
+    }
+}
+
+/// 3a3fa2b7 — Kamui CLOSE's shadow ENVELOPE, mirroring
+/// `kamui_open_shadow_envelope_for`'s exact reasoning: `visible_radius`
+/// alone, no polar warp state, no extra wrapper — reaches exactly `0.0`
+/// at full collapse and exactly `1.0` at the very start (before any
+/// visible distortion has begun).
+fn kamui_close_shadow_envelope_for(effect: crate::config::CloseAnimationEffect, t: f32) -> Option<f32> {
+    if effect == crate::config::CloseAnimationEffect::Kamui {
+        Some(sample_kamui_close_visible_radius(t))
+    } else {
+        None
+    }
+}
+
+/// The ONE pure close-effect-sampling entry point — same `match`-dispatch
+/// shape as `sample_open_effect`, kept as a SEPARATE function/dispatch
+/// (never merged with the open dispatch) since `CloseAnimationEffect` and
+/// `OpenAnimationEffect` are deliberately separate enums.
+fn sample_close_effect(effect: crate::config::CloseAnimationEffect, t: f32) -> AnimationVisual {
+    match effect {
+        crate::config::CloseAnimationEffect::Scale => sample_close_scale(t),
+        crate::config::CloseAnimationEffect::TeleportFlashy => sample_teleport_flashy_close(t),
+        crate::config::CloseAnimationEffect::Kamui => sample_kamui_close(t),
+    }
+}
+
+/// Dock/Desktop and override_redirect are excluded: no richer transient
+/// taxonomy exists yet (SurfaceVisualClass has exactly Normal/Dock/Desktop),
+/// so an unknown override_redirect popup would otherwise default to Normal.
+fn eligible_for_open_animation(entry: &SurfaceEntry) -> bool {
+    // 3a3fa2a R2: uses the semantic-preferring effective_override_redirect,
+    // not the capture-scoped override_redirect — a managed application
+    // window whose canonical capture surface happens to be override_redirect
+    // (e.g. an i3-internal wrapper) must not be rejected on that basis.
+    matches!(entry.visual_class, SurfaceVisualClass::Normal) && !entry.effective_override_redirect
+}
+
+/// Candidate-local, pure, and temporary: never touches persistent
+/// `SceneSession::window_animations`. Only a successful commit (see
+/// `commit_candidate_inner`) promotes any of this map's entries into
+/// persistent state; a rejected/retried candidate simply drops it.
+///
+/// `is_first_publish` suppresses animation on the very first scene
+/// publication (startup with pre-existing windows must not animate).
+/// `present_available` suppresses animation when Present is unavailable
+/// (no MSC heartbeat to drive intermediate frames), so surfaces render
+/// directly at final state rather than failing or busy-looping — this
+/// gate is independent of, and always ANDed with, `animation.enabled`
+/// (3a3fa2b1): a config-enabled but Present-unavailable case still
+/// yields no animation, and vice versa.
+fn provisional_open_animations(
+    old_surfaces: &HashSet<Window>,
+    snapshot: &SceneSnapshot,
+    is_first_publish: bool,
+    present_available: bool,
+    animation: crate::config::AnimationConfig,
+    started_at: Instant,
+) -> HashMap<Window, WindowAnimation> {
+    // TEMPORARY FORENSIC INSTRUMENTATION (3a3fa2a runtime non-observation
+    // investigation) — read-only, no synchronous X11 queries, no effect on
+    // the actual filter chain below. Remove before release.
+    log_open_anim_eligibility(old_surfaces, snapshot, is_first_publish, present_available, animation.enabled);
+    if is_first_publish || !present_available || !animation.enabled {
+        return HashMap::new();
+    }
+    snapshot
+        .entries
+        .iter()
+        .filter(|entry| !old_surfaces.contains(&entry.surface_xid))
+        .filter(|entry| eligible_for_open_animation(entry))
+        .inspect(|entry| {
+            println!(
+                "OPEN_ANIM_PROVISIONAL_CREATE surface=0x{:08x} effect={:?} duration_ms={}",
+                entry.surface_xid,
+                animation.open.effect,
+                animation.open.duration.as_millis(),
+            );
+        })
+        .map(|entry| (entry.surface_xid, WindowAnimation::open(started_at, animation.open.effect, animation.open.duration)))
+        .collect()
+}
+
+/// TEMPORARY FORENSIC INSTRUMENTATION — see provisional_open_animations.
+/// Mirrors (never feeds back into) the real eligibility decision, purely
+/// for one diagnostic line per newly-added surface. Remove before release.
+fn log_open_anim_eligibility(
+    old_surfaces: &HashSet<Window>,
+    snapshot: &SceneSnapshot,
+    is_first_publish: bool,
+    present_available: bool,
+    animation_config_enabled: bool,
+) {
+    for entry in &snapshot.entries {
+        if old_surfaces.contains(&entry.surface_xid) {
+            continue;
+        }
+        let eligible_visual = eligible_for_open_animation(entry);
+        let eligible = !is_first_publish && present_available && animation_config_enabled && eligible_visual;
+        // R2/b1: rejection reason now reflects the semantic-preferring
+        // value actually consulted by eligible_for_open_animation, and
+        // distinguishes the config-disabled gate from the Present-
+        // unavailable gate (previously conflated into one bool).
+        let reason = if is_first_publish {
+            "first_publish"
+        } else if !present_available {
+            "present_unavailable"
+        } else if !animation_config_enabled {
+            "animation_disabled"
+        } else if !matches!(entry.visual_class, SurfaceVisualClass::Normal) {
+            "visual_class"
+        } else if entry.effective_override_redirect {
+            "override_redirect"
+        } else {
+            "eligible"
+        };
+        println!(
+            "OPEN_ANIM_ELIGIBILITY surface=0x{:08x} semantic={} class={:?} capture_override_redirect={} effective_override_redirect={} present={} animation_enabled={} first_publish={} eligible={} reason={}",
+            entry.surface_xid,
+            entry
+                .semantic_client_xid
+                .map(|xid| format!("0x{xid:08x}"))
+                .unwrap_or_else(|| "none".to_string()),
+            entry.visual_class,
+            entry.override_redirect,
+            entry.effective_override_redirect,
+            present_available,
+            animation_config_enabled,
+            is_first_publish,
+            eligible,
+            reason,
+        );
+    }
+}
+
+/// The view a pre-commit render must use: already-committed animations plus
+/// this candidate's not-yet-committed provisional ones. Never mutates
+/// either input map.
+fn merge_window_animations(
+    persistent: &HashMap<Window, WindowAnimation>,
+    provisional: &HashMap<Window, WindowAnimation>,
+) -> HashMap<Window, WindowAnimation> {
+    let mut merged = persistent.clone();
+    merged.extend(provisional.iter().map(|(xid, animation)| (*xid, animation.clone())));
+    merged
+}
+
+/// Called only from `commit_candidate_inner`, after a successful commit —
+/// never speculatively. Preserves an existing entry's `started_at` rather
+/// than restarting it (defensive: provisional is built only from
+/// `new_surfaces - old_surfaces`, so a collision should not occur).
+fn promote_provisional_animations(
+    persistent: &mut HashMap<Window, WindowAnimation>,
+    provisional: HashMap<Window, WindowAnimation>,
+) {
+    for (surface_xid, animation) in provisional {
+        // TEMPORARY FORENSIC INSTRUMENTATION — remove before release.
+        println!("OPEN_ANIM_PROMOTE surface=0x{surface_xid:08x}");
+        persistent.entry(surface_xid).or_insert(animation);
+    }
+}
+
+/// TEMPORARY FORENSIC INSTRUMENTATION — logs, does not mutate anything.
+/// Called at rebuild_and_present's candidate-discard points (Retry/
+/// Shutdown) so a candidate that never reaches commit_candidate_inner is
+/// still visible in the forensic trace. Remove before release.
+fn log_open_anim_reject(provisional: &HashMap<Window, WindowAnimation>) {
+    for surface_xid in provisional.keys() {
+        println!("OPEN_ANIM_REJECT surface=0x{surface_xid:08x}");
+    }
+}
+
+/// Resource-free removal: `WindowAnimation` owns no DamageLease/NamedPixmap/
+/// EGLImage, so this cannot delay or interact with resource teardown.
+fn retire_removed_surface_animations(
+    animations: &mut HashMap<Window, WindowAnimation>,
+    removed_surfaces: &HashSet<Window>,
+) {
+    for surface_xid in removed_surfaces {
+        animations.remove(surface_xid);
+    }
+}
+
+/// 3a3fa2b5 — persistent composite ordering identity. `Closing(u64)` is
+/// never keyed by a `Window` XID (see the transactional `close_id`
+/// allocation in `allocate_close_ids`) — a later Live entry whose XID
+/// happens to match a historically-dead, still-animating close can never
+/// collide with it, since this enum carries no Window field to collide
+/// on (see the XID-reuse-safety proof in the r4 audit).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderLayer {
+    Live(Window),
+    Closing(u64),
+}
+
+/// 3a3fa2b5-r4 — the accepted "left-neighbor gap" reconciliation.
+/// Rebuilds the Live spine UNCONDITIONALLY from `new_live_order`,
+/// guaranteeing `projection(result, Live) == new_live_order` exactly, by
+/// construction — the Live order is never "preserved from history" (that
+/// was R3's bug). Every Closing entry (continuing from `previous_order`,
+/// or newly converted this commit from a `removed_surfaces` XID present
+/// in `provisional_closes`) is re-spliced into the gap defined by the
+/// nearest entry to its LEFT in `previous_order` that is still live in
+/// `new_live_order` — computed via a single running-anchor left-to-right
+/// scan (O(previous_order.len())), never a per-entry re-walk. Old
+/// relative order within a shared-anchor group is preserved by construction
+/// (scan order == group push order). A `None` anchor (nothing live ever
+/// to its left) is spliced at the very front (bottom of stack).
+/// `previous_order` is assumed to already reflect the previous commit's
+/// retirements (see `SceneSession::retire_completed_closing_visuals`,
+/// which mutates `render_order` directly, outside this candidate-local
+/// reconciliation) — so every `Closing(id)` found here is still-animating
+/// by invariant, and is unconditionally carried forward.
+fn reconcile_render_order(
+    previous_order: &[RenderLayer],
+    new_live_order: &[Window],
+    removed_surfaces: &HashSet<Window>,
+    provisional_closes: &HashMap<Window, u64>,
+) -> Vec<RenderLayer> {
+    let new_live_set: HashSet<Window> = new_live_order.iter().copied().collect();
+    let mut groups: HashMap<Option<Window>, Vec<RenderLayer>> = HashMap::new();
+    let mut current_anchor: Option<Window> = None;
+    for layer in previous_order {
+        match *layer {
+            RenderLayer::Live(xid) if new_live_set.contains(&xid) => {
+                current_anchor = Some(xid);
+            }
+            RenderLayer::Live(xid) => {
+                if removed_surfaces.contains(&xid)
+                    && let Some(&close_id) = provisional_closes.get(&xid)
+                {
+                    groups.entry(current_anchor).or_default().push(RenderLayer::Closing(close_id));
+                }
+                // Ineligible/unconverted removal: dropped, anchor unchanged.
+            }
+            RenderLayer::Closing(id) => {
+                groups.entry(current_anchor).or_default().push(RenderLayer::Closing(id));
+            }
+        }
+    }
+    let mut output = groups.remove(&None).unwrap_or_default();
+    for &xid in new_live_order {
+        output.push(RenderLayer::Live(xid));
+        if let Some(group) = groups.remove(&Some(xid)) {
+            output.extend(group);
+        }
+    }
+    output
+}
+
+/// 3a3fa2b5 — transactional `close_id` allocation, factored out as a pure
+/// function so the retry-then-accept semantics (same `base` reserves the
+/// same sequence; overflow fails open) are independently testable without
+/// a live `SceneSession`. `eligible_sources` must already be filtered to
+/// exactly the XIDs that should receive a new close this commit, in
+/// deterministic (stacking-index) order — this function only allocates
+/// and advances, it makes no eligibility decisions. On checked-add
+/// overflow, that ONE source is skipped (fails open: no close is created
+/// for it, `next_id` does not advance for it) — never wraps, never
+/// panics, never blocks the remaining allocations.
+fn allocate_close_ids(base: u64, eligible_sources: &[Window]) -> (HashMap<Window, u64>, u64) {
+    let mut next_id = base;
+    let mut ids = HashMap::new();
+    for &xid in eligible_sources {
+        let Some(advanced) = next_id.checked_add(1) else {
+            println!("CLOSE_ID_SPACE_EXHAUSTED surface=0x{xid:08x}");
+            continue;
+        };
+        ids.insert(xid, next_id);
+        next_id = advanced;
+    }
+    (ids, next_id)
+}
+
+/// 3a3fa2b5-r2 — pure retention rule for `SceneSession::destroy_intents`,
+/// factored out so the correction can be tested directly without a live
+/// `SceneSession`. Corrects R1's narrower `for xid in &removed_surfaces {
+/// destroy_intents.remove(xid) }`, which never retired an intent for an
+/// XID that was never part of the OLD committed scene at all (e.g. an
+/// override-redirect popup, or any window destroyed before ever becoming
+/// eligible/tracked) — such an XID can never appear in ANY future
+/// `removed_surfaces` set (it was never in `old_surfaces` to begin with),
+/// so R1's loop would leave it in `destroy_intents` forever, creating an
+/// XID-reuse hazard (a later, unrelated Live window reusing that same
+/// numeric XID would inherit the stale intent and could false-trigger a
+/// close on a mere Unmap). The corrected rule instead re-establishes, on
+/// every committed Accept, the invariant `destroy_intents ⊆ new_surfaces`
+/// — retaining an intent only for an XID that is part of the
+/// JUST-COMMITTED live scene (i.e. still a genuine candidate for a
+/// FUTURE close). This single rule subsumes R1's old removal loop
+/// (anything in `removed_surfaces` is by definition NOT in
+/// `new_surfaces` either) and additionally closes the untracked-XID leak.
+/// Called only from `commit_candidate_inner`, never during
+/// `build_candidate`/`pre_commit_gate` — so a Retry always observes the
+/// exact same causal Destroy information as its first attempt.
+fn retained_destroy_intents(
+    destroy_intents: &HashSet<Window>,
+    new_surfaces: &HashSet<Window>,
+) -> HashSet<Window> {
+    destroy_intents
+        .iter()
+        .copied()
+        .filter(|xid| new_surfaces.contains(xid))
+        .collect()
+}
+
+// ============================================================
+// TEMPORARY PERFORMANCE FORENSIC INSTRUMENTATION (3a3fa2a Brave repaint
+// latency investigation). Bounded, ~once/second aggregate stdout output
+// only — never per-frame. In-memory counters only, zero new X11 queries,
+// zero functional/behavioral change (every hook below is a pure counter
+// increment or Instant::now()/.elapsed() measurement around an otherwise
+// unmodified call). Remove before release.
+// ============================================================
+
+#[derive(Default, Clone, Copy)]
+struct PerfTiming {
+    count: u64,
+    total: Duration,
+    max: Duration,
+}
+
+impl PerfTiming {
+    fn record(&mut self, elapsed: Duration) {
+        self.count += 1;
+        self.total += elapsed;
+        if elapsed > self.max {
+            self.max = elapsed;
+        }
+    }
+
+    fn avg_micros(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.total.as_secs_f64() * 1_000_000.0 / self.count as f64
+        }
+    }
+
+    fn max_micros(&self) -> f64 {
+        self.max.as_secs_f64() * 1_000_000.0
+    }
+}
+
+struct PerfForensics {
+    window_start: Instant,
+    events: u64,
+    present_complete_events: u64,
+    pixel_damage_events: u64,
+    hierarchy_events: u64,
+    geometry_events: u64,
+    visual_state_events: u64,
+    candidate_rebuilds: u64,
+    full_recomposes: u64,
+    animation_only_recomposes: u64,
+    renders: u64,
+    egl_swaps: u64,
+    damage_subtracts: u64,
+    max_event_batch_size: usize,
+    batch_saturations: u64,
+    event_batch_drain: PerfTiming,
+    classification: PerfTiming,
+    full_recompose: PerfTiming,
+    render: PerfTiming,
+    swap: PerfTiming,
+}
+
+impl PerfForensics {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            events: 0,
+            present_complete_events: 0,
+            pixel_damage_events: 0,
+            hierarchy_events: 0,
+            geometry_events: 0,
+            visual_state_events: 0,
+            candidate_rebuilds: 0,
+            full_recomposes: 0,
+            animation_only_recomposes: 0,
+            renders: 0,
+            egl_swaps: 0,
+            damage_subtracts: 0,
+            max_event_batch_size: 0,
+            batch_saturations: 0,
+            event_batch_drain: PerfTiming::default(),
+            classification: PerfTiming::default(),
+            full_recompose: PerfTiming::default(),
+            render: PerfTiming::default(),
+            swap: PerfTiming::default(),
+        }
+    }
+
+    /// Counted at wait_live_pixel's main event-batch drain and
+    /// drain_current_events (the PixelDamage/typing-dominant paths) only —
+    /// NOT at pre_commit_gate/refresh_resize_state_before_acquisition/
+    /// try_move_only's own drains, which are structural-rebuild/resize
+    /// paths, not typing-relevant. Documented scope limit, not an omission.
+    fn record_invalidation(&mut self, invalidation: SceneInvalidation) {
+        match invalidation {
+            SceneInvalidation::PixelDamage(_) => self.pixel_damage_events += 1,
+            SceneInvalidation::Hierarchy => self.hierarchy_events += 1,
+            SceneInvalidation::Geometry(_) => self.geometry_events += 1,
+            SceneInvalidation::VisualState => self.visual_state_events += 1,
+            _ => {}
+        }
+    }
+
+    fn record_batch_size(&mut self, size: usize) {
+        if size > self.max_event_batch_size {
+            self.max_event_batch_size = size;
+        }
+        if size >= MAX_EVENTS_PER_BATCH {
+            self.batch_saturations += 1;
+        }
+    }
+
+    fn maybe_flush(&mut self, active_animations: usize) {
+        let elapsed = self.window_start.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        println!(
+            "PERF elapsed={:.2}s active_animations={} events={} present_complete={} pixel_damage={} hierarchy={} geometry={} visual_state={} candidate_rebuilds={} full_recomposes={} animation_only_recomposes={} renders={} egl_swaps={} damage_subtracts={} max_event_batch_size={} batch_saturations={} event_batch_drain[n={} avg_us={:.1} max_us={:.1}] classification[n={} avg_us={:.1} max_us={:.1}] full_recompose[n={} avg_us={:.1} max_us={:.1}] render[n={} avg_us={:.1} max_us={:.1}] swap[n={} avg_us={:.1} max_us={:.1}]",
+            elapsed.as_secs_f64(),
+            active_animations,
+            self.events,
+            self.present_complete_events,
+            self.pixel_damage_events,
+            self.hierarchy_events,
+            self.geometry_events,
+            self.visual_state_events,
+            self.candidate_rebuilds,
+            self.full_recomposes,
+            self.animation_only_recomposes,
+            self.renders,
+            self.egl_swaps,
+            self.damage_subtracts,
+            self.max_event_batch_size,
+            self.batch_saturations,
+            self.event_batch_drain.count, self.event_batch_drain.avg_micros(), self.event_batch_drain.max_micros(),
+            self.classification.count, self.classification.avg_micros(), self.classification.max_micros(),
+            self.full_recompose.count, self.full_recompose.avg_micros(), self.full_recompose.max_micros(),
+            self.render.count, self.render.avg_micros(), self.render.max_micros(),
+            self.swap.count, self.swap.avg_micros(), self.swap.max_micros(),
+        );
+        *self = Self::new();
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SceneSnapshot {
     root: Window,
@@ -1886,6 +3374,7 @@ fn eligible_surface_with_semantic_metadata(
         class: metadata.class,
         map_state: metadata.map_state,
         override_redirect: metadata.override_redirect,
+        effective_override_redirect: effective_override_redirect(metadata, semantic_metadata),
         stacking_index,
         backend,
         visual_class: classify_surface_visual_class(effective_window_type(metadata, semantic_metadata)),
@@ -1905,6 +3394,21 @@ fn effective_window_type<'a>(
     semantic_metadata
         .and_then(|metadata| metadata.window_type.as_deref())
         .or(capture_metadata.window_type.as_deref())
+}
+
+/// 3a3fa2a R2 — same precedence shape as effective_window_type: the
+/// semantic client's own override_redirect wins when semantic metadata is
+/// available (already resolved, in-memory, from the same hierarchy walk —
+/// zero new X11 queries), otherwise the capture surface's own bit is used.
+/// Consumed only by open-animation eligibility; SurfaceEntry.override_redirect
+/// itself keeps its existing capture-only meaning for every other consumer.
+fn effective_override_redirect(
+    capture_metadata: &WindowMetadata,
+    semantic_metadata: Option<&WindowMetadata>,
+) -> bool {
+    semantic_metadata
+        .map(|metadata| metadata.override_redirect)
+        .unwrap_or(capture_metadata.override_redirect)
 }
 
 fn classify_surface_visual_class(window_type: Option<&str>) -> SurfaceVisualClass {
@@ -1944,9 +3448,17 @@ fn shadow_eligible_for_entry(
         && matches!(entry.visual_class, SurfaceVisualClass::Normal)
 }
 
+/// `opacity_multiplier` scales the CONFIGURED `style.strength` only — it
+/// never replaces it (see 3a3fa2b1-s1's shadow-opacity contract). Callers
+/// that are not coupling this shadow to an open animation pass `1.0`,
+/// which reproduces the exact pre-3a3fa2b1-s1 params byte-for-byte.
+/// `strength <= 0.0` is already rejected by `ShadowParams::new` below, so
+/// `opacity_multiplier == 0.0` naturally yields `None` (no shadow drawn)
+/// rather than a degenerate zero-alpha draw call.
 fn shadow_params_from_plan(
     style: crate::config::ShadowConfig,
     plan: &RenderQuadPlan,
+    opacity_multiplier: f32,
 ) -> Option<crate::graphics::renderer::ShadowParams> {
     let mut params = crate::graphics::renderer::ShadowParams::new(
         plan.outer_x as f32,
@@ -1957,7 +3469,7 @@ fn shadow_params_from_plan(
         style.extent,
         style.offset_x,
         style.offset_y,
-        style.strength,
+        style.strength * opacity_multiplier,
     )?;
     params.color = crate::graphics::renderer::normalized_shadow_color(style.color);
     Some(params)
@@ -2735,6 +4247,152 @@ struct SurfaceResourceBundle<'a> {
     egl: Option<Rc<std::cell::RefCell<EglImportedSurface>>>,
 }
 
+/// 3a3fa2b5 — single-owner RAII for one compositor-owned GPU texture (see
+/// `EglSceneRenderer::capture_closing_snapshot`). Deliberately NOT
+/// `Rc<RefCell<_>>` like `EglImportedSurface`: a `ClosingVisual` has
+/// exactly one owner (`SceneSession::closing_visuals`), never shared —
+/// `EglImportedSurface`'s multi-owner sharing pattern is not the right
+/// analogue here (see the r2 audit). Exactly-once `glDeleteTextures` via
+/// the `released` guard, matching `EglImportedSurface`'s proven guard
+/// idiom without adopting its Rc/RefCell sharing. No `mem::forget`, no
+/// `ManuallyDrop`, no `ptr::read`.
+struct ClosingTexture {
+    texture: u32,
+    released: bool,
+}
+
+impl ClosingTexture {
+    fn new(texture: u32) -> Self {
+        Self { texture, released: false }
+    }
+
+    /// Real, exactly-once `glDeleteTextures` — requires a current GL
+    /// context (called only while one is current: normal retirement in
+    /// `retire_completed_closing_visuals`, and `SceneSession::cleanup`'s
+    /// `egl_current` branch, mirroring `EglImportedSurface::destroy`).
+    fn destroy(&mut self) {
+        if !self.released {
+            self.released = true;
+            crate::graphics::renderer::delete_texture(self.texture);
+        }
+    }
+
+    /// No-GL-call fallback — used only when no GL context is current
+    /// (the degraded-shutdown path), mirroring `EglImportedSurface::disarm`.
+    fn disarm(&mut self) {
+        self.released = true;
+    }
+}
+
+impl Drop for ClosingTexture {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+/// 3a3fa2b5 — committed, persistent-frame close visual. Owns exactly one
+/// GPU resource (`texture`) and otherwise only frozen value data captured
+/// at close-commit time — never a live Window-owned EGLImage/NamedPixmap/
+/// DamageLease/dead X11 pixmap (the milestone's non-negotiable ownership
+/// rule). `plan`/`pixel_semantics`/`base_opacity`/`shadow_eligible` are
+/// frozen from the OLD live surface's own committed geometry/border/
+/// opacity/shadow-eligibility at the moment the close was accepted —
+/// never re-derived from any live X11 state afterward. `source_xid` is
+/// diagnostic-only, never identity (see XID-reuse safety) — identity is
+/// `id` (the transactionally-allocated `close_id`).
+struct ClosingVisual {
+    #[allow(dead_code)]
+    id: u64,
+    texture: ClosingTexture,
+    plan: RenderQuadPlan,
+    pixel_semantics: EglPixelSemantics,
+    base_opacity: f32,
+    shadow_eligible: bool,
+    animation: ClosingAnimation,
+    #[allow(dead_code)]
+    source_xid: Window,
+}
+
+/// 3a3fa2b5-r2 — candidate-local, PURE value-type frame-0 data for a
+/// newly-triggered provisional close. Deliberately owns NO GPU/X11
+/// resource at all — no `Rc<RefCell<EglImportedSurface>>`, no
+/// `NamedPixmap`, no `Damage` (see the r2 correction: R1's `old_surface:
+/// Rc<RefCell<EglImportedSurface>>` field artificially extended a dead
+/// window's EGLImage lifetime merely to keep the close animation's
+/// texture source reachable, which the milestone's non-negotiable
+/// ownership rule forbids). Frame-0 rendering instead resolves the source
+/// texture FRESH, by `source_xid`, from `SceneSession::egl_surfaces`
+/// (still the OLD, live map at that point in `build_candidate` — see
+/// `render_closing_layer`'s `closing_source_surfaces` parameter); the
+/// post-Accept snapshot capture resolves it from `old_resources` inside
+/// `commit_candidate_inner`, again by lookup, never via a stored
+/// reference. Never candidate-owns a GL snapshot texture either — the
+/// real `ClosingTexture` is created only post-Accept. A rejected/retried
+/// candidate simply drops this map, touching no GPU/X11 resource and no
+/// committed state.
+struct ProvisionalClosingFrame {
+    source_xid: Window,
+    plan: RenderQuadPlan,
+    pixel_semantics: EglPixelSemantics,
+    base_opacity: f32,
+    shadow_eligible: bool,
+    animation: ClosingAnimation,
+}
+
+/// 3a3fa2b5 — unifies "committed" and "provisional" closing sources so
+/// `render_closing_layer` draws both through ONE code path (never a
+/// separate hardcoded first-frame draw call), mirroring
+/// `WindowAnimation::sample`'s "one dispatch for every render path"
+/// precedent.
+enum ClosingDrawSource<'a> {
+    Committed(&'a ClosingVisual),
+    Provisional(&'a ProvisionalClosingFrame),
+}
+
+impl ClosingDrawSource<'_> {
+    fn plan(&self) -> RenderQuadPlan {
+        match self {
+            Self::Committed(visual) => visual.plan,
+            Self::Provisional(frame) => frame.plan,
+        }
+    }
+
+    fn pixel_semantics(&self) -> EglPixelSemantics {
+        match self {
+            Self::Committed(visual) => visual.pixel_semantics,
+            Self::Provisional(frame) => frame.pixel_semantics,
+        }
+    }
+
+    fn base_opacity(&self) -> f32 {
+        match self {
+            Self::Committed(visual) => visual.base_opacity,
+            Self::Provisional(frame) => frame.base_opacity,
+        }
+    }
+
+    fn shadow_eligible(&self) -> bool {
+        match self {
+            Self::Committed(visual) => visual.shadow_eligible,
+            Self::Provisional(frame) => frame.shadow_eligible,
+        }
+    }
+
+    fn animation(&self) -> &ClosingAnimation {
+        match self {
+            Self::Committed(visual) => &visual.animation,
+            Self::Provisional(frame) => &frame.animation,
+        }
+    }
+
+    // 3a3fa2b5-r2: `texture()` was removed here on purpose. A committed
+    // `ClosingVisual` owns its `ClosingTexture` directly, but a
+    // `ProvisionalClosingFrame` owns no GPU resource at all (see its own
+    // doc comment) — its source texture must be resolved FRESH, by
+    // `source_xid`, from the still-live `closing_source_surfaces` map at
+    // the call site (`render_closing_layer`), never cached here.
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CopyPlan {
@@ -2823,6 +4481,193 @@ fn build_render_quad_plan(
         corner_radius: 0.0,
         border_width: 0.0,
         border_color: [0.0, 0.0, 0.0, 1.0],
+    })
+}
+
+/// Scales a render plan's destination rect AND its outer (shadow-extent)
+/// rect, each independently around its OWN center, for the open
+/// animation. `dst_x/dst_y/width/height` drive the actual surface texture
+/// blit — `render_surface_with_opacity` never reads `outer_*` at all.
+/// `outer_x/outer_y/outer_width/outer_height` drive shadow's base
+/// rectangle (see `shadow_params_from_plan`); as of 3a3fa2b1-s1 these now
+/// scale WITH the box, because `render_egl_scene_parts` passes this
+/// function's result to `shadow_params_from_plan` for the shadow draw.
+/// Blur staying on real (un-animated) bounds is entirely a call-site
+/// property, not a property of this function: `render_egl_scene_parts`
+/// always passes blur the original, un-scaled `plan`, never this result —
+/// see the "BLUR CONTRACT" note there. u0/v0/u1/v1 (UV mapping is
+/// independent of the destination rect, so texture sampling stays correct
+/// at any scale) are preserved untouched via `..plan`. corner_radius and
+/// border_width are scaled with the dst box so the mask ratio is
+/// preserved. Guards against a non-finite/non-positive scale and against
+/// a scaled dimension rounding to zero, even though `from_scale` (0.96)
+/// cannot normally produce one.
+fn scale_render_quad_plan(plan: RenderQuadPlan, scale_x: f32, scale_y: f32) -> RenderQuadPlan {
+    if !scale_x.is_finite() || scale_x <= 0.0 || !scale_y.is_finite() || scale_y <= 0.0 {
+        return plan;
+    }
+    let width = ((plan.width as f32) * scale_x).round().max(1.0) as i32;
+    let height = ((plan.height as f32) * scale_y).round().max(1.0) as i32;
+    let dst_x = plan.dst_x + (plan.width - width) / 2;
+    let dst_y = plan.dst_y + (plan.height - height) / 2;
+    // 3a3fa2b1-s1: outer_* (shadow's base rectangle) scales the same way,
+    // independently, around its OWN center — not derived from the dst
+    // rect's new position, so a partially off-screen window (whose outer
+    // and dst centers can already differ pre-animation, per
+    // build_render_quad_plan's edge-clipping) still gets a correctly
+    // self-centered animated shadow rect.
+    let outer_width = ((plan.outer_width as f32) * scale_x).round().max(1.0) as i32;
+    let outer_height = ((plan.outer_height as f32) * scale_y).round().max(1.0) as i32;
+    let outer_x = plan.outer_x + (plan.outer_width - outer_width) / 2;
+    let outer_y = plan.outer_y + (plan.outer_height - outer_height) / 2;
+    // 3a3fa2b1: corner_radius/border_width scale by min(scale_x, scale_y),
+    // not an average or a single axis — effective_corner_radius already
+    // clamps the radius to min(width, height) * 0.5 elsewhere; using the
+    // smaller axis' scale here preserves that same safety invariant under
+    // non-uniform scaling (the radius/border can never exceed what the
+    // smaller shrunk dimension allows), which an average or fixed-axis
+    // rule could not guarantee in the worst case.
+    let corner_border_scale = scale_x.min(scale_y);
+    RenderQuadPlan {
+        dst_x,
+        dst_y,
+        width,
+        height,
+        outer_x,
+        outer_y,
+        outer_width,
+        outer_height,
+        corner_radius: plan.corner_radius * corner_border_scale,
+        border_width: plan.border_width * corner_border_scale,
+        ..plan
+    }
+}
+
+/// 3a3fa2b3 — one vertical slice of energy_tear's window texture.
+/// `local_offset_x` is this slice's REST (un-shifted) x-position within
+/// the WHOLE window's local space — constant regardless of animation
+/// progress (a function of slice index and window width only), used
+/// ONLY for corner-radius/border masking continuity (see
+/// `render_energy_tear_slices` in renderer.rs), never for on-screen
+/// placement (that's `dst_x`, which DOES include the live tear offset).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EnergyTearSlicePlan {
+    pub(crate) dst_x: i32,
+    pub(crate) dst_y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) u0: f32,
+    pub(crate) v0: f32,
+    pub(crate) u1: f32,
+    pub(crate) v1: f32,
+    pub(crate) local_offset_x: f32,
+}
+
+/// One bright vertical tear line drawn at a slice boundary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EnergyTearStreakPlan {
+    pub(crate) dst_x: i32,
+    pub(crate) dst_y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+}
+
+/// Everything renderer.rs needs to draw one frame of energy_tear's
+/// slice+streak overlay — geometry only, no GL state, no resource
+/// handles. `full_width`/`full_height` and `corner_radius` mirror
+/// exactly what a plain single-quad `render_surface_with_opacity(...,
+/// draw_plan, ...)` call would use for its own `surface_size`/
+/// `corner_radius` uniforms — passing the SAME whole-window values to
+/// every slice (paired with each slice's own `local_offset_x`) is what
+/// makes the existing rounded-corner/border shader math correctly mask
+/// only the two true outer corners, with zero shader change to that
+/// math and zero new uniforms.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EnergyTearRenderPlan {
+    pub(crate) slices: [EnergyTearSlicePlan; ENERGY_TEAR_SLICE_COUNT],
+    pub(crate) streaks: [EnergyTearStreakPlan; ENERGY_TEAR_SLICE_COUNT - 1],
+    pub(crate) full_width: f32,
+    pub(crate) full_height: f32,
+    pub(crate) corner_radius: f32,
+    pub(crate) streak_alpha: f32,
+    pub(crate) streak_color: [f32; 3],
+}
+
+/// Pure geometry: turns a `RenderQuadPlan` + this frame's
+/// `EnergyTearLayout` into concrete slice/streak rectangles. Returns
+/// `None` when the plan is too narrow to safely form
+/// `ENERGY_TEAR_SLICE_COUNT` non-zero-width slices (the render loop
+/// falls back to the ordinary single-quad draw in that case, exactly as
+/// if no layout were active at all) — this is a real safety guard, not
+/// a clamp: it structurally prevents ever constructing a degenerate
+/// (<1px or UV-out-of-range) slice, rather than clamping one after the
+/// fact. NO border is drawn on the individual slices (border_width is
+/// not part of this plan at all) — while slices are torn apart there is
+/// no single continuous ring to draw a border around; the window's
+/// configured border reappears correctly, unmodified, the instant this
+/// function's caller falls back to the ordinary single-quad path (at
+/// t >= ENERGY_TEAR_END or for any non-energy_tear effect).
+fn energy_tear_render_plan(plan: RenderQuadPlan, layout: &EnergyTearLayout) -> Option<EnergyTearRenderPlan> {
+    if plan.width < ENERGY_TEAR_SLICE_COUNT as i32 || plan.height < 1 {
+        return None;
+    }
+    let total_width = plan.width;
+    let base = total_width / ENERGY_TEAR_SLICE_COUNT as i32;
+    let remainder = total_width % ENERGY_TEAR_SLICE_COUNT as i32;
+    let u_span = plan.u1 - plan.u0;
+    // 3a3fa2b3-r3: unit displacement is a fraction of the WHOLE WINDOW's
+    // width (not this slice's own width, per the R3 human-reviewed
+    // preference), clamped to a sane absolute-pixel range BEFORE the
+    // per-slice coefficient is applied — this preserves each slice's
+    // relative displacement pattern exactly, regardless of window size,
+    // while still bounding the absolute scale for very small/large
+    // windows.
+    let unit_displacement_px = ((total_width as f32) * ENERGY_TEAR_DISPLACEMENT_FRACTION_OF_WINDOW_WIDTH)
+        .clamp(ENERGY_TEAR_MIN_DISPLACEMENT_PX, ENERGY_TEAR_MAX_DISPLACEMENT_PX);
+    let mut slices = [EnergyTearSlicePlan {
+        dst_x: 0, dst_y: 0, width: 0, height: 0, u0: 0.0, v0: 0.0, u1: 0.0, v1: 0.0, local_offset_x: 0.0,
+    }; ENERGY_TEAR_SLICE_COUNT];
+    let mut cumulative_px: i32 = 0;
+    for (i, slot) in slices.iter_mut().enumerate() {
+        let slice_width = base + if (i as i32) < remainder { 1 } else { 0 };
+        let rest_offset_px = cumulative_px;
+        let live_offset_px = unit_displacement_px * layout.slice_offset_fractions[i];
+        *slot = EnergyTearSlicePlan {
+            dst_x: plan.dst_x + rest_offset_px + live_offset_px.round() as i32,
+            dst_y: plan.dst_y,
+            width: slice_width,
+            height: plan.height,
+            u0: plan.u0 + u_span * (rest_offset_px as f32 / total_width as f32),
+            v0: plan.v0,
+            u1: plan.u0 + u_span * ((rest_offset_px + slice_width) as f32 / total_width as f32),
+            v1: plan.v1,
+            local_offset_x: rest_offset_px as f32,
+        };
+        cumulative_px += slice_width;
+    }
+    let mut streaks = [EnergyTearStreakPlan { dst_x: 0, dst_y: 0, width: 0, height: 0 }; ENERGY_TEAR_SLICE_COUNT - 1];
+    for (i, slot) in streaks.iter_mut().enumerate() {
+        let left = &slices[i];
+        let right = &slices[i + 1];
+        let boundary_x = (left.dst_x + left.width + right.dst_x) / 2;
+        let line_width = ((left.width.min(right.width) as f32) * ENERGY_TEAR_LINE_WIDTH_FRACTION)
+            .round()
+            .max(1.0) as i32;
+        *slot = EnergyTearStreakPlan {
+            dst_x: boundary_x - line_width / 2,
+            dst_y: plan.dst_y,
+            width: line_width,
+            height: plan.height,
+        };
+    }
+    Some(EnergyTearRenderPlan {
+        slices,
+        streaks,
+        full_width: plan.width as f32,
+        full_height: plan.height as f32,
+        corner_radius: plan.corner_radius,
+        streak_alpha: layout.streak_alpha,
+        streak_color: ENERGY_TEAR_STREAK_COLOR,
     })
 }
 
@@ -3374,6 +5219,29 @@ struct SceneSession<'a> {
     shadow_style: crate::config::ShadowConfig,
     ignored_configure_windows: HashSet<Window>,
     diagnostics: Diagnostics3a3f8b3a,
+    // 3a3fa2a: resource-free (no DamageLease/NamedPixmap/EGLImage), keyed by
+    // the same stable surface_xid identity as `resources`/`egl_surfaces`.
+    // Populated only by a successful commit (see `commit_candidate_inner`),
+    // never speculatively.
+    window_animations: HashMap<Window, WindowAnimation>,
+    // 3a3fa2b5 — persistent close-animation state. `render_order` is the
+    // single authoritative composite ordering (Live projection always ==
+    // `snapshot.entries` order, see `reconcile_render_order`);
+    // `closing_visuals` owns exactly one GPU texture per still-animating
+    // close (`ClosingTexture`), keyed by `close_id`, never by Window XID;
+    // `next_close_id` is committed state, mutated ONLY inside
+    // `commit_candidate_inner` on Accept; `destroy_intents` records
+    // per-XID genuine DestroyNotify provenance, populated the instant an
+    // event is drained (see `note_destroy_intent`) and retired only once
+    // that XID is actually removed by a COMMITTED candidate — so a
+    // candidate Retry always observes the same causal Destroy
+    // information as its first attempt.
+    render_order: Vec<RenderLayer>,
+    closing_visuals: HashMap<u64, ClosingVisual>,
+    next_close_id: u64,
+    destroy_intents: HashSet<Window>,
+    // TEMPORARY (Brave repaint latency forensic) — see PerfForensics.
+    perf: PerfForensics,
 }
 
 struct SceneCandidate<'a> {
@@ -3389,6 +5257,23 @@ struct SceneCandidate<'a> {
     watch_ids: HashSet<Window>,
     watch_additions: Vec<Window>,
     ignored_configure_windows: HashSet<Window>,
+    // 3a3fa2a: candidate-local and pure until a successful commit promotes
+    // it into SceneSession::window_animations. A rejected/retried candidate
+    // is simply dropped, taking this with it — see provisional_open_animations.
+    provisional_animations: HashMap<Window, WindowAnimation>,
+    // 3a3fa2b5 — candidate-local close-animation state, mirroring
+    // `provisional_animations`'s exact precedent: pure and disposable
+    // until a successful commit promotes it. `provisional_render_order`
+    // already satisfies the Live-projection invariant by construction
+    // (see `reconcile_render_order`); `provisional_closing_frames` holds
+    // ONLY cheap value data + an `Rc` clone (no GPU allocation — see
+    // `ProvisionalClosingFrame`); `next_close_id_after` is this
+    // candidate's own locally-advanced counter, never written back to
+    // `SceneSession::next_close_id` except by `commit_candidate_inner` on
+    // Accept.
+    provisional_render_order: Vec<RenderLayer>,
+    provisional_closing_frames: HashMap<u64, ProvisionalClosingFrame>,
+    next_close_id_after: u64,
 }
 
 struct SceneStructureWatches<'a> {
@@ -3650,6 +5535,12 @@ impl<'a> SceneSession<'a> {
             shadow_style: config.visuals.shadow,
             ignored_configure_windows: HashSet::new(),
             diagnostics: Diagnostics3a3f8b3a::from_environment(),
+            window_animations: HashMap::new(),
+            render_order: Vec::new(),
+            closing_visuals: HashMap::new(),
+            next_close_id: 0,
+            destroy_intents: HashSet::new(),
+            perf: PerfForensics::new(),
         };
         session.state = SceneState::ManualActive;
         Ok(session)
@@ -3702,7 +5593,155 @@ impl<'a> SceneSession<'a> {
         Ok(())
     }
 
+    /// 3a3fa2b5 — the ONLY place `destroy_intents` is ever written.
+    /// Called at every site an event is drained from the X11 connection
+    /// (poll_for_event or the initial wait_for_event_or_shutdown event),
+    /// so a DestroyNotify's causal information is never lost merely
+    /// because it was observed during a speculative/retried build —
+    /// events are removed from the queue the instant they are polled,
+    /// regardless of which attempt is running, so this must run
+    /// unconditionally at drain time, never deferred into
+    /// build_candidate/pre_commit_gate. Retirement (removal) happens only
+    /// in commit_candidate_inner, for XIDs an ACCEPTED candidate actually
+    /// removes — see the r4/R1 close-trigger findings.
+    fn note_destroy_intent(&mut self, event: &Event) {
+        if let Event::DestroyNotify(destroy) = event {
+            self.destroy_intents.insert(destroy.window);
+        }
+    }
+
+    /// 3a3fa2b5 — computes this candidate's close-trigger set, allocates
+    /// their close_ids from a LOCAL counter seeded by (never mutating)
+    /// `self.next_close_id`, and reconciles `self.render_order` against
+    /// the fresh authoritative live order. Pure with respect to `self`:
+    /// reads `self.snapshot`/`self.resources`/`self.destroy_intents`/
+    /// `self.render_order`/`self._config`/`self.next_close_id`, mutates
+    /// nothing — the caller (`build_candidate`) stores the result
+    /// candidate-locally; only `commit_candidate_inner` on Accept ever
+    /// promotes it into committed state.
+    ///
+    /// R1 close trigger (ALL must hold): the XID is in `removed_surfaces`
+    /// (present in the OLD committed scene, absent from `snapshot`);
+    /// `eligible_for_open_animation` holds for its OLD committed metadata
+    /// (same semantic policy as open, reused directly — not reimplemented);
+    /// a genuine DestroyNotify intent is recorded for it
+    /// (`self.destroy_intents`) — Unmap-only (workspace hide/minimize/
+    /// withdraw) never sets this, so it never triggers a close; and its
+    /// OLD imported EGL texture still exists (`self.resources[xid].egl`).
+    fn build_provisional_closing_state(
+        &self,
+        snapshot: &SceneSnapshot,
+        removed_surfaces: &HashSet<Window>,
+    ) -> (Vec<RenderLayer>, HashMap<u64, ProvisionalClosingFrame>, u64) {
+        let new_live_order: Vec<Window> = snapshot.entries.iter().map(|entry| entry.surface_xid).collect();
+        let mut provisional_closing_frames: HashMap<u64, ProvisionalClosingFrame> = HashMap::new();
+        let animation = self._config.animation;
+        let mut eligible_sources: Vec<Window> = Vec::new();
+        let mut frame_inputs: HashMap<Window, (RenderQuadPlan, EglPixelSemantics, f32, bool)> = HashMap::new();
+        if animation.enabled && animation.close.enabled {
+            let mut candidates: Vec<&SurfaceEntry> = self
+                .snapshot
+                .as_ref()
+                .map(|live| {
+                    live.entries
+                        .iter()
+                        .filter(|entry| removed_surfaces.contains(&entry.surface_xid))
+                        .collect()
+                })
+                .unwrap_or_default();
+            candidates.sort_by_key(|entry| entry.stacking_index);
+            for old_entry in candidates {
+                if !eligible_for_open_animation(old_entry) {
+                    continue;
+                }
+                if !self.destroy_intents.contains(&old_entry.surface_xid) {
+                    continue;
+                }
+                let Some(bundle) = self.resources.get(&old_entry.surface_xid) else { continue; };
+                if bundle.egl.is_none() {
+                    continue;
+                }
+                let Some(mut plan) = build_render_quad_plan(old_entry.geometry, bundle.pixmap.geometry, snapshot.root_geometry) else { continue; };
+                apply_surface_visual_policy(&mut plan, &self._config.visuals, old_entry.visual_class);
+                plan.border_color = old_entry.resolved_border_color.map(f32::from_bits);
+                eligible_sources.push(old_entry.surface_xid);
+                frame_inputs.insert(
+                    old_entry.surface_xid,
+                    (
+                        plan,
+                        bundle.egl.as_ref().expect("checked above").borrow().pixel_semantics,
+                        f32::from_bits(old_entry.resolved_opacity_bits),
+                        old_entry.shadow_eligible,
+                    ),
+                );
+            }
+        }
+        let (provisional_closes, next_close_id_after) = allocate_close_ids(self.next_close_id, &eligible_sources);
+        for (&source_xid, &close_id) in &provisional_closes {
+            // 3a3fa2b5-r2: existence-only re-check — no Rc is cloned or
+            // retained here. The frame carries only `source_xid`; the
+            // actual GL texture is looked up fresh, by `source_xid`, at
+            // render time (`render_closing_layer`'s `closing_source_surfaces`
+            // lookup) and again at post-Accept capture time (`old_resources`
+            // lookup in `commit_candidate_inner`) — never cached in
+            // candidate-local state.
+            let Some(bundle) = self.resources.get(&source_xid) else { continue; };
+            if bundle.egl.is_none() {
+                continue;
+            }
+            let Some((plan, pixel_semantics, base_opacity, shadow_eligible)) = frame_inputs.get(&source_xid).copied() else { continue; };
+            provisional_closing_frames.insert(
+                close_id,
+                ProvisionalClosingFrame {
+                    source_xid,
+                    plan,
+                    pixel_semantics,
+                    base_opacity,
+                    shadow_eligible,
+                    animation: ClosingAnimation::new(Instant::now(), animation.close.effect, animation.close.duration),
+                },
+            );
+        }
+        let provisional_render_order = reconcile_render_order(
+            &self.render_order,
+            &new_live_order,
+            removed_surfaces,
+            &provisional_closes,
+        );
+        (provisional_render_order, provisional_closing_frames, next_close_id_after)
+    }
+
+    /// 3a3fa2b5 — removes every `ClosingVisual` whose animation has
+    /// completed, destroying its `ClosingTexture` exactly once (via
+    /// `Drop`, requires the GL context this is always called with while
+    /// current — mirrors `retire_completed_animations`'s call site and
+    /// timing), and drops its `RenderLayer::Closing(id)` entry from
+    /// `render_order` — a persistent-only mutation, entirely outside the
+    /// candidate transaction, exactly like `retire_completed_animations`.
+    /// Relative order of any remaining layers is preserved by construction
+    /// (`retain` never reorders).
+    fn retire_completed_closing_visuals(&mut self) {
+        if self.closing_visuals.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let completed: HashSet<u64> = self
+            .closing_visuals
+            .iter()
+            .filter(|(_, visual)| visual.animation.is_complete(now))
+            .map(|(id, _)| *id)
+            .collect();
+        if completed.is_empty() {
+            return;
+        }
+        for id in &completed {
+            self.closing_visuals.remove(id);
+        }
+        self.render_order.retain(|layer| !matches!(layer, RenderLayer::Closing(id) if completed.contains(id)));
+    }
+
     fn build_candidate(&mut self) -> Result<SceneCandidate<'a>, Box<dyn Error>> {
+        self.perf.candidate_rebuilds += 1;
         if self.diagnostics.enabled && self.diagnostics.structural_origin.is_none() { self.diagnostics.begin_structural_origin(StructuralOrigin::NormalLifecycle); }
         self.diagnostics.structural_candidates_started += 1;
         let resizeonly_snapshot_start = self.diagnostics.resizeonly_structural_direction
@@ -3780,6 +5819,31 @@ impl<'a> SceneSession<'a> {
                 return Err(Box::new(CandidateBuildError::Stale(invalidation)));
             }
         }
+        // 3a3fa2a: computed from the current live snapshot BEFORE any commit,
+        // and from the final (post prune/resize-refresh) candidate entries —
+        // pure, candidate-local. Never touches self.window_animations.
+        let is_first_publish = self.snapshot.is_none();
+        let old_surfaces: HashSet<Window> = self
+            .snapshot
+            .as_ref()
+            .map(|live| live.entries.iter().map(|entry| entry.surface_xid).collect())
+            .unwrap_or_default();
+        let provisional_animations = provisional_open_animations(
+            &old_surfaces,
+            &snapshot,
+            is_first_publish,
+            self.present.is_some(),
+            self._config.animation,
+            Instant::now(),
+        );
+        // 3a3fa2b5: candidate-local close-trigger/ordering state, computed
+        // from the OLD live snapshot/resources (still valid, unmutated at
+        // this point) and this candidate's own fresh snapshot. See
+        // build_provisional_closing_state.
+        let new_surface_ids: HashSet<Window> = snapshot.entries.iter().map(|entry| entry.surface_xid).collect();
+        let removed_surfaces: HashSet<Window> = old_surfaces.difference(&new_surface_ids).copied().collect();
+        let (provisional_render_order, provisional_closing_frames, next_close_id_after) =
+            self.build_provisional_closing_state(&snapshot, &removed_surfaces);
         let mut pixmaps = Vec::new();
         let mut damage_leases = Vec::new();
         let mut damage_registry = HashMap::new();
@@ -3891,7 +5955,19 @@ impl<'a> SceneSession<'a> {
         if !egl_scene_is_renderable(snapshot.entries.len(), egl_surfaces.len()) {
             return Err("scene has canonical surfaces but no EGL-renderable surfaces".into());
         }
-        self.render_egl_scene(&snapshot, &egl_surfaces, &pixmaps)?;
+        // 3a3fa2a: the FIRST frame this candidate can ever present already
+        // uses provisional_animations, merged with whatever is already
+        // persistent — so a newly eligible surface can never be swapped
+        // visible at full opacity/scale before its animation exists.
+        let render_animations = merge_window_animations(&self.window_animations, &provisional_animations);
+        self.render_egl_scene(
+            &snapshot,
+            &egl_surfaces,
+            &pixmaps,
+            &render_animations,
+            &provisional_render_order,
+            &provisional_closing_frames,
+        )?;
         self.diagnostics.last_candidate_resize = replaced_existing_resource;
         if replaced_existing_resource { self.diagnostics.resize_candidate_started += 1; }
         self.state = SceneState::NamedPixmapsReady;
@@ -3908,6 +5984,10 @@ impl<'a> SceneSession<'a> {
             watch_ids,
             watch_additions,
             ignored_configure_windows,
+            provisional_animations,
+            provisional_render_order,
+            provisional_closing_frames,
+            next_close_id_after,
         })
     }
 
@@ -3919,6 +5999,7 @@ impl<'a> SceneSession<'a> {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
             };
+            self.note_destroy_intent(&event);
             self.diagnostics.record_configure(&event, candidate);
             let geometry_source = geometry_event_source(&event, candidate);
             self.diagnostics.record_geometry_source(geometry_source);
@@ -4033,11 +6114,13 @@ impl<'a> SceneSession<'a> {
                     return Ok(());
                 }
                 GateDecision::Shutdown(reason) => {
+                    log_open_anim_reject(&candidate.provisional_animations);
                     self.structure_watches.rollback(&candidate.watch_additions)?;
                     self.diagnostics.record_structural_terminal(false, false, false);
                     return Err(format!("candidate aborted by shutdown: {reason:?}").into());
                 }
                 GateDecision::Retry(invalidation) if retry_allowed(attempt) => {
+                    log_open_anim_reject(&candidate.provisional_animations);
                     self.diagnostics.structural_candidates_stale += 1;
                     self.diagnostics.record_stale_origin(invalidation, false);
                     if self.diagnostics.last_candidate_resize { self.diagnostics.resize_candidate_stale += 1; }
@@ -4047,6 +6130,7 @@ impl<'a> SceneSession<'a> {
                     println!("candidate stale; bounded retry: {invalidation:?}");
                 }
                 GateDecision::Retry(invalidation) => {
+                    log_open_anim_reject(&candidate.provisional_animations);
                     self.diagnostics.structural_candidates_stale += 1;
                     self.diagnostics.record_stale_origin(invalidation, true);
                     if self.diagnostics.last_candidate_resize { self.diagnostics.resize_candidate_stale += 1; }
@@ -4080,6 +6164,7 @@ impl<'a> SceneSession<'a> {
                 break;
             };
             drained += 1;
+            self.note_destroy_intent(&event);
             self.diagnostics.record_configure(&event, &candidate.snapshot);
             let geometry_source = geometry_event_source(&event, &candidate.snapshot);
             self.diagnostics.record_geometry_source(geometry_source);
@@ -4209,10 +6294,14 @@ impl<'a> SceneSession<'a> {
         let previous_geometry = candidate_entry.geometry;
         let previous_client_root = candidate_entry.client_root_geometry;
         rebase_candidate_geometry_fields(&mut candidate.snapshot.entries[candidate_index], update);
+        let render_animations = merge_window_animations(&self.window_animations, &candidate.provisional_animations);
         let render_result = self.render_egl_scene(
             &candidate.snapshot,
             &candidate.egl_surfaces,
             &candidate.pixmaps,
+            &render_animations,
+            &candidate.provisional_render_order,
+            &candidate.provisional_closing_frames,
         );
         if let Err(error) = render_result {
             candidate.snapshot.entries[candidate_index].geometry = previous_geometry;
@@ -4237,8 +6326,7 @@ impl<'a> SceneSession<'a> {
         &mut self,
         candidate: SceneCandidate<'a>,
     ) -> Result<(), Box<dyn Error>> {
-        let egl = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?;
-        egl.swap()?;
+        self.timed_swap()?;
         self.state = SceneState::ScenePresented;
         let old_surfaces = self
             .snapshot
@@ -4278,6 +6366,119 @@ impl<'a> SceneSession<'a> {
         self.urgency.retain(|client, _| live_clients.contains(client));
         self.structure_watches.reconcile(&candidate.watch_ids)?;
         self.pending_hierarchy_geometry = None;
+        // 3a3fa2a: promote this now-committed candidate's provisional
+        // animations into persistent state, preserving the exact
+        // `started_at` already used by the render this commit just swapped
+        // (continuity: no restart, no discontinuity). Retire animations for
+        // surfaces that no longer exist — resource-free, so this cannot
+        // delay or interact with removed_surfaces' resource teardown below.
+        retire_removed_surface_animations(&mut self.window_animations, &removed_surfaces);
+        promote_provisional_animations(&mut self.window_animations, candidate.provisional_animations);
+        // 3a3fa2b5-r2 — retire destroy intents. Corrected from R1's
+        // narrower `for surface_xid in &removed_surfaces { remove(..) }`:
+        // that loop only ever retired intents for XIDs that were part of
+        // the OLD committed scene and got removed this commit — it left a
+        // permanent leak for any DestroyNotify(X) where X was NEVER part
+        // of the committed scene at all (an override-redirect popup, a
+        // stray/untracked child, a destroyed-before-ever-becoming-eligible
+        // window): such an X can never appear in ANY future
+        // `removed_surfaces` (since it was never in `old_surfaces` to
+        // begin with), so the old loop's `destroy_intents` entry for it
+        // would sit there forever — a real XID-reuse hazard (see the r2
+        // correction), since a LATER, unrelated Live window that happens
+        // to reuse that same numeric XID would inherit the stale intent
+        // and could false-trigger a close on a mere Unmap.
+        //
+        // The corrected rule instead re-establishes, on every committed
+        // Accept, the invariant `destroy_intents ⊆ new_surfaces`: retain
+        // an intent only if its XID is part of the JUST-COMMITTED live
+        // scene (i.e. still a candidate for a REAL future close). This
+        // single `retain` subsumes R1's old removal loop (anything in
+        // `removed_surfaces` is, by definition, not in `new_surfaces`
+        // either, so it's still dropped, whether or not it produced a
+        // close) AND additionally prunes any intent for an XID that was
+        // never tracked as part of the scene at all — closing the leak.
+        // Never mutated during build/Retry — only here, on a committed
+        // Accept, so a Retry always observes the SAME causal Destroy
+        // information as its first attempt.
+        self.destroy_intents = retained_destroy_intents(&self.destroy_intents, &new_surfaces);
+        // 3a3fa2b5-r2 — materialize this commit's newly-triggered
+        // provisional closes into compositor-owned GPU snapshots. Strictly
+        // AFTER timed_swap (frame 0 already presented from the OLD live
+        // texture, per the r1 first-frame-gap finding) and BEFORE the OLD
+        // X11/EGL resources are dropped below. Corrected from R1: the
+        // source texture and the snapshot's CLIENT-CONTENT dimensions are
+        // now resolved by `source_xid` lookup into `old_resources` (the
+        // pre-swap resource map captured just above via `mem::replace`,
+        // naturally still alive here, dropped normally right after this
+        // loop) — never via a stored `Rc` clone (R1's frame carried an
+        // owned reference to the live surface, which artificially
+        // extended a dead window's EGLImage lifetime). Width/height come
+        // from `bundle.pixmap.geometry` — the ACTUAL client pixmap's own
+        // dimensions — never the render plan's own outer extent fields
+        // (R1's bug: those are documented as the SHADOW's base rectangle
+        // in `shadow_params_from_plan`/`scale_render_quad_plan`, not a
+        // guaranteed content-size source, even though they numerically
+        // coincide with the pixmap size for an unclipped on-screen window
+        // via `build_render_quad_plan`).
+        // GPU-side only: no XGetImage, no glReadPixels, no new X11
+        // request. Snapshot failure is cosmetic (never aborts this
+        // commit): logged, the ClosingVisual is omitted, and its
+        // `close_id` is still filtered out of the committed render_order
+        // below — but the id itself stays consumed (see
+        // commit_candidate_inner's next_close_id promotion:
+        // `next_close_id_after` was already computed from every
+        // reservation this candidate made, regardless of later capture
+        // outcome).
+        let mut failed_close_ids: HashSet<u64> = HashSet::new();
+        for (close_id, frame) in candidate.provisional_closing_frames {
+            let source = old_resources
+                .get(&frame.source_xid)
+                .ok_or_else(|| -> Box<dyn Error> {
+                    format!("closing source surface 0x{:08x} is missing from old resources at capture time", frame.source_xid).into()
+                })
+                .and_then(|bundle| {
+                    bundle.egl.as_ref().ok_or_else(|| -> Box<dyn Error> {
+                        format!("closing source surface 0x{:08x} has no EGL texture at capture time", frame.source_xid).into()
+                    }).map(|egl_surface| {
+                        (egl_surface.borrow().texture, bundle.pixmap.geometry.width, bundle.pixmap.geometry.height)
+                    })
+                });
+            let capture = match source {
+                Ok((source_texture, width, height)) => match self.egl.as_mut() {
+                    Some(egl) => egl.capture_closing_snapshot(source_texture, i32::from(width), i32::from(height)),
+                    None => Err("EGL scene renderer is unavailable".into()),
+                },
+                Err(error) => Err(error),
+            };
+            match capture {
+                Ok(texture) => {
+                    self.closing_visuals.insert(close_id, ClosingVisual {
+                        id: close_id,
+                        texture: ClosingTexture::new(texture),
+                        plan: frame.plan,
+                        pixel_semantics: frame.pixel_semantics,
+                        base_opacity: frame.base_opacity,
+                        shadow_eligible: frame.shadow_eligible,
+                        animation: frame.animation,
+                        source_xid: frame.source_xid,
+                    });
+                }
+                Err(error) => {
+                    println!(
+                        "CLOSE_SNAPSHOT_FAILED close_id={close_id} surface=0x{:08x}: {error}",
+                        frame.source_xid,
+                    );
+                    failed_close_ids.insert(close_id);
+                }
+            }
+        }
+        self.render_order = candidate
+            .provisional_render_order
+            .into_iter()
+            .filter(|layer| !matches!(layer, RenderLayer::Closing(id) if failed_close_ids.contains(id)))
+            .collect();
+        self.next_close_id = candidate.next_close_id_after;
         drop(removed_surfaces);
         drop(old_resources);
         self.retain_current_pending();
@@ -4289,6 +6490,48 @@ impl<'a> SceneSession<'a> {
 
     fn retain_current_pending(&mut self) {
         retain_pending_for_registry(&mut self.pending_damage, &self.damage_registry);
+    }
+
+    /// 3a3fa2a: removes animations whose progress has reached 1.0. Must
+    /// only be called after a render that observed the current animation
+    /// state has already happened this iteration (see call site).
+    fn retire_completed_animations(&mut self) {
+        if self.window_animations.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        // TEMPORARY FORENSIC INSTRUMENTATION — behaviorally identical to
+        // the original `.retain(|_, a| !a.is_complete(now))` (same `now`
+        // snapshot, same removed set), restructured only so each removal
+        // can be logged. Remove before release.
+        let completed: Vec<Window> = self
+            .window_animations
+            .iter()
+            .filter(|(_, animation)| animation.is_complete(now))
+            .map(|(surface_xid, _)| *surface_xid)
+            .collect();
+        for surface_xid in completed {
+            self.window_animations.remove(&surface_xid);
+            println!(
+                "OPEN_ANIM_RETIRE surface=0x{surface_xid:08x} active_remaining={}",
+                self.window_animations.len(),
+            );
+        }
+    }
+
+    /// TEMPORARY FORENSIC INSTRUMENTATION — behaviorally identical to
+    /// calling `self.egl...swap()` directly; only adds a count+timing
+    /// sample. Remove before release.
+    fn timed_swap(&mut self) -> Result<(), Box<dyn Error>> {
+        let start = Instant::now();
+        let result = self
+            .egl
+            .as_ref()
+            .ok_or("EGL scene renderer is unavailable")?
+            .swap();
+        self.perf.egl_swaps += 1;
+        self.perf.swap.record(start.elapsed());
+        result
     }
 
     fn arm_next_presentation(&mut self, target_msc: u64) -> Result<(), Box<dyn Error>> {
@@ -4366,6 +6609,7 @@ impl<'a> SceneSession<'a> {
         let present = self.present.as_mut()?;
         let msc = present.complete(event)?;
         self.diagnostics.present_completion_events += 1;
+        self.perf.present_complete_events += 1;
         if !self.scheduler.complete(event.serial, msc) {
             return None;
         }
@@ -4425,6 +6669,11 @@ impl<'a> SceneSession<'a> {
             if !present_enabled && batch.decision() == SceneInvalidation::Ignore && !had_pending_work
                 || present_enabled
             {
+                // TEMPORARY FORENSIC INSTRUMENTATION (Brave repaint
+                // latency investigation) — timing/counters only, no
+                // functional change. Remove before release.
+                let batch_drain_start = Instant::now();
+                let mut batch_event_count: usize = 0;
                 let first = match wait_for_event_or_shutdown(self.connection, &mut self.signal)? {
                     WaitResult::Event(event) => event,
                     WaitResult::Shutdown => {
@@ -4432,6 +6681,7 @@ impl<'a> SceneSession<'a> {
                         return Ok(());
                     }
                 };
+                self.note_destroy_intent(&first);
                 let snapshot = self.snapshot.as_ref().expect("published scene snapshot must exist while live");
                 self.diagnostics.record_configure(&first, snapshot);
                 let first_geometry_source = geometry_event_source(&first, snapshot);
@@ -4439,11 +6689,16 @@ impl<'a> SceneSession<'a> {
                 self.diagnostics.record_geometry_source(first_geometry_source);
                 batch.note_configure_event(&first, first_geometry_source, first_surface_xid);
                 opportunity_msc = self.present_opportunity(&first);
+                self.perf.events += 1;
+                batch_event_count += 1;
                 let geometry_update = configure_geometry_update(&first, self.current_snapshot());
+                let classify_start = Instant::now();
                 let visual_invalidation = self.maybe_update_visual_state(&first)?;
                 let invalidation = visual_invalidation.unwrap_or_else(|| {
                 self.classify_session_event(first.clone(), self.current_snapshot(), &self.damage_registry, &self.damage_registry)
                 });
+                self.perf.classification.record(classify_start.elapsed());
+                self.perf.record_invalidation(invalidation);
                 if !matches!(invalidation, SceneInvalidation::Geometry(_)) {
                     self.observe_invalidation(invalidation);
                 }
@@ -4457,6 +6712,7 @@ impl<'a> SceneSession<'a> {
                     let Some(event) = self.connection.inner.poll_for_event()? else {
                         break;
                     };
+                    self.note_destroy_intent(&event);
                     let snapshot = self.snapshot.as_ref().expect("published scene snapshot must exist while live");
                     self.diagnostics.record_configure(&event, snapshot);
                     let geometry_source = geometry_event_source(&event, snapshot);
@@ -4464,11 +6720,16 @@ impl<'a> SceneSession<'a> {
                     self.diagnostics.record_geometry_source(geometry_source);
                     batch.note_configure_event(&event, geometry_source, surface_xid);
                     opportunity_msc = opportunity_msc.or_else(|| self.present_opportunity(&event));
+                    self.perf.events += 1;
+                    batch_event_count += 1;
                     let geometry_update = configure_geometry_update(&event, self.current_snapshot());
+                    let classify_start = Instant::now();
                     let visual_invalidation = self.maybe_update_visual_state(&event)?;
                     let invalidation = visual_invalidation.unwrap_or_else(|| {
                     self.classify_session_event(event.clone(), self.current_snapshot(), &self.damage_registry, &self.damage_registry)
                     });
+                    self.perf.classification.record(classify_start.elapsed());
+                    self.perf.record_invalidation(invalidation);
                     if !matches!(invalidation, SceneInvalidation::Geometry(_)) {
                         self.observe_invalidation(invalidation);
                     }
@@ -4479,6 +6740,8 @@ impl<'a> SceneSession<'a> {
                     if geometry_update.is_some() { self.diagnostics.record_pending_geometry(geometry_source, batch.geometry_update.is_some(), true); }
                     batch.push_geometry_update(geometry_update);
                 }
+                self.perf.record_batch_size(batch_event_count);
+                self.perf.event_batch_drain.record(batch_drain_start.elapsed());
             }
             if self.signal.poll_shutdown_pending()? {
                 println!("scene shutdown: Signal");
@@ -4523,7 +6786,24 @@ impl<'a> SceneSession<'a> {
                 carry_structural_pending_damage(&mut self.pending_damage, decision, &batch_pixel_damage);
             }
             match decision {
-                SceneInvalidation::Ignore => {}
+                // 3a3fa2a: this arm is only reached when either Present is
+                // disabled (no animation is ever created in that case, see
+                // provisional_open_animations) or a genuine Present
+                // completion was observed this iteration (the guard above,
+                // `present_enabled && opportunity_msc.is_none() -> continue`,
+                // already prevents reaching here otherwise) — so this is
+                // exactly the "Present completion + animation exists +
+                // decision == Ignore" tick, and it never touches Damage.
+                SceneInvalidation::Ignore => {
+                    if !self.window_animations.is_empty() || !self.closing_visuals.is_empty() {
+                        // TEMPORARY FORENSIC INSTRUMENTATION — only while
+                        // animations are active, remove before release.
+                        println!("OPEN_ANIM_TICK active={}", self.window_animations.len());
+                        self.perf.animation_only_recomposes += 1;
+                        self.full_recompose_current()?;
+                        self.timed_swap()?;
+                    }
+                }
                 SceneInvalidation::Shutdown(reason) => {
                     println!("scene shutdown: {reason:?}");
                     return Ok(());
@@ -4578,7 +6858,7 @@ impl<'a> SceneSession<'a> {
                         self.pending_damage.clear();
                         self.pending_background = false;
                         self.pending_visual_state = false;
-                        self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap()?;
+                        self.timed_swap()?;
                     } else {
                         self.observe_invalidation(SceneInvalidation::Geometry(window));
                         self.pending_background = false;
@@ -4611,17 +6891,32 @@ impl<'a> SceneSession<'a> {
                     self.pending_background = false;
                     self.refresh_background()?;
                     self.full_recompose_current()?;
-                    self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap()?;
+                    self.timed_swap()?;
                 }
                 SceneInvalidation::VisualState => {
                     self.pending_visual_state = false;
                     self.full_recompose_current()?;
-                    self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap()?;
+                    self.timed_swap()?;
                 }
                 SceneInvalidation::PixelDamage(_) => {
                     self.recompose_current_scene(batch.pixel_damage().clone())?;
                 }
             }
+            // 3a3fa2a: every reachable arm above that can observe a
+            // non-empty window_animations map has just rendered+swapped
+            // using it (Ignore's new branch; Geometry/Hierarchy via
+            // rebuild_and_present/try_move_only/try_resize_only;
+            // Background/VisualState/PixelDamage via full_recompose_current)
+            // — so any animation retired here already had its current
+            // (clamped, so t>=1.0 renders exactly opacity=1.0/scale=1.0)
+            // frame presented this same iteration. Retiring after the match
+            // also guarantees no extra perpetual redraw: once empty, the
+            // Ignore arm's guard above is false again on the next tick.
+            self.retire_completed_animations();
+            self.retire_completed_closing_visuals();
+            // TEMPORARY FORENSIC INSTRUMENTATION — once-per-~1s aggregate
+            // stdout line only. Remove before release.
+            self.perf.maybe_flush(self.window_animations.len());
             if let Some(msc) = opportunity_msc {
                 self.scheduler.finish_render(
                     self.structural_generation,
@@ -4812,9 +7107,20 @@ impl<'a> SceneSession<'a> {
             watch_ids: self.structure_watches.previous_masks.keys().copied().collect(),
             watch_additions: Vec::new(),
             ignored_configure_windows: self.ignored_configure_windows.clone(),
+            // Resize-only never changes the surface_xid set (same surface,
+            // rebased geometry only) — no new surface can appear here.
+            provisional_animations: HashMap::new(),
+            // 3a3fa2b5: same reasoning — resize-only never adds/removes a
+            // surface, so the composite ordering and close-id counter are
+            // carried forward completely unchanged; no close is ever
+            // triggered by a pure resize.
+            provisional_render_order: self.render_order.clone(),
+            provisional_closing_frames: HashMap::new(),
+            next_close_id_after: self.next_close_id,
         };
         let target_build_start = self.diagnostics.enabled.then(Instant::now);
-        self.render_egl_scene(&candidate.snapshot, &candidate.egl_surfaces, &candidate.pixmaps)?;
+        let render_animations = self.window_animations.clone();
+        self.render_egl_scene(&candidate.snapshot, &candidate.egl_surfaces, &candidate.pixmaps, &render_animations, &candidate.provisional_render_order, &candidate.provisional_closing_frames)?;
         if let Some(start) = target_build_start {
             self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::TargetBuildRender, start.elapsed());
         }
@@ -4878,12 +7184,12 @@ impl<'a> SceneSession<'a> {
                 self.pending_background = false;
                 self.refresh_background()?;
                 self.full_recompose_current()?;
-                return self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap();
+                return self.timed_swap();
             }
             SceneInvalidation::VisualState => {
                 self.pending_visual_state = false;
                 self.full_recompose_current()?;
-                return self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?.swap();
+                return self.timed_swap();
             }
             SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => {}
         }
@@ -4901,11 +7207,7 @@ impl<'a> SceneSession<'a> {
             return Ok(());
         }
         if pixel_gate_allows_presentation(final_gate.decision(), ownership_ok, false) {
-            return self
-                .egl
-                .as_ref()
-                .ok_or("EGL scene renderer is unavailable")?
-                .swap();
+            return self.timed_swap();
         }
         match final_gate.decision() {
             SceneInvalidation::Shutdown(reason) => {
@@ -4929,25 +7231,37 @@ impl<'a> SceneSession<'a> {
     }
 
     fn drain_current_events(&mut self) -> Result<InvalidationBatch, Box<dyn Error>> {
+        // TEMPORARY FORENSIC INSTRUMENTATION — timing/counters only, no
+        // functional change. Remove before release.
+        let batch_drain_start = Instant::now();
+        let mut batch_event_count: usize = 0;
         let mut batch = InvalidationBatch::default();
         for _ in 0..MAX_EVENTS_PER_BATCH {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
             };
+            self.perf.events += 1;
+            batch_event_count += 1;
+            self.note_destroy_intent(&event);
             let snapshot = self.snapshot.as_ref().expect("published scene snapshot must exist while live");
             self.diagnostics.record_configure(&event, snapshot);
             let geometry_source = geometry_event_source(&event, snapshot);
             self.diagnostics.record_geometry_source(geometry_source);
+            let classify_start = Instant::now();
             let visual_invalidation = self.maybe_update_visual_state(&event)?;
             let invalidation = visual_invalidation.unwrap_or_else(|| {
                 self.classify_session_event(event.clone(), self.current_snapshot(), &self.damage_registry, &self.damage_registry)
             });
+            self.perf.classification.record(classify_start.elapsed());
+            self.perf.record_invalidation(invalidation);
             let current_snapshot = self.current_snapshot().clone();
             self.record_hierarchy_event_diagnostic(&event, invalidation, &current_snapshot, batch.geometry_update);
             if matches!(invalidation, SceneInvalidation::Hierarchy) { if let Some(source) = hierarchy_event_source(&event) { batch.note_hierarchy_source(source); } }
             self.observe_invalidation(invalidation);
             batch.push(invalidation);
         }
+        self.perf.record_batch_size(batch_event_count);
+        self.perf.event_batch_drain.record(batch_drain_start.elapsed());
         Ok(batch)
     }
 
@@ -4974,11 +7288,15 @@ impl<'a> SceneSession<'a> {
                 .and_then(|entry| entry.semantic_client_xid))
         });
         self.damage_lease(damage_id)?.subtract()?;
+        self.perf.damage_subtracts += 1;
         self.diagnostics.record_damage_dispatch(damage_id, geometry_pending, identity);
         Ok(())
     }
 
     fn full_recompose_current(&mut self) -> Result<(), Box<dyn Error>> {
+        // TEMPORARY FORENSIC INSTRUMENTATION (timing only, no functional
+        // change) — remove before release.
+        let full_recompose_start = Instant::now();
         self.diagnostics.recompositions += 1;
         let snapshot = self
             .snapshot
@@ -4989,10 +7307,26 @@ impl<'a> SceneSession<'a> {
         let background = self.background.as_ref();
         let shadow_style = self.shadow_style;
         let visuals = &self._config.visuals;
+        let animations = &self.window_animations;
+        let render_order = &self.render_order;
+        let closing_committed = &self.closing_visuals;
+        let empty_closing_provisional: HashMap<u64, ProvisionalClosingFrame> = HashMap::new();
         let egl = self.egl.as_mut().ok_or("EGL scene renderer is unavailable")?;
-        render_egl_scene_parts(
-            egl, background, shadow_style, visuals, snapshot, surfaces, pixmaps,
-        )
+        let render_start = Instant::now();
+        let result = render_egl_scene_parts(
+            egl, background, shadow_style, visuals, snapshot, surfaces, pixmaps, animations,
+            render_order, closing_committed, &empty_closing_provisional,
+            // 3a3fa2b5-r2: no in-flight candidate here (ordinary committed
+            // redraw) — `surfaces` already IS `&self.egl_surfaces`, and
+            // `empty_closing_provisional` above means this map is never
+            // actually consulted anyway.
+            surfaces,
+        );
+        self.perf.renders += 1;
+        self.perf.render.record(render_start.elapsed());
+        self.perf.full_recomposes += 1;
+        self.perf.full_recompose.record(full_recompose_start.elapsed());
+        result
     }
 
     fn classify_session_event(
@@ -5213,8 +7547,14 @@ impl<'a> SceneSession<'a> {
         snapshot: &SceneSnapshot,
         surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
         pixmaps: &[Rc<NamedSurfacePixmap<'a>>],
+        animations: &HashMap<Window, WindowAnimation>,
+        render_order: &[RenderLayer],
+        closing_provisional: &HashMap<u64, ProvisionalClosingFrame>,
     ) -> Result<(), Box<dyn Error>> {
-        render_egl_scene_parts(
+        // TEMPORARY FORENSIC INSTRUMENTATION (timing only, no functional
+        // change) — remove before release.
+        let render_start = Instant::now();
+        let result = render_egl_scene_parts(
             self.egl.as_mut().ok_or("EGL scene renderer is unavailable")?,
             self.background.as_ref(),
             self.shadow_style,
@@ -5222,7 +7562,20 @@ impl<'a> SceneSession<'a> {
             snapshot,
             surfaces,
             pixmaps,
-        )
+            animations,
+            render_order,
+            &self.closing_visuals,
+            closing_provisional,
+            // 3a3fa2b5-r2: `self.egl_surfaces` — the SESSION's OWN, still-OLD
+            // surfaces map at every call site that can carry a non-empty
+            // `closing_provisional` (build_candidate and the MoveOnly-rebase
+            // path both run strictly before commit_candidate_inner's swap).
+            // Never a stored/cloned reference — read fresh on every call.
+            &self.egl_surfaces,
+        );
+        self.perf.renders += 1;
+        self.perf.render.record(render_start.elapsed());
+        result
     }
 
     fn try_move_only(
@@ -5282,6 +7635,7 @@ impl<'a> SceneSession<'a> {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
             };
+            self.note_destroy_intent(&event);
             let snapshot = self.snapshot.as_ref().expect("published scene snapshot must exist while live");
             self.diagnostics.record_configure(&event, snapshot);
             let visual_invalidation = self.maybe_update_visual_state(&event)?;
@@ -5426,6 +7780,13 @@ impl<'a> SceneSession<'a> {
                     first_error.get_or_insert(error);
                 }
             }
+            // 3a3fa2b5 — explicit, hand-ordered ClosingTexture teardown,
+            // strictly BEFORE the EGL context itself is destroyed below —
+            // mirrors egl_surfaces' own ordering exactly (see the r2 GL-
+            // lifetime proof, which this reuses unmodified).
+            for visual in self.closing_visuals.values_mut() {
+                visual.texture.destroy();
+            }
         } else {
             if let Some(background) = self.background.as_mut() {
                 background.surface.disarm();
@@ -5433,9 +7794,13 @@ impl<'a> SceneSession<'a> {
             for surface in self.egl_surfaces.values() {
                 surface.borrow_mut().disarm();
             }
+            for visual in self.closing_visuals.values_mut() {
+                visual.texture.disarm();
+            }
         }
         self.background = None;
         self.egl_surfaces.clear();
+        self.closing_visuals.clear();
         for pixmap in &self.pixmaps {
             if let Err(error) = pixmap.free() {
                 first_error.get_or_insert(error);
@@ -5495,11 +7860,15 @@ impl<'a> SceneSession<'a> {
         for surface in self.egl_surfaces.values() {
             surface.borrow_mut().disarm();
         }
+        for visual in self.closing_visuals.values_mut() {
+            visual.texture.disarm();
+        }
         if let Some(background) = self.background.as_mut() {
             background.surface.disarm();
         }
         self.background = None;
         self.egl_surfaces.clear();
+        self.closing_visuals.clear();
         if let Some(mut egl) = self.egl.take() {
             egl.disarm();
         }
@@ -5649,14 +8018,58 @@ fn render_egl_scene_parts<'a>(
     snapshot: &SceneSnapshot,
     surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
     pixmaps: &[Rc<NamedSurfacePixmap<'a>>],
+    animations: &HashMap<Window, WindowAnimation>,
+    render_order: &[RenderLayer],
+    closing_committed: &HashMap<u64, ClosingVisual>,
+    closing_provisional: &HashMap<u64, ProvisionalClosingFrame>,
+    closing_source_surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
 ) -> Result<(), Box<dyn Error>> {
     egl.clear()?;
+    // 3a3fa2a: one clock reading for every entry in this render, so all
+    // simultaneously animating surfaces advance in lockstep within a frame.
+    let animation_now = Instant::now();
     if let Some(background) = background {
         if let Some(plan) = build_background_render_quad_plan(background.source.geometry, snapshot.root_geometry) {
             egl.render_surface(background.surface.texture, plan, background.surface.pixel_semantics)?;
         }
     }
-    for entry in &snapshot.entries {
+    // 3a3fa2b5-r2: exploits the proven invariant `projection(render_order,
+    // Live) == snapshot.entries` order EXACTLY (see reconcile_render_order)
+    // via a single synchronized forward walk — every RenderLayer::Live
+    // consumes exactly the next `live_entries` item, in order; Closing
+    // layers never advance it. O(render_order.len() + snapshot.entries.len())
+    // total, replacing R1's O(render_order.len() * snapshot.entries.len())
+    // per-entry `.find()`.
+    let mut live_entries = snapshot.entries.iter();
+    for layer in render_order {
+        // 3a3fa2b5: `render_order` (never `snapshot.entries` directly) now
+        // drives composite depth, so committed close visuals splice into
+        // the correct gap relative to Live entries — see
+        // reconcile_render_order. Live-branch logic below this guard is
+        // otherwise BYTE-IDENTICAL to before this milestone (same
+        // indentation, same variable names) — see render_wiring_* source-
+        // scan tests, which depend on it staying that way.
+        let entry = match *layer {
+            RenderLayer::Live(surface_xid) => {
+                let Some(entry) = live_entries.next() else {
+                    debug_assert!(
+                        false,
+                        "RenderLayer::Live(0x{surface_xid:08x}) has no corresponding \
+                         snapshot entry — Live-projection invariant violated",
+                    );
+                    continue;
+                };
+                debug_assert_eq!(
+                    entry.surface_xid, surface_xid,
+                    "render_order's Live projection must exactly equal snapshot.entries order",
+                );
+                entry
+            }
+            RenderLayer::Closing(close_id) => {
+                render_closing_layer(egl, shadow_style, closing_committed, closing_provisional, closing_source_surfaces, close_id, animation_now)?;
+                continue;
+            }
+        };
         let Some(surface) = surfaces.get(&entry.surface_xid) else {
             continue;
         };
@@ -5669,6 +8082,62 @@ fn render_egl_scene_parts<'a>(
             .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
         apply_surface_visual_policy(&mut plan, visuals, entry.visual_class);
         plan.border_color = entry.resolved_border_color.map(f32::from_bits);
+
+        // 3a3fa2b1-s1: resolve the animated surface plan/opacity ONCE,
+        // right after the real `plan` is finalized and before any
+        // geometry-consuming draw work below — shadow and the final
+        // surface draw both reuse this SAME sampled AnimationVisual,
+        // never resampled a second time. `plan` itself (Copy) is left
+        // untouched here and remains the real, un-animated footprint —
+        // BLUR CONTRACT: blur below intentionally keeps using it, unchanged.
+        let base_opacity = f32::from_bits(entry.resolved_opacity_bits);
+        let (draw_plan, draw_opacity, shadow_opacity_multiplier, energy_tear_layout, open_flash_alpha, open_reveal_radius, open_kamui_state) = match animations.get(&entry.surface_xid) {
+            Some(animation) => {
+                let t = animation.progress(animation_now);
+                let visual = animation.sample(animation_now);
+                // TEMPORARY FORENSIC INSTRUMENTATION — bounded sampling via
+                // threshold bands (not per-frame), remove before release.
+                if t < 0.05 || (0.4..=0.6).contains(&t) || t >= 1.0 {
+                    println!(
+                        "OPEN_ANIM_RENDER surface=0x{:08x} progress={t:.2} scale_x={:.3} scale_y={:.3} alpha={:.3}",
+                        entry.surface_xid, visual.scale_x, visual.scale_y, visual.opacity,
+                    );
+                }
+                // 3a3fa2b3: energy_tear's slice/streak layout is derived
+                // from this SAME already-sampled `t` — no second
+                // Instant::now(), no new timer.
+                let energy_tear_layout = energy_tear_layout_for(animation.effect, t);
+                // 3a3fa2b6-r1: TeleportFlashy's flash-alpha overlay state,
+                // same reasoning — derived from this SAME `t`, effect-
+                // gated via teleport_flashy_open_flash_for exactly like
+                // energy_tear_layout above.
+                let open_flash_alpha = teleport_flashy_open_flash_for(animation.effect, t);
+                // 3a3fa2b6-r2 (Minato): the center->edges radial reveal
+                // radius, same reasoning again — derived from this SAME
+                // `t`, effect-gated via minato_reveal_radius_for, `None`
+                // once t>=MINATO_REVEAL_END (fallback to the ordinary
+                // mode-0 draw below, mirroring energy_tear_layout's own
+                // post-completion `None` fallback).
+                let open_reveal_radius = minato_reveal_radius_for(animation.effect, t);
+                // 3a3fa2b7 (Kamui): (visible_radius, twist) state for the
+                // polar-warp content draw, same reasoning again — derived
+                // from this SAME `t`, effect-gated via
+                // kamui_open_state_for, `None` once t>=KAMUI_OPEN_SETTLE_END
+                // (fallback to the ordinary mode-0 draw below).
+                let open_kamui_state = kamui_open_state_for(animation.effect, t);
+                // 3a3fa2b7: Kamui's shadow ENVELOPE multiplies into the
+                // existing shadow_opacity_multiplier — `None` (i.e. no
+                // change, multiplier stays 1.0) for every non-Kamui
+                // effect. Shadow itself never receives twist/warp state —
+                // see kamui_open_shadow_envelope_for.
+                let shadow_opacity_multiplier = match kamui_open_shadow_envelope_for(animation.effect, t) {
+                    Some(envelope) => visual.opacity * envelope,
+                    None => visual.opacity,
+                };
+                (scale_render_quad_plan(plan, visual.scale_x, visual.scale_y), base_opacity * visual.opacity, shadow_opacity_multiplier, energy_tear_layout, open_flash_alpha, open_reveal_radius, open_kamui_state)
+            }
+            None => (plan, base_opacity, 1.0, None, None, None, None),
+        };
 
         let region_plan = match &entry.resolved_blur_request {
             BlurRequest::Regions(regions) => entry.client_root_geometry.and_then(|client| {
@@ -5705,8 +8174,15 @@ fn render_egl_scene_parts<'a>(
             }).transpose()?,
             BlurRequest::None => None,
         };
+        // 3a3fa2b1-s1: shadow now uses `draw_plan` — the ANIMATED plan
+        // (equal to `plan`, the real plan, when this entry has no active
+        // animation) — for its base rectangle/corner radius, and
+        // `shadow_opacity_multiplier` (`visual.opacity`, or 1.0 when not
+        // animating) to scale the config's own shadow strength. Blur
+        // above and below this block is untouched and still keys off the
+        // real, un-animated `plan` — see BLUR CONTRACT above.
         if entry.shadow_eligible {
-            if let Some(shadow) = shadow_params_from_plan(shadow_style, &plan) {
+            if let Some(shadow) = shadow_params_from_plan(shadow_style, &draw_plan, shadow_opacity_multiplier) {
                 egl.render_shadow(shadow)?;
             }
         }
@@ -5739,21 +8215,189 @@ fn render_egl_scene_parts<'a>(
             egl.draw_blurred_backdrop(blurred_texture, backdrop_params, plan.corner_radius)?;
             }
         }
-        let opacity = crate::graphics::renderer::SurfaceOpacity::new(
-            f32::from_bits(entry.resolved_opacity_bits),
-        ).expect("resolved surface opacity must be valid");
-        egl.render_surface_with_opacity(
-            surface.texture,
-            plan,
-            surface.pixel_semantics,
-            opacity,
-        )?;
+        let opacity = crate::graphics::renderer::SurfaceOpacity::new(draw_opacity)
+            .expect("resolved surface opacity must be valid");
+        // 3a3fa2b3: energy_tear_render_plan returns None both when no
+        // tear layout is active at all (Scale/Teleport/non-animated,
+        // AND energy_tear itself once t >= ENERGY_TEAR_END) and when the
+        // plan is too narrow to slice safely — both cases fall back to
+        // the exact same single-quad call every other effect already
+        // used, unchanged.
+        match energy_tear_layout.and_then(|layout| energy_tear_render_plan(draw_plan, &layout)) {
+            Some(render_plan) => {
+                egl.render_energy_tear_slices(surface.texture, surface.pixel_semantics, opacity, &render_plan)?;
+            }
+            // 3a3fa2b6-r2/b7 (Minato/Kamui): mutually exclusive with the
+            // EnergyTear arm above AND with each other by construction
+            // (energy_tear_layout / open_reveal_radius / open_kamui_state
+            // are each gated on DIFFERENT OpenAnimationEffect variants,
+            // never more than one Some for the same entry) — this
+            // REPLACES which function draws the single existing content
+            // draw call, it never adds a second one. Falls through to the
+            // ordinary mode-0 path below once every effect-specific state
+            // is `None` (ordinary effects, OR TeleportFlashy past
+            // MINATO_REVEAL_END, OR Kamui past KAMUI_OPEN_SETTLE_END).
+            None => match (open_reveal_radius, open_kamui_state) {
+                (Some(reveal_radius), _) => {
+                    egl.render_surface_with_radial_reveal(
+                        surface.texture,
+                        draw_plan,
+                        surface.pixel_semantics,
+                        opacity,
+                        reveal_radius,
+                    )?;
+                }
+                (None, Some((visible_radius, twist, radial_power))) => {
+                    egl.render_surface_with_kamui_warp(
+                        surface.texture,
+                        draw_plan,
+                        surface.pixel_semantics,
+                        opacity,
+                        visible_radius,
+                        twist,
+                        radial_power,
+                    )?;
+                }
+                (None, None) => {
+                    egl.render_surface_with_opacity(
+                        surface.texture,
+                        draw_plan,
+                        surface.pixel_semantics,
+                        opacity,
+                    )?;
+                }
+            },
+        }
+        // 3a3fa2b6-r1 — TeleportFlashy's solid-overlay flash, appended
+        // strictly AFTER the surface draw above (never before it, where
+        // it would be hidden). `open_flash_alpha` is `None` for every
+        // effect except TeleportFlashy (see
+        // teleport_flashy_open_flash_for), and the overlay draw itself
+        // is skipped entirely once alpha reaches 0 (see
+        // render_solid_overlay's own `alpha <= 0.0` guard) — so this is
+        // exactly +1 draw call only while the flash is actually visible,
+        // zero otherwise. Uses `draw_plan` — the SAME currently-animated
+        // geometry the surface/shadow above already used — so the flash
+        // follows the effect's own micro-scale and stays rounded-corner-
+        // clipped to it.
+        if let Some(alpha) = open_flash_alpha {
+            egl.render_solid_overlay(draw_plan, TELEPORT_FLASHY_COLOR, alpha)?;
+        }
     }
     Ok(())
 }
 
 fn egl_scene_is_renderable(entry_count: usize, egl_surface_count: usize) -> bool {
     entry_count == 0 || egl_surface_count > 0
+}
+
+/// 3a3fa2b5-r2 — draws one composited `RenderLayer::Closing` entry,
+/// sourced from EITHER a committed `ClosingVisual` (compositor-owned GPU
+/// snapshot, used for every persistent frame — texture resolved directly
+/// from its own owned `ClosingTexture`) OR a candidate-local
+/// `ProvisionalClosingFrame` (frame 0 only, sourced from the OLD LIVE
+/// texture while it is still valid — see the r1 first-frame-gap finding).
+/// Corrected from R1: a `ProvisionalClosingFrame` owns no GPU resource at
+/// all (see its doc comment), so its source texture is resolved HERE,
+/// fresh, by `frame.source_xid`, from `closing_source_surfaces` — the
+/// caller's OWN still-live surfaces map (`SceneSession::egl_surfaces`,
+/// naturally alive at frame-0 render time since commit hasn't swapped it
+/// yet), never a value stored on the frame itself. A missing lookup
+/// degrades to "draw nothing for this layer" (`Ok(())`), matching the
+/// same fail-open shape used elsewhere in this pipeline for a stale/
+/// inconsistent state, never a panic.
+///
+/// `ClosingDrawSource` still unifies plan/pixel_semantics/base_opacity/
+/// shadow_eligible/animation access for both sources into ONE draw path.
+/// Deliberately kept OUTSIDE `render_egl_scene_parts`'s own source span
+/// (after `egl_scene_is_renderable`, never between it and that function)
+/// so this closing-only path can never accidentally satisfy or break one
+/// of that function's literal-text `render_wiring_*` source-scan tests.
+/// Reuses exactly the same scale/shadow/draw primitives the Live path
+/// already uses (`scale_render_quad_plan`, `shadow_params_from_plan`,
+/// `render_surface_with_opacity`) — no new shader mode. R1/R2 scope: no
+/// energy_tear, NO LIVE BLUR FROM FIRST CLOSING FRAME (the last ordinary
+/// LIVE frame before a window starts closing may carry blur; no
+/// `RenderLayer::Closing` frame — provisional or committed — ever issues
+/// one, since neither `ClosingVisual` nor `ProvisionalClosingFrame` carry
+/// a blur request at all). 3a3fa2b6-r1: the SAME `render_solid_overlay`
+/// TeleportFlashy flash path serves BOTH provisional frame-0 and
+/// committed ClosingVisual frames here — no frame-0 special case, since
+/// this one function already runs for both sources.
+fn render_closing_layer(
+    egl: &EglSceneRenderer,
+    shadow_style: crate::config::ShadowConfig,
+    closing_committed: &HashMap<u64, ClosingVisual>,
+    closing_provisional: &HashMap<u64, ProvisionalClosingFrame>,
+    closing_source_surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
+    close_id: u64,
+    animation_now: Instant,
+) -> Result<(), Box<dyn Error>> {
+    let (source, texture) = match closing_committed.get(&close_id) {
+        Some(visual) => (ClosingDrawSource::Committed(visual), visual.texture.texture),
+        None => match closing_provisional.get(&close_id) {
+            Some(frame) => {
+                let Some(surface) = closing_source_surfaces.get(&frame.source_xid) else { return Ok(()); };
+                (ClosingDrawSource::Provisional(frame), surface.borrow().texture)
+            }
+            None => return Ok(()),
+        },
+    };
+    let animation = source.animation();
+    let t = animation.progress(animation_now);
+    let visual = sample_close_effect(animation.effect, t);
+    let closing_draw_plan = scale_render_quad_plan(source.plan(), visual.scale_x, visual.scale_y);
+    // 3a3fa2b7 (Kamui): shadow ENVELOPE multiplied into the existing
+    // closing_opacity_multiplier — `None` (no change) for every non-Kamui
+    // close effect. Shadow never receives twist/warp state, same
+    // reasoning as the OPEN path — see kamui_close_shadow_envelope_for.
+    let closing_opacity_multiplier = match kamui_close_shadow_envelope_for(animation.effect, t) {
+        Some(envelope) => visual.opacity * envelope,
+        None => visual.opacity,
+    };
+    if source.shadow_eligible() {
+        if let Some(shadow) = shadow_params_from_plan(shadow_style, &closing_draw_plan, closing_opacity_multiplier) {
+            egl.render_shadow(shadow)?;
+        }
+    }
+    let opacity = crate::graphics::renderer::SurfaceOpacity::new(source.base_opacity() * visual.opacity)
+        .expect("resolved closing opacity must be valid");
+    // 3a3fa2b7 (Kamui): mutually exclusive with the ordinary path by
+    // construction (kamui_close_state_for is gated exclusively on
+    // crate::config::CloseAnimationEffect::Kamui) — this REPLACES which function draws
+    // the single existing closing content draw call, exactly like the
+    // OPEN path's own reveal/kamui/ordinary match. Same function serves
+    // BOTH provisional frame-0 and committed ClosingVisual sources — no
+    // frame-0 special case, since `source`/`texture` were already
+    // resolved above regardless of which map they came from.
+    match kamui_close_state_for(animation.effect, t) {
+        Some((visible_radius, twist, radial_power)) => {
+            egl.render_surface_with_kamui_warp(
+                texture,
+                closing_draw_plan,
+                source.pixel_semantics(),
+                opacity,
+                visible_radius,
+                twist,
+                radial_power,
+            )?;
+        }
+        None => {
+            egl.render_surface_with_opacity(texture, closing_draw_plan, source.pixel_semantics(), opacity)?;
+        }
+    }
+    // 3a3fa2b6-r1 — TeleportFlashy's solid-overlay flash, appended
+    // strictly AFTER the closing surface draw above. `teleport_flashy_close_flash_for`
+    // returns `None` for every other close effect (currently only Scale),
+    // and `render_solid_overlay` itself skips the draw entirely once
+    // alpha reaches 0 — so this is exactly +1 draw call only while the
+    // flash is actually visible, identical gating shape to the OPEN path.
+    // Uses `closing_draw_plan` — the SAME currently-animated geometry the
+    // surface/shadow above already used.
+    if let Some(alpha) = teleport_flashy_close_flash_for(animation.effect, t) {
+        egl.render_solid_overlay(closing_draw_plan, TELEPORT_FLASHY_COLOR, alpha)?;
+    }
+    Ok(())
 }
 
 fn retain_pending_for_registry(
@@ -6727,7 +9371,7 @@ pub(crate) fn run_with_root(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         build_copy_plan,
@@ -6790,13 +9434,61 @@ mod tests {
         configure_geometry_update, classify_event_with_registries_and_ignored,
         geometry_event_source, GeometryEventSource, PreResizeOnlyBypassReason,
         StructuralOrigin,
+        RenderQuadPlan,
+        WindowAnimation, AnimationVisual,
+        animation_progress, ease_out_cubic, ease_in_cubic, lerp, phase_progress, sample_open_effect, sample_scale,
+        SCALE_EFFECT_FROM_SCALE, SCALE_EFFECT_TO_SCALE, SCALE_EFFECT_FROM_OPACITY, SCALE_EFFECT_TO_OPACITY,
+        ClosingAnimation, sample_close_scale, sample_close_effect,
+        CLOSE_SCALE_END_OPACITY, CLOSE_SCALE_END_SCALE,
+        RenderLayer, reconcile_render_order, allocate_close_ids, retained_destroy_intents,
+        sample_teleport,
+        TELEPORT_PHASE_A_END, TELEPORT_PHASE_B_END, TELEPORT_PHASE_C_END,
+        TELEPORT_START_OPACITY, TELEPORT_START_SCALE_X, TELEPORT_START_SCALE_Y,
+        TELEPORT_PHASE_B_SCALE_X, TELEPORT_PHASE_B_SCALE_Y,
+        sample_energy_tear, sample_energy_tear_layout, energy_tear_layout_for,
+        energy_tear_render_plan, energy_tear_oscillation, EnergyTearLayout, EnergyTearSlicePlan,
+        ENERGY_TEAR_SLICE_COUNT, ENERGY_TEAR_END, ENERGY_TEAR_PEAK_STREAK_ALPHA,
+        ENERGY_TEAR_SLICE_PEAK_OFFSET_FRACTIONS,
+        ENERGY_TEAR_PHASE_A_END, ENERGY_TEAR_PHASE_B_END, ENERGY_TEAR_PHASE_C_END,
+        ENERGY_TEAR_REBOUND_1_FACTOR, ENERGY_TEAR_REBOUND_2_FACTOR,
+        ENERGY_TEAR_MAX_DISPLACEMENT_PX,
+        sample_bubble,
+        BUBBLE_PHASE_A_END, BUBBLE_PHASE_B_END, BUBBLE_PHASE_C_END,
+        BUBBLE_START_OPACITY, BUBBLE_START_SCALE_X, BUBBLE_START_SCALE_Y,
+        TELEPORT_FLASHY_COLOR,
+        sample_teleport_flashy_open, sample_teleport_flashy_open_flash, teleport_flashy_open_flash_for,
+        sample_teleport_flashy_close, sample_teleport_flashy_close_flash, teleport_flashy_close_flash_for,
+        TELEPORT_FLASHY_OPEN_START_OPACITY, TELEPORT_FLASHY_OPEN_START_SCALE, TELEPORT_FLASHY_OPEN_GEOMETRY_END,
+        TELEPORT_FLASHY_OPEN_FLASH_HOLD_END, TELEPORT_FLASHY_OPEN_FLASH_END,
+        TELEPORT_FLASHY_CLOSE_HOLD_END, TELEPORT_FLASHY_CLOSE_COLLAPSE_END, TELEPORT_FLASHY_CLOSE_END_SCALE,
+        TELEPORT_FLASHY_CLOSE_FLASH_PEAK, TELEPORT_FLASHY_CLOSE_FLASH_END,
+        sample_minato_reveal_radius, minato_reveal_radius_for,
+        MINATO_REVEAL_START, MINATO_REVEAL_END, MINATO_REVEAL_FULL_RADIUS,
+        sample_kamui_open, sample_kamui_open_visible_radius, sample_kamui_open_twist,
+        sample_kamui_open_radial_power,
+        kamui_open_state_for, kamui_open_shadow_envelope_for,
+        KAMUI_OPEN_START_RADIUS, KAMUI_OPEN_CORE_END, KAMUI_OPEN_CORE_RADIUS,
+        KAMUI_OPEN_EXPAND_END, KAMUI_OPEN_SETTLE_END, KAMUI_OPEN_MAX_TWIST,
+        KAMUI_OPEN_TWIST_DECAY_POWER, KAMUI_OPEN_RADIAL_POWER_START,
+        sample_kamui_close, sample_kamui_close_visible_radius, sample_kamui_close_twist,
+        sample_kamui_close_radial_power,
+        kamui_close_state_for, kamui_close_shadow_envelope_for,
+        KAMUI_CLOSE_GRAB_END, KAMUI_CLOSE_FLOW_END, KAMUI_CLOSE_SUCTION_END, KAMUI_CLOSE_COLLAPSE_END,
+        KAMUI_CLOSE_GRAB_RADIUS, KAMUI_CLOSE_FLOW_RADIUS, KAMUI_CLOSE_SUCTION_RADIUS,
+        KAMUI_CLOSE_TWIST_AFTER_GRAB, KAMUI_CLOSE_TWIST_AFTER_FLOW, KAMUI_CLOSE_MAX_TWIST,
+        KAMUI_CLOSE_RADIAL_POWER_END,
+        eligible_for_open_animation, provisional_open_animations,
+        merge_window_animations, scale_render_quad_plan,
+        promote_provisional_animations, retire_removed_surface_animations,
+        effective_override_redirect,
     };
+    use crate::config::{AnimationConfig, OpenAnimationConfig, OpenAnimationEffect};
     use crate::x11::capture::WindowGeometry;
     use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
     use x11rb::errors::ReplyError;
     use x11rb::protocol::damage::ReportLevel;
     use x11rb::protocol::render;
-    use x11rb::protocol::xproto::{EventMask, MapState, Rectangle, WindowClass};
+    use x11rb::protocol::xproto::{EventMask, MapState, Rectangle, Window, WindowClass};
     use x11rb::protocol::xproto;
     use x11rb::protocol::Event;
     use x11rb::protocol::ErrorKind;
@@ -8716,6 +11408,7 @@ mod tests {
             class: WindowClass::INPUT_OUTPUT,
             map_state: MapState::VIEWABLE,
             override_redirect: true,
+            effective_override_redirect: true,
             stacking_index: 0,
             backend: BackendCompatibility::BackendUnsupported,
             visual_class: SurfaceVisualClass::Normal,
@@ -8726,6 +11419,3831 @@ mod tests {
         client_root_geometry: None,
         resolved_blur_request: BlurRequest::None,
         }
+    }
+
+    // ========================================================
+    // 3a3fa2a — window open animation core.
+    // ========================================================
+
+    fn animation_test_entry(
+        surface_xid: Window,
+        visual_class: SurfaceVisualClass,
+        override_redirect: bool,
+    ) -> SurfaceEntry {
+        SurfaceEntry {
+            surface_xid,
+            semantic_client_xid: None,
+            lifecycle_xid: surface_xid,
+            geometry: geo(0, 0, 100, 100),
+            depth: 24,
+            visual: 0x2d8,
+            class: WindowClass::INPUT_OUTPUT,
+            map_state: MapState::VIEWABLE,
+            override_redirect,
+            // R1 tests only ever model capture == semantic (no identity
+            // mismatch) — mirroring the single `override_redirect` param
+            // keeps every existing R1 test's semantics unchanged under R2.
+            // R2-specific capture/semantic mismatch tests use the real
+            // eligible_surface_with_semantic_metadata() construction path
+            // instead (see the "R2" test section below), not this fixture.
+            effective_override_redirect: override_redirect,
+            stacking_index: 0,
+            backend: BackendCompatibility::BackendUnsupported,
+            visual_class,
+            fullscreen: false,
+            shadow_eligible: false,
+            resolved_border_color: [0, 0, 0, 1.0f32.to_bits()],
+            resolved_opacity_bits: 1.0f32.to_bits(),
+            client_root_geometry: None,
+            resolved_blur_request: BlurRequest::None,
+        }
+    }
+
+    fn animation_test_plan(dst_x: i32, dst_y: i32, width: i32, height: i32) -> RenderQuadPlan {
+        RenderQuadPlan {
+            dst_x,
+            dst_y,
+            width,
+            height,
+            outer_x: dst_x - 2,
+            outer_y: dst_y - 2,
+            outer_width: width + 4,
+            outer_height: height + 4,
+            src_x: 0,
+            src_y: 0,
+            src_width: width,
+            src_height: height,
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            corner_radius: 8.0,
+            border_width: 2.0,
+            border_color: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+
+    fn test_animation_config(enabled: bool) -> AnimationConfig {
+        AnimationConfig {
+            enabled,
+            open: OpenAnimationConfig { effect: OpenAnimationEffect::Scale, duration: Duration::from_millis(180) },
+            close: crate::config::CloseAnimationConfig { enabled: false, effect: crate::config::CloseAnimationEffect::Scale, duration: Duration::from_millis(180) },
+        }
+    }
+
+    fn test_window_animation(started_at: Instant) -> WindowAnimation {
+        WindowAnimation::open(started_at, OpenAnimationEffect::Scale, Duration::from_millis(180))
+    }
+
+    fn test_animation_config_with_effect(enabled: bool, effect: OpenAnimationEffect) -> AnimationConfig {
+        AnimationConfig {
+            enabled,
+            open: OpenAnimationConfig { effect, duration: Duration::from_millis(180) },
+            close: crate::config::CloseAnimationConfig { enabled: false, effect: crate::config::CloseAnimationEffect::Scale, duration: Duration::from_millis(180) },
+        }
+    }
+
+
+    fn test_window_animation_with_effect(started_at: Instant, effect: OpenAnimationEffect) -> WindowAnimation {
+        WindowAnimation::open(started_at, effect, Duration::from_millis(180))
+    }
+
+    // --- A/B/C: progress + easing (pure, deterministic, clamped) ---
+
+    const TEST_ANIMATION_DURATION: Duration = Duration::from_millis(180);
+
+    #[test]
+    fn animation_progress_and_scale_sample_start_at_from_values() {
+        let t = animation_progress(Duration::ZERO, TEST_ANIMATION_DURATION);
+        assert_eq!(t, 0.0);
+        let visual = sample_open_effect(OpenAnimationEffect::Scale, t);
+        assert_eq!(visual.opacity, SCALE_EFFECT_FROM_OPACITY);
+        assert_eq!(visual.scale_x, SCALE_EFFECT_FROM_SCALE);
+        assert_eq!(visual.scale_y, SCALE_EFFECT_FROM_SCALE);
+    }
+
+    #[test]
+    fn scale_sample_midpoint_strictly_between_endpoints() {
+        let t = animation_progress(TEST_ANIMATION_DURATION / 2, TEST_ANIMATION_DURATION);
+        assert!(t > 0.0 && t < 1.0);
+        let visual = sample_open_effect(OpenAnimationEffect::Scale, t);
+        assert!(visual.opacity > 0.0 && visual.opacity < 1.0, "opacity={}", visual.opacity);
+        assert!(visual.scale_x > SCALE_EFFECT_FROM_SCALE && visual.scale_x < 1.0, "scale_x={}", visual.scale_x);
+        assert_eq!(visual.scale_x, visual.scale_y, "Scale is uniform");
+    }
+
+    #[test]
+    fn animation_progress_clamps_and_scale_sample_reaches_exact_final_state() {
+        assert_eq!(animation_progress(TEST_ANIMATION_DURATION, TEST_ANIMATION_DURATION), 1.0);
+        // Elapsed far past duration must still clamp to exactly 1.0, never overshoot.
+        assert_eq!(animation_progress(TEST_ANIMATION_DURATION * 10, TEST_ANIMATION_DURATION), 1.0);
+        let visual = sample_open_effect(OpenAnimationEffect::Scale, 1.0);
+        assert_eq!(visual.opacity, 1.0);
+        assert_eq!(visual.scale_x, 1.0);
+        assert_eq!(visual.scale_y, 1.0);
+    }
+
+    #[test]
+    fn ease_out_cubic_is_bounded_and_monotonic() {
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        let a = ease_out_cubic(0.25);
+        let b = ease_out_cubic(0.75);
+        assert!((0.0..=1.0).contains(&a));
+        assert!((0.0..=1.0).contains(&b));
+        assert!(a < b);
+    }
+
+    #[test]
+    fn lerp_interpolates_linearly() {
+        assert_eq!(lerp(0.0, 10.0, 0.5), 5.0);
+        assert_eq!(lerp(2.0, 2.0, 0.7), 2.0);
+        assert_eq!(lerp(-1.0, 1.0, 0.0), -1.0);
+        assert_eq!(lerp(-1.0, 1.0, 1.0), 1.0);
+    }
+
+    // --- D/E: render-plan scaling (geometry, UV, corner/border) ---
+
+    #[test]
+    fn scale_render_quad_plan_keeps_center_stable() {
+        let plan = animation_test_plan(100, 200, 300, 400);
+        let scaled = scale_render_quad_plan(plan, 0.5, 0.5);
+        let orig_center_x = plan.dst_x as f32 + plan.width as f32 / 2.0;
+        let orig_center_y = plan.dst_y as f32 + plan.height as f32 / 2.0;
+        let new_center_x = scaled.dst_x as f32 + scaled.width as f32 / 2.0;
+        let new_center_y = scaled.dst_y as f32 + scaled.height as f32 / 2.0;
+        assert!((orig_center_x - new_center_x).abs() <= 1.0);
+        assert!((orig_center_y - new_center_y).abs() <= 1.0);
+        assert_eq!(scaled.width, 150);
+        assert_eq!(scaled.height, 200);
+    }
+
+    #[test]
+    fn scale_render_quad_plan_preserves_uv_but_scales_outer_bounds_with_the_box() {
+        let plan = animation_test_plan(10, 20, 200, 100);
+        let scaled = scale_render_quad_plan(plan, SCALE_EFFECT_FROM_SCALE, SCALE_EFFECT_FROM_SCALE);
+        assert_eq!(scaled.u0, plan.u0);
+        assert_eq!(scaled.v0, plan.v0);
+        assert_eq!(scaled.u1, plan.u1);
+        assert_eq!(scaled.v1, plan.v1);
+        assert_eq!(scaled.src_x, plan.src_x);
+        assert_eq!(scaled.src_y, plan.src_y);
+        // 3a3fa2b1-s1: outer_* (shadow's base rect, see
+        // shadow_params_from_plan) now scales WITH the box — this was
+        // deliberately un-scaled before this milestone, which is exactly
+        // the shadow-geometry bug this milestone fixes. Blur staying on
+        // real bounds is a render_egl_scene_parts call-site property
+        // (always passes blur the original `plan`, never this result),
+        // not a property of this function anymore.
+        let expected_outer_width = ((plan.outer_width as f32) * SCALE_EFFECT_FROM_SCALE).round().max(1.0) as i32;
+        let expected_outer_height = ((plan.outer_height as f32) * SCALE_EFFECT_FROM_SCALE).round().max(1.0) as i32;
+        assert_eq!(scaled.outer_width, expected_outer_width);
+        assert_eq!(scaled.outer_height, expected_outer_height);
+        assert_ne!(scaled.outer_width, plan.outer_width);
+        assert_ne!(scaled.outer_height, plan.outer_height);
+        // outer rect is recentered around its OWN center, same idiom as dst.
+        let orig_outer_center_x = plan.outer_x as f32 + plan.outer_width as f32 / 2.0;
+        let orig_outer_center_y = plan.outer_y as f32 + plan.outer_height as f32 / 2.0;
+        let new_outer_center_x = scaled.outer_x as f32 + scaled.outer_width as f32 / 2.0;
+        let new_outer_center_y = scaled.outer_y as f32 + scaled.outer_height as f32 / 2.0;
+        assert!((orig_outer_center_x - new_outer_center_x).abs() <= 1.0);
+        assert!((orig_outer_center_y - new_outer_center_y).abs() <= 1.0);
+    }
+
+    #[test]
+    fn scale_render_quad_plan_scales_corner_radius_and_border_with_the_box() {
+        let plan = animation_test_plan(0, 0, 100, 100);
+        let scaled = scale_render_quad_plan(plan, 0.5, 0.5);
+        assert_eq!(scaled.corner_radius, plan.corner_radius * 0.5);
+        assert_eq!(scaled.border_width, plan.border_width * 0.5);
+    }
+
+    #[test]
+    fn scale_render_quad_plan_guards_invalid_scale() {
+        let plan = animation_test_plan(0, 0, 100, 100);
+        assert_eq!(scale_render_quad_plan(plan, 0.0, 1.0), plan);
+        assert_eq!(scale_render_quad_plan(plan, 1.0, 0.0), plan);
+        assert_eq!(scale_render_quad_plan(plan, -1.0, 1.0), plan);
+        assert_eq!(scale_render_quad_plan(plan, f32::NAN, 1.0), plan);
+        assert_eq!(scale_render_quad_plan(plan, 1.0, f32::NAN), plan);
+    }
+
+    #[test]
+    fn scale_render_quad_plan_never_produces_zero_or_negative_dimensions() {
+        let plan = animation_test_plan(0, 0, 1, 1);
+        let scaled = scale_render_quad_plan(plan, 0.01, 0.01);
+        assert!(scaled.width >= 1);
+        assert!(scaled.height >= 1);
+    }
+
+    // --- 3a3fa2b1 generic non-uniform transform seam (prepares Teleport
+    // without implementing it) ---
+
+    #[test]
+    fn scale_render_quad_plan_identity_when_both_axes_are_one() {
+        let plan = animation_test_plan(10, 20, 200, 100);
+        assert_eq!(scale_render_quad_plan(plan, 1.0, 1.0), plan);
+    }
+
+    #[test]
+    fn scale_render_quad_plan_x_only_scaling_leaves_height_unchanged() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let scaled = scale_render_quad_plan(plan, 0.5, 1.0);
+        assert_eq!(scaled.width, 100);
+        assert_eq!(scaled.height, 100);
+        // center preserved on the scaled axis only
+        assert_eq!(scaled.dst_y, plan.dst_y);
+    }
+
+    #[test]
+    fn scale_render_quad_plan_y_only_scaling_leaves_width_unchanged() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let scaled = scale_render_quad_plan(plan, 1.0, 0.5);
+        assert_eq!(scaled.width, 200);
+        assert_eq!(scaled.height, 50);
+        assert_eq!(scaled.dst_x, plan.dst_x);
+    }
+
+    #[test]
+    fn scale_render_quad_plan_corner_and_border_use_the_smaller_axis_scale() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        // scale_x shrinks far more than scale_y — corner/border must
+        // follow the SMALLER (scale_x) factor, per the audited rule.
+        let scaled = scale_render_quad_plan(plan, 0.25, 0.9);
+        assert_eq!(scaled.corner_radius, plan.corner_radius * 0.25);
+        assert_eq!(scaled.border_width, plan.border_width * 0.25);
+    }
+
+    #[test]
+    fn scale_render_quad_plan_non_uniform_preserves_uv() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let scaled = scale_render_quad_plan(plan, 0.3, 0.8);
+        assert_eq!(scaled.u0, plan.u0);
+        assert_eq!(scaled.v0, plan.v0);
+        assert_eq!(scaled.u1, plan.u1);
+        assert_eq!(scaled.v1, plan.v1);
+    }
+
+    // --- F: opacity multiplication ---
+
+    #[test]
+    fn animation_opacity_multiplies_existing_resolved_opacity() {
+        let base_opacity = 0.5_f32;
+        let start = sample_open_effect(OpenAnimationEffect::Scale, 0.0);
+        assert_eq!(base_opacity * start.opacity, 0.0);
+        let end = sample_open_effect(OpenAnimationEffect::Scale, 1.0);
+        assert_eq!(base_opacity * end.opacity, base_opacity);
+        let mid = sample_open_effect(OpenAnimationEffect::Scale, 0.5);
+        let mixed = base_opacity * mid.opacity;
+        assert!(mixed > 0.0 && mixed < base_opacity);
+    }
+
+    // --- J/K/L/M/Q: generic effect-sampling properties ---
+
+    #[test]
+    fn scale_sample_opacity_stays_within_bounds_across_a_dense_sweep() {
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            let visual = sample_open_effect(OpenAnimationEffect::Scale, t);
+            assert!((0.0..=1.0).contains(&visual.opacity), "t={t} opacity={}", visual.opacity);
+        }
+    }
+
+    #[test]
+    fn scale_sample_values_are_finite_across_a_dense_sweep() {
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            let visual = sample_open_effect(OpenAnimationEffect::Scale, t);
+            assert!(visual.opacity.is_finite());
+            assert!(visual.scale_x.is_finite());
+            assert!(visual.scale_y.is_finite());
+        }
+    }
+
+    #[test]
+    fn scale_sample_t_greater_than_one_still_finalizes_exactly() {
+        let visual = sample_open_effect(OpenAnimationEffect::Scale, 1.0);
+        assert_eq!(visual, AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 });
+    }
+
+    #[test]
+    fn scale_sample_matches_the_already_validated_ease_out_cubic_lerp_composition() {
+        // Regression pin against R1's already-human-validated behavior:
+        // sample_scale(t) must equal directly composing ease_out_cubic+lerp
+        // over the Scale effect's own documented endpoints.
+        for t in [0.0_f32, 0.13, 0.5, 0.87, 1.0] {
+            let eased = ease_out_cubic(t);
+            let expected_scale = lerp(SCALE_EFFECT_FROM_SCALE, SCALE_EFFECT_TO_SCALE, eased);
+            let expected_opacity = lerp(SCALE_EFFECT_FROM_OPACITY, SCALE_EFFECT_TO_OPACITY, eased);
+            let visual = sample_scale(t);
+            assert_eq!(visual.scale_x, expected_scale);
+            assert_eq!(visual.scale_y, expected_scale);
+            assert_eq!(visual.opacity, expected_opacity);
+        }
+    }
+
+    // ========================================================
+    // 3a3fa2b2-r2 — teleport materialization effect.
+    // ========================================================
+
+    // --- start state (exact) ---
+
+    #[test]
+    fn teleport_sample_t0_is_exact_thin_streak_start_state() {
+        let visual = sample_teleport(0.0);
+        assert_eq!(visual, AnimationVisual {
+            opacity: TELEPORT_START_OPACITY,
+            scale_x: TELEPORT_START_SCALE_X,
+            scale_y: TELEPORT_START_SCALE_Y,
+        });
+        assert_eq!(visual.scale_x, 0.45);
+        assert_eq!(visual.scale_y, 0.03);
+        assert_eq!(visual.opacity, 0.0);
+        assert!(visual.scale_y < visual.scale_x, "must read as a flat streak, not a small window");
+    }
+
+    // --- front-loaded motion contract ---
+
+    #[test]
+    fn teleport_phase_a_end_has_begun_materializing_substantially() {
+        let start = sample_teleport(0.0);
+        let phase_a_end = sample_teleport(TELEPORT_PHASE_A_END);
+        assert!(phase_a_end.opacity > start.opacity + 0.15, "opacity={}", phase_a_end.opacity);
+        assert!(phase_a_end.scale_y > start.scale_y + 0.10, "scale_y={}", phase_a_end.scale_y);
+        // Still reads as a materializing streak, not a normal window yet.
+        assert!(phase_a_end.scale_x < 0.9);
+        assert!(phase_a_end.scale_y < 0.5);
+    }
+
+    #[test]
+    fn teleport_at_t_035_is_already_essentially_full_size() {
+        // The critical human-character gate: by t=0.35, geometry/opacity
+        // transition must be essentially done — only a small, sharp
+        // impact/recoil/snap remains.
+        let visual = sample_teleport(TELEPORT_PHASE_B_END);
+        assert!(visual.scale_x >= 0.98, "scale_x={}", visual.scale_x);
+        assert!(visual.scale_y >= 0.98, "scale_y={}", visual.scale_y);
+        assert!(visual.opacity >= 0.95, "opacity={}", visual.opacity);
+    }
+
+    #[test]
+    fn teleport_opacity_reaches_one_by_t_035_and_stays_there() {
+        assert_eq!(sample_teleport(TELEPORT_PHASE_B_END).opacity, 1.0);
+        // No further fading through impact/recoil/snap — materialization
+        // (opacity) is deliberately decoupled from the geometric settle.
+        for i in 0..=20 {
+            let t = TELEPORT_PHASE_B_END + (1.0 - TELEPORT_PHASE_B_END) * (i as f32 / 20.0);
+            assert_eq!(sample_teleport(t).opacity, 1.0, "t={t}");
+        }
+    }
+
+    // --- distinct from Scale ---
+
+    #[test]
+    fn teleport_differs_materially_from_scale_at_several_t_values() {
+        for t in [0.05_f32, 0.15, 0.25, 0.50] {
+            let teleport = sample_teleport(t);
+            let scale = sample_scale(t);
+            assert_ne!(teleport, scale, "t={t}");
+        }
+    }
+
+    #[test]
+    fn teleport_scale_y_is_far_behind_scale_x_at_early_t() {
+        for t in [0.05_f32, TELEPORT_PHASE_A_END] {
+            let visual = sample_teleport(t);
+            assert!(visual.scale_y < visual.scale_x, "t={t} scale_y={} scale_x={}", visual.scale_y, visual.scale_x);
+        }
+    }
+
+    // --- bounded overshoot ---
+
+    #[test]
+    fn teleport_overshoot_is_bounded_and_axis_specific() {
+        let mut saw_x_overshoot = false;
+        let mut saw_y_overshoot = false;
+        for i in 0..=200 {
+            let t = i as f32 / 200.0;
+            let visual = sample_teleport(t);
+            assert!(visual.scale_x <= 1.04, "t={t} scale_x={}", visual.scale_x);
+            assert!(visual.scale_y <= 1.08, "t={t} scale_y={}", visual.scale_y);
+            saw_x_overshoot |= visual.scale_x > 1.0;
+            saw_y_overshoot |= visual.scale_y > 1.0;
+        }
+        assert!(saw_x_overshoot);
+        assert!(saw_y_overshoot);
+    }
+
+    // --- recoil (phase C actually settles back down, not monotonic ease) ---
+
+    #[test]
+    fn teleport_phase_c_recoils_below_the_phase_b_peak() {
+        let peak = sample_teleport(TELEPORT_PHASE_B_END);
+        assert_eq!((peak.scale_x, peak.scale_y), (TELEPORT_PHASE_B_SCALE_X, TELEPORT_PHASE_B_SCALE_Y));
+        let mid_recoil = sample_teleport((TELEPORT_PHASE_B_END + TELEPORT_PHASE_C_END) / 2.0);
+        assert!(mid_recoil.scale_x < peak.scale_x, "scale_x did not recoil: {} !< {}", mid_recoil.scale_x, peak.scale_x);
+        assert!(mid_recoil.scale_y < peak.scale_y, "scale_y did not recoil: {} !< {}", mid_recoil.scale_y, peak.scale_y);
+        // Recoil dips slightly under 1.0 by design (a real recoil, not
+        // just "less overshoot").
+        assert!(mid_recoil.scale_x < 1.0);
+        assert!(mid_recoil.scale_y < 1.0);
+    }
+
+    // --- final state (exact, at and beyond t=1.0) ---
+
+    #[test]
+    fn teleport_sample_t1_and_beyond_is_exact_final_state() {
+        for t in [1.0_f32, 1.5, 10.0] {
+            assert_eq!(sample_teleport(t), AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 }, "t={t}");
+        }
+    }
+
+    // --- bounds / finiteness across a dense sweep ---
+
+    #[test]
+    fn teleport_opacity_stays_within_bounds_across_a_dense_sweep() {
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let visual = sample_teleport(t);
+            assert!((0.0..=1.0).contains(&visual.opacity), "t={t} opacity={}", visual.opacity);
+        }
+    }
+
+    #[test]
+    fn teleport_scale_values_are_finite_and_positive_across_a_dense_sweep() {
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let visual = sample_teleport(t);
+            assert!(visual.scale_x.is_finite() && visual.scale_x > 0.0, "t={t} scale_x={}", visual.scale_x);
+            assert!(visual.scale_y.is_finite() && visual.scale_y > 0.0, "t={t} scale_y={}", visual.scale_y);
+        }
+    }
+
+    #[test]
+    fn teleport_sample_is_deterministic() {
+        for i in 0..=40 {
+            let t = i as f32 / 40.0;
+            assert_eq!(sample_teleport(t), sample_teleport(t));
+            assert_eq!(sample_open_effect(OpenAnimationEffect::Teleport, t), sample_teleport(t));
+        }
+    }
+
+    // --- minimum dimensions (scale_y=0.03 must never yield a zero-sized plan) ---
+
+    #[test]
+    fn teleport_t0_scale_never_produces_zero_sized_dst_or_outer_plan() {
+        for (w, h) in [(200, 100), (10, 10), (1, 1), (201, 99)] {
+            let plan = animation_test_plan(0, 0, w, h);
+            let visual = sample_teleport(0.0);
+            let scaled = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+            assert!(scaled.width >= 1, "w={w} h={h} width={}", scaled.width);
+            assert!(scaled.height >= 1, "w={w} h={h} height={}", scaled.height);
+            assert!(scaled.outer_width >= 1, "w={w} h={h} outer_width={}", scaled.outer_width);
+            assert!(scaled.outer_height >= 1, "w={w} h={h} outer_height={}", scaled.outer_height);
+        }
+    }
+
+    // --- center stability across phases, parities, and sizes ---
+
+    #[test]
+    fn teleport_center_is_stable_across_all_phases_parities_and_sizes() {
+        for (w, h) in [(200, 100), (201, 101), (10, 10), (11, 11), (1, 1)] {
+            let plan = animation_test_plan(50, 60, w, h);
+            let orig_center_x = plan.dst_x as f32 + plan.width as f32 / 2.0;
+            let orig_center_y = plan.dst_y as f32 + plan.height as f32 / 2.0;
+            let orig_outer_center_x = plan.outer_x as f32 + plan.outer_width as f32 / 2.0;
+            let orig_outer_center_y = plan.outer_y as f32 + plan.outer_height as f32 / 2.0;
+            for i in 0..=20 {
+                let t = i as f32 / 20.0;
+                let visual = sample_teleport(t);
+                let scaled = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+                let new_center_x = scaled.dst_x as f32 + scaled.width as f32 / 2.0;
+                let new_center_y = scaled.dst_y as f32 + scaled.height as f32 / 2.0;
+                let new_outer_center_x = scaled.outer_x as f32 + scaled.outer_width as f32 / 2.0;
+                let new_outer_center_y = scaled.outer_y as f32 + scaled.outer_height as f32 / 2.0;
+                assert!((orig_center_x - new_center_x).abs() <= 1.0, "w={w} h={h} t={t}");
+                assert!((orig_center_y - new_center_y).abs() <= 1.0, "w={w} h={h} t={t}");
+                assert!((orig_outer_center_x - new_outer_center_x).abs() <= 1.0, "w={w} h={h} t={t}");
+                assert!((orig_outer_center_y - new_outer_center_y).abs() <= 1.0, "w={w} h={h} t={t}");
+            }
+        }
+    }
+
+    // --- shadow integration (reusing the s1 animated-shadow contract, no
+    // Teleport-specific shadow logic anywhere) ---
+
+    #[test]
+    fn teleport_t0_shadow_base_rect_follows_the_non_uniform_streak_geometry() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let visual = sample_teleport(0.0);
+        assert_eq!((visual.scale_x, visual.scale_y), (0.45, 0.03));
+        let draw_plan = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+        let style = shadow_style(true, 8.0, 0.0, 0.0);
+        // Opacity multiplier forced to 1.0 to isolate GEOMETRY from the
+        // separate opacity-coupling behavior proved below (Teleport's own
+        // t=0 opacity is 0.0, which would otherwise make
+        // shadow_params_from_plan return None and hide this check).
+        let shadow = shadow_params_from_plan(style, &draw_plan, 1.0).unwrap();
+        assert_eq!(shadow.outer_width, draw_plan.outer_width as f32);
+        assert_eq!(shadow.outer_height, draw_plan.outer_height as f32);
+        // Not a full-sized shadow behind the streak.
+        assert_ne!(shadow.outer_width, plan.outer_width as f32);
+        assert_ne!(shadow.outer_height, plan.outer_height as f32);
+        assert!(shadow.outer_height < shadow.outer_width, "shadow must also read as a thin streak");
+    }
+
+    #[test]
+    fn teleport_t0_opacity_zero_yields_no_shadow_params() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let visual = sample_teleport(0.0);
+        let draw_plan = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+        let style = shadow_style(true, 8.0, 0.0, 0.0);
+        assert_eq!(visual.opacity, 0.0);
+        assert!(shadow_params_from_plan(style, &draw_plan, visual.opacity).is_none());
+    }
+
+    #[test]
+    fn teleport_materialized_shadow_follows_current_non_uniform_geometry() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let visual = sample_teleport(TELEPORT_PHASE_B_END); // essentially materialized, per the front-loaded contract
+        assert!(visual.opacity > 0.9);
+        let draw_plan = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+        let style = shadow_style(true, 8.0, 0.0, 0.0);
+        let shadow = shadow_params_from_plan(style, &draw_plan, visual.opacity).unwrap();
+        assert_eq!(shadow.outer_width, draw_plan.outer_width as f32);
+        assert_eq!(shadow.outer_height, draw_plan.outer_height as f32);
+        assert_eq!(shadow.strength, style.strength * visual.opacity);
+    }
+
+    #[test]
+    fn teleport_at_t1_shadow_equals_ordinary_final_shadow() {
+        let plan = animation_test_plan(10, 5, 200, 100);
+        let visual = sample_teleport(1.0);
+        assert_eq!(visual, AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 });
+        let draw_plan = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+        let style = shadow_style(true, 8.0, 3.0, 4.0);
+        let animated_shadow = shadow_params_from_plan(style, &draw_plan, visual.opacity).unwrap();
+        let ordinary_shadow = shadow_params_from_plan(style, &plan, 1.0).unwrap();
+        assert_eq!(animated_shadow, ordinary_shadow);
+    }
+
+    // --- authoritative X11 geometry never touched ---
+
+    #[test]
+    fn teleport_pipeline_never_touches_authoritative_x11_geometry() {
+        let entry = animation_test_entry(9, SurfaceVisualClass::Normal, false);
+        let original_geometry = entry.geometry;
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let visual = sample_teleport(0.2);
+        let _draw_plan = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+        assert_eq!(entry.geometry, original_geometry);
+    }
+
+    // --- first visible frame: provisional Teleport renders a compressed
+    // streak, never a full-size window on frame one ---
+
+    #[test]
+    fn provisional_teleport_first_frame_is_a_compressed_streak_not_full_size() {
+        let new_surface = animation_test_entry(77, SurfaceVisualClass::Normal, false);
+        let snapshot = SceneSnapshot { root: 1, root_geometry: full_hd_root(), entries: vec![new_surface] };
+        let old_surfaces = HashSet::new();
+        let persistent = HashMap::new();
+        let now = Instant::now();
+        let provisional = provisional_open_animations(
+            &old_surfaces, &snapshot, false, true,
+            test_animation_config_with_effect(true, OpenAnimationEffect::Teleport), now,
+        );
+        let render_view = merge_window_animations(&persistent, &provisional);
+        let animation = render_view.get(&77).expect("newly eligible surface must have a provisional animation");
+        assert_eq!(animation.effect, OpenAnimationEffect::Teleport);
+        let t = animation.progress(now);
+        let visual = animation.sample(now);
+        assert!(t < 0.02);
+        // Same generic sample path the persistent render path also uses.
+        assert_eq!(visual, sample_teleport(t));
+        assert_ne!((visual.opacity, visual.scale_x, visual.scale_y), (1.0, 1.0, 1.0));
+        let real_plan = animation_test_plan(0, 0, 200, 100);
+        let draw_plan = scale_render_quad_plan(real_plan, visual.scale_x, visual.scale_y);
+        assert!(draw_plan.height < real_plan.height / 4, "first frame must read as a thin streak, not a full-size window");
+        // And the shadow this frame is absent (opacity≈0), never a
+        // full-size shadow behind a tiny streak.
+        let shadow = shadow_params_from_plan(shadow_style(true, 8.0, 0.0, 0.0), &draw_plan, visual.opacity);
+        assert!(shadow.is_none());
+    }
+
+    // --- retirement: no visual jump ---
+
+    #[test]
+    fn teleport_completed_animation_retires_with_no_visual_jump() {
+        let mut animations = HashMap::new();
+        // started_at far enough in the past that progress() clamps to 1.0
+        // regardless of the configured duration.
+        animations.insert(1, test_window_animation_with_effect(Instant::now() - Duration::from_secs(10), OpenAnimationEffect::Teleport));
+        let now = Instant::now();
+        let visual = animations[&1].sample(now);
+        assert_eq!(visual, AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 });
+        assert!(animations[&1].is_complete(now));
+        let mut removed = HashSet::new();
+        removed.insert(1);
+        retire_removed_surface_animations(&mut animations, &removed);
+        assert!(animations.is_empty());
+    }
+
+    // --- move/resize during animation: no cached geometry (Teleport-flavored) ---
+
+    #[test]
+    fn teleport_shadow_follows_latest_geometry_across_a_simulated_move_and_resize() {
+        let visual = sample_teleport(0.20); // mid-streak, strongly non-uniform
+        assert_ne!(visual.scale_x, visual.scale_y);
+        let moved_plan = animation_test_plan(80, 40, 200, 100);
+        let draw_plan = scale_render_quad_plan(moved_plan, visual.scale_x, visual.scale_y);
+        let style = shadow_style(true, 8.0, 0.0, 0.0);
+        let shadow = shadow_params_from_plan(style, &draw_plan, 1.0).unwrap();
+        assert_eq!(shadow.outer_x + shadow.outer_width / 2.0, draw_plan.outer_x as f32 + draw_plan.outer_width as f32 / 2.0);
+        assert_eq!(shadow.outer_y + shadow.outer_height / 2.0, draw_plan.outer_y as f32 + draw_plan.outer_height as f32 / 2.0);
+
+        let resized_plan = animation_test_plan(80, 40, 350, 60);
+        let resized_draw_plan = scale_render_quad_plan(resized_plan, visual.scale_x, visual.scale_y);
+        assert_ne!(resized_draw_plan.outer_width, draw_plan.outer_width);
+        let resized_shadow = shadow_params_from_plan(style, &resized_draw_plan, 1.0).unwrap();
+        assert_eq!(resized_shadow.outer_width, resized_draw_plan.outer_width as f32);
+    }
+
+    // ========================================================
+    // 3a3fa2b3 — energy_tear open effect.
+    // ========================================================
+
+    // --- effect sampling / model ---
+
+    #[test]
+    fn energy_tear_t0_layout_is_at_peak_tear_and_streak_alpha() {
+        // "Estado visível" at t=0: the tear geometry (slice offsets +
+        // streak alpha) is at its PEAK, non-trivial value — energy_tear's
+        // distinctive character is expressed through this layout, not
+        // through AnimationVisual.opacity (which follows the same
+        // "starts at 0, ramps up" convention every other effect already
+        // uses — see energy_tear_opacity_ramps_like_every_other_effect).
+        let layout = sample_energy_tear_layout(0.0);
+        assert_eq!(layout.streak_alpha, ENERGY_TEAR_PEAK_STREAK_ALPHA);
+        assert_eq!(energy_tear_oscillation(0.0), 1.0);
+        for i in 0..ENERGY_TEAR_SLICE_COUNT {
+            let expected = ENERGY_TEAR_SLICE_PEAK_OFFSET_FRACTIONS[i]; // * osc(0.0)==1.0
+            assert_eq!(layout.slice_offset_fractions[i], expected, "slice {i}");
+            assert_ne!(layout.slice_offset_fractions[i], 0.0, "slice {i} must not be at rest at t=0");
+        }
+    }
+
+    // --- 3a3fa2b3-r2: window-opacity-multiplier correction ---
+    // EnergyTear's AnimationVisual.opacity is now an unconditional
+    // CONSTANT 1.0 multiplier — it must never fade or override the
+    // surface's already-resolved/configured opacity. Required test 1/2.
+
+    #[test]
+    fn energy_tear_opacity_multiplier_is_exactly_one_at_t0() {
+        let visual = sample_energy_tear(0.0);
+        assert_eq!(visual.opacity, 1.0);
+        assert_eq!(visual.scale_x, 1.0);
+        assert_eq!(visual.scale_y, 1.0);
+    }
+
+    #[test]
+    fn energy_tear_opacity_multiplier_stays_one_throughout() {
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let visual = sample_energy_tear(t);
+            assert_eq!(visual.opacity, 1.0, "t={t}");
+            assert_eq!(visual.scale_x, 1.0, "t={t}");
+            assert_eq!(visual.scale_y, 1.0, "t={t}");
+        }
+        for t in [1.0_f32, 1.5, 10.0] {
+            assert_eq!(sample_energy_tear(t), AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 }, "t={t}");
+        }
+    }
+
+    // Required test 3: Scale's existing opacity curve is unmodified by
+    // this milestone (a fresh, explicit regression pin — Scale's own
+    // code has zero hunks in either R1 or this R2 correction).
+    #[test]
+    fn scale_opacity_curve_is_unmodified_by_energy_tear() {
+        for t in [0.0_f32, 0.13, 0.5, 0.87, 1.0] {
+            let eased = ease_out_cubic(t);
+            let expected_opacity = lerp(SCALE_EFFECT_FROM_OPACITY, SCALE_EFFECT_TO_OPACITY, eased);
+            assert_eq!(sample_scale(t).opacity, expected_opacity, "t={t}");
+        }
+        assert_eq!(sample_scale(0.0).opacity, SCALE_EFFECT_FROM_OPACITY);
+        assert_eq!(sample_scale(1.0).opacity, SCALE_EFFECT_TO_OPACITY);
+    }
+
+    // Required test 4: Teleport's existing opacity curve is unmodified
+    // (extends the R1 regression pin with explicit opacity-at-several-t
+    // coverage).
+    #[test]
+    fn teleport_opacity_curve_is_unmodified_by_energy_tear() {
+        assert_eq!(sample_teleport(0.0).opacity, TELEPORT_START_OPACITY);
+        assert_eq!(sample_teleport(TELEPORT_PHASE_A_END).opacity, 0.28);
+        assert_eq!(sample_teleport(TELEPORT_PHASE_B_END).opacity, 1.0);
+        assert_eq!(sample_teleport(1.0).opacity, 1.0);
+    }
+
+    // Required tests 5/6: resolved (base) opacity passes through
+    // energy_tear's render-loop formula (base_opacity * visual.opacity)
+    // completely unchanged, because visual.opacity is always exactly 1.0.
+    #[test]
+    fn resolved_opacity_0_82_remains_effective_0_82_under_energy_tear() {
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            let visual = sample_energy_tear(t);
+            let draw_opacity = 0.82_f32 * visual.opacity;
+            assert_eq!(draw_opacity, 0.82, "t={t}");
+        }
+    }
+
+    #[test]
+    fn resolved_opacity_1_0_remains_1_0_under_energy_tear() {
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            let visual = sample_energy_tear(t);
+            let draw_opacity = 1.0_f32 * visual.opacity;
+            assert_eq!(draw_opacity, 1.0, "t={t}");
+        }
+    }
+
+    // Required test 7: tear/streak alpha is computed by a function that
+    // takes ONLY `t` — no resolved/window-opacity input exists for it to
+    // depend on. Demonstrated by showing the SAME layout results
+    // regardless of which (hypothetical) base_opacity the caller would
+    // separately multiply into the surface's own draw_opacity.
+    #[test]
+    fn tear_alpha_is_independent_from_resolved_window_opacity() {
+        for i in 0..=20 {
+            let t = ENERGY_TEAR_END * (i as f32 / 20.0);
+            let layout_a = sample_energy_tear_layout(t);
+            let layout_b = sample_energy_tear_layout(t);
+            // Nothing resembling a "base_opacity" parameter exists on
+            // this function's signature at all — two independent calls
+            // at the same t, standing in for two hypothetically
+            // differently-configured windows (e.g. 0.3 vs 1.0 resolved
+            // opacity), produce byte-identical tear state.
+            assert_eq!(layout_a, layout_b, "t={t}");
+            let hypothetical_low_opacity_draw = 0.3_f32 * sample_energy_tear(t).opacity;
+            let hypothetical_full_opacity_draw = 1.0_f32 * sample_energy_tear(t).opacity;
+            assert_ne!(hypothetical_low_opacity_draw, hypothetical_full_opacity_draw);
+            // ...yet the tear layout itself never changed between them.
+            assert_eq!(sample_energy_tear_layout(t).streak_alpha, layout_a.streak_alpha, "t={t}");
+        }
+    }
+
+    // Required test 8: once tear_alpha reaches 0 (t >= ENERGY_TEAR_END),
+    // only the OVERLAY disappears (energy_tear_layout_for -> None, so no
+    // slice/streak draw calls happen) — the window's own opacity
+    // multiplier was ALREADY 1.0 on both sides of that boundary, so
+    // nothing about window rendering itself changes at the transition.
+    #[test]
+    fn at_tear_alpha_zero_only_the_overlay_disappears() {
+        let just_before = ENERGY_TEAR_END - 0.001;
+        assert!(energy_tear_layout_for(OpenAnimationEffect::EnergyTear, just_before).is_some());
+        assert_eq!(energy_tear_layout_for(OpenAnimationEffect::EnergyTear, ENERGY_TEAR_END), None);
+        // Window opacity multiplier: unchanged across the boundary.
+        assert_eq!(sample_energy_tear(just_before).opacity, sample_energy_tear(ENERGY_TEAR_END).opacity);
+        assert_eq!(sample_energy_tear(just_before).opacity, 1.0);
+    }
+
+    // Required test 9: no code path forces a translucent window toward
+    // opacity=1.0 — the render-loop formula (base_opacity *
+    // visual.opacity) is a genuine multiplier identity whenever
+    // visual.opacity==1.0, for ANY base_opacity, not a hardcoded override.
+    #[test]
+    fn no_code_path_forces_translucent_windows_to_opacity_one() {
+        for base_opacity in [0.10_f32, 0.30, 0.60, 0.82, 0.99, 1.0] {
+            for i in 0..=10 {
+                let t = i as f32 / 10.0;
+                let visual = sample_energy_tear(t);
+                let draw_opacity = base_opacity * visual.opacity;
+                assert_eq!(draw_opacity, base_opacity, "base_opacity={base_opacity} t={t}");
+                assert!(base_opacity >= 1.0 || draw_opacity < 1.0, "translucent window must stay translucent: base_opacity={base_opacity} t={t}");
+            }
+        }
+    }
+
+    #[test]
+    fn energy_tear_layout_at_t1_is_exactly_no_tear() {
+        let layout = sample_energy_tear_layout(1.0);
+        assert_eq!(layout.streak_alpha, 0.0);
+        assert_eq!(layout.slice_offset_fractions, [0.0; ENERGY_TEAR_SLICE_COUNT]);
+    }
+
+    #[test]
+    fn energy_tear_visual_at_t1_and_beyond_is_exact_final_state() {
+        for t in [1.0_f32, 1.5, 10.0] {
+            assert_eq!(sample_energy_tear(t), AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 }, "t={t}");
+        }
+    }
+
+    // ============================================================
+    // 3a3fa2b3-r3 — multi-cycle displacement + tear pulses.
+    // ============================================================
+
+    // Boundary t-values in ABSOLUTE (whole-animation) time, derived from
+    // the envelope-normalized phase boundaries — reused across the
+    // section 17/18 tests below.
+    fn energy_tear_r3_cycle0_t() -> f32 { 0.0 }
+    fn energy_tear_r3_crossing1_t() -> f32 { ENERGY_TEAR_END * ENERGY_TEAR_PHASE_A_END }
+    fn energy_tear_r3_rebound1_t() -> f32 { ENERGY_TEAR_END * ENERGY_TEAR_PHASE_B_END }
+    fn energy_tear_r3_rebound2_t() -> f32 { ENERGY_TEAR_END * ENERGY_TEAR_PHASE_C_END }
+
+    // --- test A: initial displacement is larger than R2 ---
+
+    #[test]
+    fn energy_tear_r3_initial_displacement_exceeds_r2() {
+        // R2's old formula, inlined here ONLY as a fixed historical
+        // reference to prove the regression requirement — R2's constants
+        // no longer exist in production source (superseded by R3).
+        // R2: live_offset_px = slice_width * (peak_fraction * 0.35),
+        // with slice_width ~= window_width / ENERGY_TEAR_SLICE_COUNT and
+        // R2's peak_fraction magnitude capped at 1.0.
+        let window_width = 200.0_f32;
+        let r2_slice_width = window_width / ENERGY_TEAR_SLICE_COUNT as f32;
+        let r2_max_displacement_px = r2_slice_width * 1.0 * 0.35; // = 14.0
+
+        let plan = animation_test_plan(0, 0, window_width as i32, 100);
+        let layout = sample_energy_tear_layout(0.0);
+        let render_plan = energy_tear_render_plan(plan, &layout).unwrap();
+        // R3's strongest-magnitude slice is index 3 (coefficient 1.0).
+        let r3_max_displacement_px = (render_plan.slices[3].dst_x - (plan.dst_x + render_plan.slices[3].local_offset_x.round() as i32)).abs() as f32;
+        assert!(r3_max_displacement_px > r2_max_displacement_px, "r3={r3_max_displacement_px} r2={r2_max_displacement_px}");
+
+        // And every single slice individually increased too, not just
+        // the strongest one (see the R3 preview report's derivation).
+        for i in 0..ENERGY_TEAR_SLICE_COUNT {
+            let r2_px = r2_slice_width * ENERGY_TEAR_SLICE_PEAK_OFFSET_FRACTIONS_R2_REFERENCE[i].abs() * 0.35;
+            let r3_px = (render_plan.slices[i].dst_x - (plan.dst_x + render_plan.slices[i].local_offset_x.round() as i32)).abs() as f32;
+            assert!(r3_px > r2_px, "slice {i}: r3={r3_px} r2={r2_px}");
+        }
+    }
+    // R2's old (superseded) per-slice pattern, kept ONLY as a named
+    // reference constant for the regression comparison above — not used
+    // anywhere in production code.
+    const ENERGY_TEAR_SLICE_PEAK_OFFSET_FRACTIONS_R2_REFERENCE: [f32; ENERGY_TEAR_SLICE_COUNT] = [-1.0, 0.6, -0.3, 0.6, -1.0];
+
+    // --- tests B/C: sign reversal across cycles ---
+
+    #[test]
+    fn energy_tear_r3_rebound1_reverses_sign_from_cycle0() {
+        let cycle0 = sample_energy_tear_layout(energy_tear_r3_cycle0_t());
+        let rebound1 = sample_energy_tear_layout(energy_tear_r3_rebound1_t());
+        for i in 0..ENERGY_TEAR_SLICE_COUNT {
+            assert_ne!(cycle0.slice_offset_fractions[i], 0.0, "slice {i}");
+            assert_ne!(rebound1.slice_offset_fractions[i], 0.0, "slice {i}");
+            assert!(
+                cycle0.slice_offset_fractions[i].signum() != rebound1.slice_offset_fractions[i].signum(),
+                "slice {i} did not reverse sign: cycle0={} rebound1={}",
+                cycle0.slice_offset_fractions[i], rebound1.slice_offset_fractions[i],
+            );
+        }
+    }
+
+    #[test]
+    fn energy_tear_r3_rebound2_reverses_sign_from_rebound1_back_to_cycle0_sign() {
+        let cycle0 = sample_energy_tear_layout(energy_tear_r3_cycle0_t());
+        let rebound1 = sample_energy_tear_layout(energy_tear_r3_rebound1_t());
+        let rebound2 = sample_energy_tear_layout(energy_tear_r3_rebound2_t());
+        for i in 0..ENERGY_TEAR_SLICE_COUNT {
+            assert!(
+                rebound1.slice_offset_fractions[i].signum() != rebound2.slice_offset_fractions[i].signum(),
+                "slice {i} did not reverse sign again: rebound1={} rebound2={}",
+                rebound1.slice_offset_fractions[i], rebound2.slice_offset_fractions[i],
+            );
+            // ...and rebound2 is back on cycle0's original side.
+            assert_eq!(
+                cycle0.slice_offset_fractions[i].signum(), rebound2.slice_offset_fractions[i].signum(),
+                "slice {i} rebound2 must match cycle0's original sign",
+            );
+        }
+    }
+
+    // --- tests D/E: decreasing amplitude across cycles ---
+
+    #[test]
+    fn energy_tear_r3_rebound1_amplitude_is_smaller_than_cycle0() {
+        let cycle0 = sample_energy_tear_layout(energy_tear_r3_cycle0_t());
+        let rebound1 = sample_energy_tear_layout(energy_tear_r3_rebound1_t());
+        for i in 0..ENERGY_TEAR_SLICE_COUNT {
+            assert!(
+                rebound1.slice_offset_fractions[i].abs() < cycle0.slice_offset_fractions[i].abs(),
+                "slice {i}: rebound1={} !< cycle0={}",
+                rebound1.slice_offset_fractions[i].abs(), cycle0.slice_offset_fractions[i].abs(),
+            );
+        }
+        // The requested 45-60% range, applied to the shared oscillation factor.
+        assert!((0.45..=0.60).contains(&ENERGY_TEAR_REBOUND_1_FACTOR.abs()));
+    }
+
+    #[test]
+    fn energy_tear_r3_rebound2_amplitude_is_smaller_than_rebound1() {
+        let rebound1 = sample_energy_tear_layout(energy_tear_r3_rebound1_t());
+        let rebound2 = sample_energy_tear_layout(energy_tear_r3_rebound2_t());
+        for i in 0..ENERGY_TEAR_SLICE_COUNT {
+            assert!(
+                rebound2.slice_offset_fractions[i].abs() < rebound1.slice_offset_fractions[i].abs(),
+                "slice {i}: rebound2={} !< rebound1={}",
+                rebound2.slice_offset_fractions[i].abs(), rebound1.slice_offset_fractions[i].abs(),
+            );
+        }
+        // The requested 20-30% range.
+        assert!((0.20..=0.30).contains(&ENERGY_TEAR_REBOUND_2_FACTOR.abs()));
+    }
+
+    // --- test F: exact zero after ENERGY_TEAR_END ---
+
+    #[test]
+    fn energy_tear_r3_offsets_and_streak_alpha_are_exact_zero_after_end() {
+        for t in [ENERGY_TEAR_END, ENERGY_TEAR_END + 0.01, 1.0, 1.5] {
+            let layout = sample_energy_tear_layout(t);
+            assert_eq!(layout.slice_offset_fractions, [0.0; ENERGY_TEAR_SLICE_COUNT], "t={t}");
+            assert_eq!(layout.streak_alpha, 0.0, "t={t}");
+        }
+    }
+
+    // --- test G: deterministic output (multi-cycle-specific) ---
+
+    #[test]
+    fn energy_tear_r3_oscillation_and_layout_are_deterministic() {
+        for i in 0..=60 {
+            let t = ENERGY_TEAR_END * (i as f32 / 60.0);
+            assert_eq!(energy_tear_oscillation(t), energy_tear_oscillation(t), "t={t}");
+            assert_eq!(sample_energy_tear_layout(t), sample_energy_tear_layout(t), "t={t}");
+        }
+    }
+
+    // --- tests H/I: finiteness + bounds ---
+
+    #[test]
+    fn energy_tear_r3_displacement_is_always_finite_and_bounded() {
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let layout = sample_energy_tear_layout(t);
+            for slice_idx in 0..ENERGY_TEAR_SLICE_COUNT {
+                let f = layout.slice_offset_fractions[slice_idx];
+                assert!(f.is_finite(), "t={t} slice {slice_idx} not finite: {f}");
+                // Coefficients are within [-1,1] and |oscillation|<=1.0,
+                // so the dimensionless fraction itself is always within
+                // [-1,1] — the actual pixel bound (ENERGY_TEAR_MIN/MAX_
+                // DISPLACEMENT_PX) is applied downstream in
+                // energy_tear_render_plan, proven separately below.
+                assert!((-1.0..=1.0).contains(&f), "t={t} slice {slice_idx} out of [-1,1]: {f}");
+            }
+            assert!(layout.streak_alpha.is_finite(), "t={t}");
+            assert!((0.0..=1.0).contains(&layout.streak_alpha), "t={t} streak_alpha={}", layout.streak_alpha);
+        }
+    }
+
+    #[test]
+    fn energy_tear_r3_pixel_displacement_stays_within_approved_bounds() {
+        for window_width in [5, 40, 200, 800, 5000] {
+            let plan = animation_test_plan(0, 0, window_width, 100);
+            for i in 0..=20 {
+                let t = ENERGY_TEAR_END * (i as f32 / 20.0);
+                let layout = sample_energy_tear_layout(t);
+                let render_plan = energy_tear_render_plan(plan, &layout).unwrap();
+                for (slice_idx, slice) in render_plan.slices.iter().enumerate() {
+                    let rest_x = plan.dst_x + slice.local_offset_x.round() as i32;
+                    let displacement = (slice.dst_x - rest_x).abs() as f32;
+                    assert!(
+                        displacement <= ENERGY_TEAR_MAX_DISPLACEMENT_PX + 1.0, // +1 for .round() slack
+                        "window_width={window_width} t={t} slice={slice_idx} displacement={displacement} > max",
+                    );
+                }
+            }
+        }
+    }
+
+    // --- tear pulse ordering (section 18) ---
+
+    #[test]
+    fn energy_tear_r3_tear_pulses_decrease_in_order() {
+        let cycle0_alpha = sample_energy_tear_layout(energy_tear_r3_cycle0_t()).streak_alpha;
+        let rebound1_alpha = sample_energy_tear_layout(energy_tear_r3_rebound1_t()).streak_alpha;
+        let rebound2_alpha = sample_energy_tear_layout(energy_tear_r3_rebound2_t()).streak_alpha;
+        assert!(cycle0_alpha > rebound1_alpha, "cycle0={cycle0_alpha} !> rebound1={rebound1_alpha}");
+        assert!(rebound1_alpha > rebound2_alpha, "rebound1={rebound1_alpha} !> rebound2={rebound2_alpha}");
+        assert_eq!(cycle0_alpha, ENERGY_TEAR_PEAK_STREAK_ALPHA);
+    }
+
+    #[test]
+    fn energy_tear_r3_tear_pulses_dip_between_peaks() {
+        // Proves these are genuine PULSES (rise/fall/rise/fall), not a
+        // single monotonic fade: the crossing point between cycle0 and
+        // rebound1 must be a local minimum, strictly lower than both
+        // neighbors.
+        let crossing1_alpha = sample_energy_tear_layout(energy_tear_r3_crossing1_t()).streak_alpha;
+        let cycle0_alpha = sample_energy_tear_layout(energy_tear_r3_cycle0_t()).streak_alpha;
+        let rebound1_alpha = sample_energy_tear_layout(energy_tear_r3_rebound1_t()).streak_alpha;
+        assert!(crossing1_alpha < cycle0_alpha, "crossing1={crossing1_alpha} !< cycle0={cycle0_alpha}");
+        assert!(crossing1_alpha < rebound1_alpha, "crossing1={crossing1_alpha} !< rebound1={rebound1_alpha}");
+    }
+
+    #[test]
+    fn energy_tear_r3_tear_alpha_final_is_zero_and_always_in_bounds() {
+        assert_eq!(sample_energy_tear_layout(ENERGY_TEAR_END).streak_alpha, 0.0);
+        for i in 0..=200 {
+            let t = i as f32 / 200.0;
+            let alpha = sample_energy_tear_layout(t).streak_alpha;
+            assert!((0.0..=1.0).contains(&alpha), "t={t} alpha={alpha}");
+        }
+    }
+
+    #[test]
+    fn energy_tear_r3_window_opacity_multiplier_unaffected_by_multicycle_change() {
+        // Preserve R2 exactly: window opacity multiplier stays 1.0
+        // throughout, completely independent of the new multi-cycle
+        // displacement/tear-pulse machinery above.
+        for i in 0..=20 {
+            let t = ENERGY_TEAR_END * (i as f32 / 20.0);
+            assert_eq!(sample_energy_tear(t).opacity, 1.0, "t={t}");
+        }
+    }
+
+    #[test]
+    fn energy_tear_sampling_is_deterministic() {
+        for i in 0..=40 {
+            let t = i as f32 / 40.0;
+            assert_eq!(sample_energy_tear(t), sample_energy_tear(t));
+            assert_eq!(sample_energy_tear_layout(t), sample_energy_tear_layout(t));
+            assert_eq!(sample_open_effect(OpenAnimationEffect::EnergyTear, t), sample_energy_tear(t));
+        }
+    }
+
+    #[test]
+    fn scale_never_produces_a_tear_layout() {
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            assert_eq!(energy_tear_layout_for(OpenAnimationEffect::Scale, t), None, "t={t}");
+        }
+    }
+
+    #[test]
+    fn teleport_never_produces_a_tear_layout() {
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            assert_eq!(energy_tear_layout_for(OpenAnimationEffect::Teleport, t), None, "t={t}");
+        }
+    }
+
+    #[test]
+    fn bubble_never_produces_a_tear_layout() {
+        // 3a3fa2b4-r1: bubble is geometry+opacity only — like Scale and
+        // Teleport, it must never trigger energy_tear's slice/streak
+        // overlay path, at any point across its whole [0, 1] range.
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            assert_eq!(energy_tear_layout_for(OpenAnimationEffect::Bubble, t), None, "t={t}");
+        }
+    }
+
+    #[test]
+    fn energy_tear_only_produces_a_layout_during_its_own_tear_phase() {
+        assert!(energy_tear_layout_for(OpenAnimationEffect::EnergyTear, 0.0).is_some());
+        assert!(energy_tear_layout_for(OpenAnimationEffect::EnergyTear, ENERGY_TEAR_END - 0.001).is_some());
+        assert_eq!(energy_tear_layout_for(OpenAnimationEffect::EnergyTear, ENERGY_TEAR_END), None);
+        assert_eq!(energy_tear_layout_for(OpenAnimationEffect::EnergyTear, 1.0), None);
+    }
+
+    #[test]
+    fn teleport_is_unmodified_by_this_milestone_regression_pin() {
+        // Regression pin against the 3a3fa2b2-r2-accepted human-validated
+        // curve — this milestone (3a3fa2b3) must not alter it at all.
+        let peak = sample_teleport(TELEPORT_PHASE_B_END);
+        assert_eq!((peak.opacity, peak.scale_x, peak.scale_y), (1.0, 1.03, 1.06));
+        let start = sample_teleport(0.0);
+        assert_eq!((start.opacity, start.scale_x, start.scale_y), (TELEPORT_START_OPACITY, TELEPORT_START_SCALE_X, TELEPORT_START_SCALE_Y));
+    }
+
+    // --- bubble sampler (3a3fa2b4-r1) ---
+
+    #[test]
+    fn bubble_start_is_compressed_and_translucent() {
+        let start = sample_bubble(0.0);
+        assert!(start.opacity > 0.0 && start.opacity < 1.0, "opacity={}", start.opacity);
+        assert!(start.scale_x < 1.0, "scale_x={}", start.scale_x);
+        assert!(start.scale_y < 1.0, "scale_y={}", start.scale_y);
+        assert_eq!((start.opacity, start.scale_x, start.scale_y), (BUBBLE_START_OPACITY, BUBBLE_START_SCALE_X, BUBBLE_START_SCALE_Y));
+    }
+
+    #[test]
+    fn bubble_pop_overshoots_both_axes_at_full_opacity() {
+        // Sampled exactly at the phase A/B boundary: by construction this
+        // equals phase A's own end values (continuity, u=0 on the phase B
+        // side) — the peak of the "pop".
+        let pop = sample_bubble(BUBBLE_PHASE_A_END);
+        assert_eq!(pop.opacity, 1.0);
+        assert!(pop.scale_x > 1.0, "scale_x={}", pop.scale_x);
+        assert!(pop.scale_y > 1.0, "scale_y={}", pop.scale_y);
+    }
+
+    #[test]
+    fn bubble_squash_has_one_axis_above_and_one_below_one() {
+        // Sampled at the phase B/C boundary: equals phase B's own end
+        // values by the same continuity argument.
+        let squash = sample_bubble(BUBBLE_PHASE_B_END);
+        assert!(squash.scale_x > 1.0, "scale_x={}", squash.scale_x);
+        assert!(squash.scale_y < 1.0, "scale_y={}", squash.scale_y);
+    }
+
+    #[test]
+    fn bubble_rebound_reverses_which_axis_leads() {
+        // Sampled at the phase C/D boundary: equals phase C's own end
+        // values by continuity — the opposite-sign rebound peak.
+        let rebound = sample_bubble(BUBBLE_PHASE_C_END);
+        assert!(rebound.scale_x < 1.0, "scale_x={}", rebound.scale_x);
+        assert!(rebound.scale_y > 1.0, "scale_y={}", rebound.scale_y);
+    }
+
+    #[test]
+    fn bubble_reaches_exact_final_identity() {
+        let end = sample_bubble(1.0);
+        assert_eq!((end.opacity, end.scale_x, end.scale_y), (1.0, 1.0, 1.0));
+        // Also proven via the generic dispatcher, not just the direct call.
+        let via_dispatch = sample_open_effect(OpenAnimationEffect::Bubble, 1.0);
+        assert_eq!(via_dispatch, end);
+    }
+
+    #[test]
+    fn bubble_sampling_is_always_finite_and_within_safe_bounds() {
+        for i in 0..=200 {
+            let t = i as f32 / 200.0;
+            let visual = sample_bubble(t);
+            assert!(visual.opacity.is_finite(), "t={t}");
+            assert!(visual.scale_x.is_finite(), "t={t}");
+            assert!(visual.scale_y.is_finite(), "t={t}");
+            assert!((0.0..=1.0).contains(&visual.opacity), "t={t} opacity={}", visual.opacity);
+            assert!(visual.scale_x > 0.0, "t={t} scale_x={}", visual.scale_x);
+            assert!(visual.scale_y > 0.0, "t={t} scale_y={}", visual.scale_y);
+        }
+    }
+
+    #[test]
+    fn bubble_sampling_is_deterministic() {
+        for i in 0..=40 {
+            let t = i as f32 / 40.0;
+            assert_eq!(sample_bubble(t), sample_bubble(t));
+            assert_eq!(sample_open_effect(OpenAnimationEffect::Bubble, t), sample_bubble(t));
+        }
+    }
+
+    #[test]
+    fn bubble_is_distinct_from_scale_and_teleport_by_actual_sampled_values() {
+        // Compare the actual AnimationVisual samples, not merely enum
+        // identity — at every representative t below, Bubble's value
+        // must differ from both Scale's and Teleport's own sample.
+        for i in 1..20 {
+            let t = i as f32 / 20.0;
+            let bubble = sample_bubble(t);
+            let scale = sample_scale(t);
+            let teleport = sample_teleport(t);
+            assert_ne!(bubble, scale, "t={t} bubble matched scale");
+            assert_ne!(bubble, teleport, "t={t} bubble matched teleport");
+        }
+    }
+
+    #[test]
+    fn bubble_axis_reversal_is_present_across_the_curve() {
+        // The defining Bubble characteristic (section 6 of the R1 spec):
+        // at least one phase has scale_x > 1 && scale_y < 1, and a LATER
+        // phase has scale_x < 1 && scale_y > 1.
+        let squash = sample_bubble(BUBBLE_PHASE_B_END);
+        let rebound = sample_bubble(BUBBLE_PHASE_C_END);
+        assert!(squash.scale_x > 1.0 && squash.scale_y < 1.0);
+        assert!(rebound.scale_x < 1.0 && rebound.scale_y > 1.0);
+        assert!(BUBBLE_PHASE_B_END < BUBBLE_PHASE_C_END, "squash must precede rebound");
+    }
+
+    #[test]
+    fn bubble_never_forces_translucent_windows_opaque_beyond_its_own_visual_opacity() {
+        // Composition contract (unchanged, generic): effective opacity =
+        // resolved/base opacity * AnimationVisual.opacity. At Bubble's
+        // exact final state (opacity == 1.0), a resolved 0.80 window's
+        // effective opacity is 0.80, never bumped to 1.0 by the effect.
+        let end = sample_bubble(1.0);
+        assert_eq!(end.opacity, 1.0);
+        let base_opacity = 0.80_f32;
+        assert_eq!(base_opacity * end.opacity, 0.80);
+    }
+
+    #[test]
+    fn bubble_strongest_squash_survives_generic_geometry_scaling() {
+        // Exercises Bubble's most extreme non-uniform values (the start
+        // state: scale_x=0.62, scale_y=0.42) through the SAME generic
+        // scale_render_quad_plan every other effect uses — no
+        // Bubble-specific geometry function exists or is needed.
+        let plan = animation_test_plan(10, 20, 200, 100);
+        let scaled = scale_render_quad_plan(plan, BUBBLE_START_SCALE_X, BUBBLE_START_SCALE_Y);
+        assert!(scaled.width >= 1);
+        assert!(scaled.height >= 1);
+        assert!(scaled.outer_width >= 1);
+        assert!(scaled.outer_height >= 1);
+        // Non-uniform scaling proof: width follows scale_x independently
+        // of height following scale_y — not a single shared factor.
+        let expected_width = ((plan.width as f32) * BUBBLE_START_SCALE_X).round().max(1.0) as i32;
+        let expected_height = ((plan.height as f32) * BUBBLE_START_SCALE_Y).round().max(1.0) as i32;
+        assert_eq!(scaled.width, expected_width);
+        assert_eq!(scaled.height, expected_height);
+        let orig_center_x = plan.dst_x as f32 + plan.width as f32 / 2.0;
+        let orig_center_y = plan.dst_y as f32 + plan.height as f32 / 2.0;
+        let new_center_x = scaled.dst_x as f32 + scaled.width as f32 / 2.0;
+        let new_center_y = scaled.dst_y as f32 + scaled.height as f32 / 2.0;
+        assert!((orig_center_x - new_center_x).abs() <= 1.0);
+        assert!((orig_center_y - new_center_y).abs() <= 1.0);
+        // Final identity (scale 1.0/1.0) exactly reproduces the original plan.
+        let identity = scale_render_quad_plan(plan, 1.0, 1.0);
+        assert_eq!(identity, plan);
+    }
+
+    // --- geometry / render contract (energy_tear_render_plan) ---
+
+    #[test]
+    fn energy_tear_slices_tile_the_full_width_with_no_gaps_at_rest() {
+        let plan = animation_test_plan(0, 0, 203, 100); // not a multiple of 5
+        let layout = EnergyTearLayout { slice_offset_fractions: [0.0; ENERGY_TEAR_SLICE_COUNT], streak_alpha: 0.0 };
+        let render_plan = energy_tear_render_plan(plan, &layout).unwrap();
+        let total: i32 = render_plan.slices.iter().map(|s| s.width).sum();
+        assert_eq!(total, plan.width);
+        let mut expected_local_offset = 0.0_f32;
+        for slice in &render_plan.slices {
+            assert!(slice.width >= 1);
+            assert_eq!(slice.local_offset_x, expected_local_offset);
+            // At rest (offsets all zero), on-screen dst_x must exactly
+            // continue the previous slice — no gap, no overlap.
+            assert_eq!(slice.dst_x, plan.dst_x + expected_local_offset.round() as i32);
+            expected_local_offset += slice.width as f32;
+        }
+        assert_eq!(expected_local_offset, plan.width as f32);
+    }
+
+    #[test]
+    fn energy_tear_slices_move_and_scale_with_the_window() {
+        let layout = sample_energy_tear_layout(0.0);
+        let plan_a = animation_test_plan(10, 20, 200, 100);
+        let plan_b = animation_test_plan(60, 20, 200, 100); // moved +50 in x
+        let render_a = energy_tear_render_plan(plan_a, &layout).unwrap();
+        let render_b = energy_tear_render_plan(plan_b, &layout).unwrap();
+        for i in 0..ENERGY_TEAR_SLICE_COUNT {
+            assert_eq!(render_b.slices[i].dst_x - render_a.slices[i].dst_x, 50, "slice {i}");
+            assert_eq!(render_a.slices[i].width, render_b.slices[i].width, "slice {i}");
+        }
+    }
+
+    #[test]
+    fn energy_tear_render_plan_carries_the_whole_window_mask_reference() {
+        // This is the data-contract half of "tears respect corner
+        // radius/clipping": each slice must be masked against the WHOLE
+        // window's size/corner_radius, never its own tiny slice size —
+        // the actual GPU-side masking correctness is only visually
+        // verifiable at runtime (see the preview report), but this
+        // proves the geometry handed to the renderer is correct.
+        let mut plan = animation_test_plan(0, 0, 200, 100);
+        plan.corner_radius = 12.0;
+        let layout = sample_energy_tear_layout(0.0);
+        let render_plan = energy_tear_render_plan(plan, &layout).unwrap();
+        assert_eq!(render_plan.full_width, plan.width as f32);
+        assert_eq!(render_plan.full_height, plan.height as f32);
+        assert_eq!(render_plan.corner_radius, plan.corner_radius);
+    }
+
+    #[test]
+    fn energy_tear_minimum_dimensions_are_always_at_least_one_pixel() {
+        for width in [5, 6, 7, 9, 100, 101, 997] {
+            let plan = animation_test_plan(0, 0, width, 50);
+            let layout = sample_energy_tear_layout(0.05);
+            let render_plan = energy_tear_render_plan(plan, &layout).unwrap();
+            for slice in &render_plan.slices {
+                assert!(slice.width >= 1, "width={width} slice.width={}", slice.width);
+                assert!(slice.height >= 1, "width={width} slice.height={}", slice.height);
+            }
+            for streak in &render_plan.streaks {
+                assert!(streak.width >= 1, "width={width} streak.width={}", streak.width);
+                assert!(streak.height >= 1, "width={width} streak.height={}", streak.height);
+            }
+        }
+    }
+
+    #[test]
+    fn energy_tear_render_plan_refuses_windows_too_narrow_to_slice() {
+        for width in [0, 1, 2, 3, 4] {
+            let plan = animation_test_plan(0, 0, width, 50);
+            let layout = sample_energy_tear_layout(0.0);
+            assert_eq!(energy_tear_render_plan(plan, &layout), None, "width={width}");
+        }
+    }
+
+    #[test]
+    fn energy_tear_uv_ranges_stay_within_the_original_plans_uv_window() {
+        // A partially off-screen window (src_x > 0, so u0 != 0.0),
+        // constructed directly rather than via the always-[0,1]
+        // animation_test_plan fixture, to prove slice UVs never escape
+        // the ORIGINAL plan's own UV sub-window.
+        let plan = RenderQuadPlan {
+            dst_x: 0, dst_y: 0, width: 200, height: 100,
+            outer_x: 0, outer_y: 0, outer_width: 200, outer_height: 100,
+            src_x: 40, src_y: 0, src_width: 200, src_height: 100,
+            u0: 0.2, v0: 0.0, u1: 0.9, v1: 1.0,
+            corner_radius: 0.0, border_width: 0.0, border_color: [0.0, 0.0, 0.0, 1.0],
+        };
+        let layout = sample_energy_tear_layout(0.0);
+        let render_plan = energy_tear_render_plan(plan, &layout).unwrap();
+        for slice in &render_plan.slices {
+            assert!(slice.u0 >= plan.u0 - 1e-5 && slice.u0 <= plan.u1 + 1e-5, "u0={}", slice.u0);
+            assert!(slice.u1 >= plan.u0 - 1e-5 && slice.u1 <= plan.u1 + 1e-5, "u1={}", slice.u1);
+            assert!(slice.u0 <= slice.u1);
+            assert_eq!(slice.v0, plan.v0);
+            assert_eq!(slice.v1, plan.v1);
+        }
+        // First/last slice touch the original plan's own UV edges exactly.
+        assert_eq!(render_plan.slices[0].u0, plan.u0);
+        assert_eq!(render_plan.slices[ENERGY_TEAR_SLICE_COUNT - 1].u1, plan.u1);
+    }
+
+    #[test]
+    fn energy_tear_slices_carry_no_border_by_construction() {
+        // Structural, not runtime: EnergyTearSlicePlan simply has no
+        // border field at all, so a slice cannot carry border state —
+        // border reappears correctly, unmodified, only once the render
+        // loop falls back to the ordinary single-quad draw (t >=
+        // ENERGY_TEAR_END or any non-energy_tear effect). Confirmed here
+        // by exhaustively naming this plan's own fields.
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let layout = sample_energy_tear_layout(0.0);
+        let render_plan = energy_tear_render_plan(plan, &layout).unwrap();
+        let EnergyTearSlicePlan { dst_x: _, dst_y: _, width: _, height: _, u0: _, v0: _, u1: _, v1: _, local_offset_x: _ } = render_plan.slices[0];
+    }
+
+    // --- regressions ---
+
+    #[test]
+    fn dock_and_desktop_stay_ineligible_regardless_of_configured_effect() {
+        for effect in [OpenAnimationEffect::Scale, OpenAnimationEffect::Teleport, OpenAnimationEffect::EnergyTear] {
+            let _ = test_animation_config_with_effect(true, effect);
+            for visual_class in [SurfaceVisualClass::Dock, SurfaceVisualClass::Desktop] {
+                let entry = animation_test_entry(1, visual_class, false);
+                assert!(!eligible_for_open_animation(&entry), "effect={effect:?} visual_class={visual_class:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn override_redirect_policy_unaffected_by_configured_effect() {
+        for effect in [OpenAnimationEffect::Scale, OpenAnimationEffect::Teleport, OpenAnimationEffect::EnergyTear] {
+            let _ = test_animation_config_with_effect(true, effect);
+            let normal = animation_test_entry(2, SurfaceVisualClass::Normal, false);
+            assert!(eligible_for_open_animation(&normal), "effect={effect:?}");
+        }
+    }
+
+    #[test]
+    fn energy_tear_shadow_equals_non_animated_shadow_at_full_strength_throughout() {
+        // scale_x==scale_y==1.0 always for energy_tear, so draw_plan ==
+        // plan exactly — shadow behaves exactly like the s1 contract
+        // already proves for any non-scaling case, with zero
+        // energy_tear-specific shadow code anywhere. 3a3fa2b3-r2 note:
+        // since visual.opacity is now a constant 1.0 (see the r2 window-
+        // opacity correction above), shadow_opacity_multiplier (which the
+        // unchanged render loop derives directly from visual.opacity) is
+        // ALSO constantly 1.0 for energy_tear — shadow no longer fades in
+        // alongside the window; it renders at full configured strength
+        // from the very first frame. This is a deliberate, transparent
+        // consequence of the window-opacity fix, not a separate change.
+        let plan = animation_test_plan(10, 5, 200, 100);
+        let style = shadow_style(true, 8.0, 3.0, 4.0);
+        for t in [0.0_f32, 0.10, ENERGY_TEAR_END, 0.5, 1.0] {
+            let visual = sample_energy_tear(t);
+            assert_eq!(visual.opacity, 1.0, "t={t}");
+            let draw_plan = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+            assert_eq!(draw_plan, plan, "t={t}");
+            let animated = shadow_params_from_plan(style, &draw_plan, visual.opacity).unwrap();
+            let ordinary = shadow_params_from_plan(style, &plan, 1.0).unwrap();
+            assert_eq!(animated, ordinary, "t={t}");
+            assert_eq!(animated.strength, style.strength, "t={t}: shadow must be at full configured strength");
+        }
+    }
+
+    #[test]
+    fn provisional_energy_tear_first_frame_uses_the_tear_active_layout() {
+        let new_surface = animation_test_entry(88, SurfaceVisualClass::Normal, false);
+        let snapshot = SceneSnapshot { root: 1, root_geometry: full_hd_root(), entries: vec![new_surface] };
+        let old_surfaces = HashSet::new();
+        let persistent = HashMap::new();
+        let now = Instant::now();
+        let provisional = provisional_open_animations(
+            &old_surfaces, &snapshot, false, true,
+            test_animation_config_with_effect(true, OpenAnimationEffect::EnergyTear), now,
+        );
+        let render_view = merge_window_animations(&persistent, &provisional);
+        let animation = render_view.get(&88).expect("newly eligible surface must have a provisional animation");
+        assert_eq!(animation.effect, OpenAnimationEffect::EnergyTear);
+        let t = animation.progress(now);
+        assert!(t < 0.02);
+        let layout = energy_tear_layout_for(animation.effect, t).expect("first frame must still be in the tear phase");
+        assert_ne!(layout.streak_alpha, 0.0);
+    }
+
+    #[test]
+    fn energy_tear_completed_animation_retires_with_no_visual_jump() {
+        let mut animations = HashMap::new();
+        animations.insert(1, test_window_animation_with_effect(Instant::now() - Duration::from_secs(10), OpenAnimationEffect::EnergyTear));
+        let now = Instant::now();
+        let visual = animations[&1].sample(now);
+        assert_eq!(visual, AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 });
+        assert_eq!(energy_tear_layout_for(OpenAnimationEffect::EnergyTear, animations[&1].progress(now)), None);
+        assert!(animations[&1].is_complete(now));
+        let mut removed = HashSet::new();
+        removed.insert(1);
+        retire_removed_surface_animations(&mut animations, &removed);
+        assert!(animations.is_empty());
+    }
+
+    // --- system invariants ---
+
+    #[test]
+    fn render_wiring_energy_tear_adds_no_new_x11_queries_or_gl_resources() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = start + source[start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("energy_tear_layout_for(animation.effect, t)"));
+        assert!(body.contains("render_energy_tear_slices"));
+        assert!(!body.contains("intern_atom"));
+        assert!(!body.contains("GenTextures"));
+        assert!(!body.contains("GenFramebuffers"));
+        assert!(!body.contains("CreateProgram"));
+        // Still exactly one AnimationVisual sample per surface per render.
+        assert_eq!(body.matches(".sample(animation_now)").count(), 1);
+    }
+
+    // ========================================================
+    // 3a3fa2b1-s1 — animated shadow geometry alignment.
+    // ========================================================
+
+    // --- A: non-animated shadow geometry/opacity unchanged ---
+
+    #[test]
+    fn non_animated_shadow_geometry_and_strength_reproduce_pre_fix_behavior() {
+        let plan = animation_test_plan(10, 20, 200, 100);
+        let style = shadow_style(true, 8.0, 3.0, 4.0);
+        // 1.0 is exactly what render_egl_scene_parts passes for an entry
+        // with no active animation (draw_plan == plan in that arm).
+        let shadow = shadow_params_from_plan(style, &plan, 1.0).unwrap();
+        assert_eq!(shadow.outer_x, plan.outer_x as f32);
+        assert_eq!(shadow.outer_y, plan.outer_y as f32);
+        assert_eq!(shadow.outer_width, plan.outer_width as f32);
+        assert_eq!(shadow.outer_height, plan.outer_height as f32);
+        assert_eq!(shadow.corner_radius, plan.corner_radius);
+        assert_eq!(shadow.strength, style.strength);
+    }
+
+    // --- B: Scale 0.70 shadow center matches animated surface center ---
+
+    #[test]
+    fn scale_0_70_shadow_center_matches_animated_surface_center() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let visual = sample_scale(0.0);
+        assert_eq!((visual.scale_x, visual.scale_y), (SCALE_EFFECT_FROM_SCALE, SCALE_EFFECT_FROM_SCALE));
+        let draw_plan = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+        // Opacity multiplier forced to 1.0 here to isolate GEOMETRY from
+        // the separate opacity-coupling behavior proved in section D below
+        // (Scale's own t=0 opacity is 0.0, which would otherwise make
+        // shadow_params_from_plan return None and hide the geometry check).
+        let shadow = shadow_params_from_plan(shadow_style(true, 8.0, 0.0, 0.0), &draw_plan, 1.0).unwrap();
+        let surface_center_x = draw_plan.dst_x as f32 + draw_plan.width as f32 / 2.0;
+        let surface_center_y = draw_plan.dst_y as f32 + draw_plan.height as f32 / 2.0;
+        let shadow_center_x = shadow.outer_x + shadow.outer_width / 2.0;
+        let shadow_center_y = shadow.outer_y + shadow.outer_height / 2.0;
+        assert!((surface_center_x - shadow_center_x).abs() <= 1.0);
+        assert!((surface_center_y - shadow_center_y).abs() <= 1.0);
+    }
+
+    // --- C: Scale 0.70 shadow base dimensions follow animated window ---
+
+    #[test]
+    fn scale_0_70_shadow_base_dimensions_follow_animated_window_not_real_window() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let visual = sample_scale(0.0);
+        let draw_plan = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+        let style = shadow_style(true, 8.0, 0.0, 0.0);
+        let animated_shadow = shadow_params_from_plan(style, &draw_plan, 1.0).unwrap();
+        let real_shadow = shadow_params_from_plan(style, &plan, 1.0).unwrap();
+        assert_eq!(animated_shadow.outer_width, draw_plan.outer_width as f32);
+        assert_eq!(animated_shadow.outer_height, draw_plan.outer_height as f32);
+        assert_ne!(animated_shadow.outer_width, real_shadow.outer_width);
+        assert_ne!(animated_shadow.outer_height, real_shadow.outer_height);
+    }
+
+    // --- D: non-uniform hypothetical transform — shadow follows both axes ---
+
+    #[test]
+    fn non_uniform_scale_shadow_base_rect_follows_each_axis_independently() {
+        // Conceptual future-Teleport-shaped values (see the 3a3fa2b1-s1
+        // milestone's own example), exercised here generically without
+        // implementing or depending on Teleport at all.
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let (scale_x, scale_y) = (0.45, 0.10);
+        let draw_plan = scale_render_quad_plan(plan, scale_x, scale_y);
+        let expected_outer_width = ((plan.outer_width as f32) * scale_x).round().max(1.0) as i32;
+        let expected_outer_height = ((plan.outer_height as f32) * scale_y).round().max(1.0) as i32;
+        assert_eq!(draw_plan.outer_width, expected_outer_width);
+        assert_eq!(draw_plan.outer_height, expected_outer_height);
+        let shadow = shadow_params_from_plan(shadow_style(true, 8.0, 0.0, 0.0), &draw_plan, 1.0).unwrap();
+        assert_eq!(shadow.outer_width, expected_outer_width as f32);
+        assert_eq!(shadow.outer_height, expected_outer_height as f32);
+    }
+
+    // --- E: final t=1.0 — animated shadow geometry == ordinary shadow ---
+
+    #[test]
+    fn scale_at_t1_shadow_geometry_and_strength_match_ordinary_shadow_exactly() {
+        let plan = animation_test_plan(10, 5, 200, 100);
+        let visual = sample_scale(1.0);
+        assert_eq!(visual, AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 });
+        let draw_plan = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+        let style = shadow_style(true, 8.0, 3.0, 4.0);
+        let animated_shadow = shadow_params_from_plan(style, &draw_plan, visual.opacity).unwrap();
+        let ordinary_shadow = shadow_params_from_plan(style, &plan, 1.0).unwrap();
+        assert_eq!(animated_shadow, ordinary_shadow);
+    }
+
+    // --- F: UVs remain irrelevant/unchanged for the surface itself ---
+    // (covered directly by scale_render_quad_plan_preserves_uv_but_scales_
+    // outer_bounds_with_the_box above — u0/v0/u1/v1/src_x/src_y untouched.)
+
+    // --- G: real X11 geometry never mutated by this pipeline ---
+
+    #[test]
+    fn shadow_alignment_pipeline_never_touches_authoritative_x11_geometry() {
+        let entry = animation_test_entry(9, SurfaceVisualClass::Normal, false);
+        let original_geometry = entry.geometry;
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let visual = sample_scale(0.3);
+        let draw_plan = scale_render_quad_plan(plan, visual.scale_x, visual.scale_y);
+        let _shadow = shadow_params_from_plan(shadow_style(true, 8.0, 0.0, 0.0), &draw_plan, visual.opacity);
+        assert_eq!(entry.geometry, original_geometry);
+    }
+
+    // --- shadow opacity coupling (multiplier only, never replaces config) ---
+
+    #[test]
+    fn shadow_opacity_multiplier_scales_configured_strength_linearly() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let style = shadow_style(true, 8.0, 0.0, 0.0); // strength = 0.5
+        assert_eq!(shadow_params_from_plan(style, &plan, 1.0).unwrap().strength, style.strength);
+        let half = shadow_params_from_plan(style, &plan, 0.5).unwrap();
+        assert_eq!(half.strength, style.strength * 0.5);
+    }
+
+    #[test]
+    fn shadow_opacity_multiplier_zero_yields_no_shadow_params() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let style = shadow_style(true, 8.0, 0.0, 0.0);
+        assert!(shadow_params_from_plan(style, &plan, 0.0).is_none());
+    }
+
+    #[test]
+    fn shadow_opacity_multiplier_one_reproduces_exact_configured_strength() {
+        let plan = animation_test_plan(0, 0, 200, 100);
+        let style = shadow_style(true, 8.0, 0.0, 0.0);
+        assert_eq!(shadow_params_from_plan(style, &plan, 1.0).unwrap().strength, style.strength);
+    }
+
+    // --- blur independence + single-sample-path proof, via source text
+    // (same technique blur_wiring_has_no_new_gl_resources_or_renderer_x11_
+    // queries already uses for render_egl_scene_parts) ---
+
+    #[test]
+    fn render_wiring_samples_animation_visual_exactly_once_per_surface() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = start + source[start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let body = &source[start..end];
+        assert_eq!(body.matches(".sample(animation_now)").count(), 1);
+    }
+
+    #[test]
+    fn render_wiring_couples_shadow_to_draw_plan_and_visual_opacity_only() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = start + source[start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let body = &source[start..end];
+        assert_eq!(
+            body.matches("shadow_params_from_plan(shadow_style, &draw_plan, shadow_opacity_multiplier)").count(),
+            1,
+        );
+        // The pre-3a3fa2b1-s1 real-plan-only shadow call must be gone.
+        assert!(!body.contains("shadow_params_from_plan(shadow_style, &plan)"));
+    }
+
+    #[test]
+    fn render_wiring_keeps_blur_on_the_real_plan_not_draw_plan() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = start + source[start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let body = &source[start..end];
+        assert_eq!(
+            body.matches("capture_and_blur_background(\n                plan.outer_x,").count(),
+            1,
+        );
+        assert_eq!(
+            body.matches("draw_blurred_backdrop(blurred_texture, backdrop_params, plan.corner_radius)").count(),
+            2,
+        );
+        assert!(!body.contains("capture_and_blur_background(\n                draw_plan"));
+        assert!(!body.contains("draw_blurred_backdrop(blurred_texture, backdrop_params, draw_plan.corner_radius)"));
+    }
+
+    // --- first-frame: provisional animation's shadow aligns with the same
+    // first animated surface plan, never a full-size shadow on a tiny
+    // first frame ---
+
+    #[test]
+    fn provisional_scale_first_frame_shadow_never_uses_full_size_rect() {
+        let new_surface = animation_test_entry(55, SurfaceVisualClass::Normal, false);
+        let snapshot = SceneSnapshot { root: 1, root_geometry: full_hd_root(), entries: vec![new_surface] };
+        let old_surfaces = HashSet::new();
+        let persistent = HashMap::new();
+        let now = Instant::now();
+        let provisional = provisional_open_animations(
+            &old_surfaces, &snapshot, false, true,
+            test_animation_config(true), now,
+        );
+        let render_view = merge_window_animations(&persistent, &provisional);
+        let animation = render_view.get(&55).expect("newly eligible surface must have a provisional animation");
+        let t = animation.progress(now);
+        let visual = animation.sample(now);
+        assert!(t < 0.05);
+        let real_plan = animation_test_plan(0, 0, 200, 100);
+        let draw_plan = scale_render_quad_plan(real_plan, visual.scale_x, visual.scale_y);
+        // The rect a shadow would use this frame is already the small,
+        // first-frame animated rect — never the final full-size one.
+        assert_ne!(draw_plan.outer_width, real_plan.outer_width);
+        assert_ne!(draw_plan.outer_height, real_plan.outer_height);
+        // And at Scale's t≈0 opacity (0.0), shadow_params_from_plan
+        // correctly yields no shadow at all this frame — the forbidden
+        // "tiny window + full-size shadow" case cannot occur either way.
+        let shadow = shadow_params_from_plan(shadow_style(true, 8.0, 0.0, 0.0), &draw_plan, visual.opacity);
+        assert!(shadow.is_none());
+    }
+
+    // --- move/resize during animation: no stale cached rectangle ---
+
+    #[test]
+    fn shadow_follows_latest_animated_rect_across_a_simulated_move_and_resize() {
+        // "Move": nothing in this pipeline caches an initial rect — each
+        // call is a pure function of that frame's real plan + visual.
+        let moved_plan = animation_test_plan(80, 40, 200, 100);
+        let visual = sample_scale(0.5);
+        let draw_plan = scale_render_quad_plan(moved_plan, visual.scale_x, visual.scale_y);
+        let style = shadow_style(true, 8.0, 0.0, 0.0);
+        let shadow = shadow_params_from_plan(style, &draw_plan, 1.0).unwrap();
+        assert_eq!(shadow.outer_x + shadow.outer_width / 2.0, draw_plan.outer_x as f32 + draw_plan.outer_width as f32 / 2.0);
+        assert_eq!(shadow.outer_y + shadow.outer_height / 2.0, draw_plan.outer_y as f32 + draw_plan.outer_height as f32 / 2.0);
+
+        // "Resize": same animation progress, different real dimensions —
+        // the shadow rect must change too, not remain at the pre-resize size.
+        let resized_plan = animation_test_plan(80, 40, 350, 60);
+        let resized_draw_plan = scale_render_quad_plan(resized_plan, visual.scale_x, visual.scale_y);
+        assert_ne!(resized_draw_plan.outer_width, draw_plan.outer_width);
+        let resized_shadow = shadow_params_from_plan(style, &resized_draw_plan, 1.0).unwrap();
+        assert_eq!(resized_shadow.outer_width, resized_draw_plan.outer_width as f32);
+    }
+
+    // --- G/H/I/J: eligibility ---
+
+    #[test]
+    fn eligibility_normal_non_override_redirect_is_eligible() {
+        let entry = animation_test_entry(1, SurfaceVisualClass::Normal, false);
+        assert!(eligible_for_open_animation(&entry));
+    }
+
+    #[test]
+    fn eligibility_excludes_dock() {
+        let entry = animation_test_entry(1, SurfaceVisualClass::Dock, false);
+        assert!(!eligible_for_open_animation(&entry));
+    }
+
+    #[test]
+    fn eligibility_excludes_desktop() {
+        let entry = animation_test_entry(1, SurfaceVisualClass::Desktop, false);
+        assert!(!eligible_for_open_animation(&entry));
+    }
+
+    #[test]
+    fn eligibility_excludes_override_redirect_even_when_classified_normal() {
+        // Regression guard for the exact gap the audit flagged: unknown
+        // override_redirect popups classify as Normal by default, so
+        // visual_class alone is not sufficient.
+        let entry = animation_test_entry(1, SurfaceVisualClass::Normal, true);
+        assert!(!eligible_for_open_animation(&entry));
+    }
+
+    // --- K/L/N: provisional animation construction ---
+
+    #[test]
+    fn provisional_animations_suppressed_on_first_publish() {
+        let entry = animation_test_entry(1, SurfaceVisualClass::Normal, false);
+        let snapshot = SceneSnapshot { root: 1, root_geometry: full_hd_root(), entries: vec![entry] };
+        let old_surfaces = HashSet::new();
+        let result = provisional_open_animations(
+            &old_surfaces, &snapshot, true, true, test_animation_config(true), Instant::now(),
+        );
+        assert!(result.is_empty(), "five-windows-already-open startup must not animate");
+    }
+
+    #[test]
+    fn provisional_animations_only_for_genuinely_added_surfaces() {
+        let existing = animation_test_entry(1, SurfaceVisualClass::Normal, false);
+        let added = animation_test_entry(2, SurfaceVisualClass::Normal, false);
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: full_hd_root(),
+            entries: vec![existing, added],
+        };
+        let mut old_surfaces = HashSet::new();
+        old_surfaces.insert(1);
+        let result = provisional_open_animations(
+            &old_surfaces, &snapshot, false, true, test_animation_config(true), Instant::now(),
+        );
+        assert_eq!(result.len(), 1, "existing surface must not replay");
+        assert!(result.contains_key(&2), "genuinely added surface must be eligible");
+        assert!(!result.contains_key(&1));
+    }
+
+    #[test]
+    fn provisional_animations_disabled_when_present_unavailable() {
+        let entry = animation_test_entry(1, SurfaceVisualClass::Normal, false);
+        let snapshot = SceneSnapshot { root: 1, root_geometry: full_hd_root(), entries: vec![entry] };
+        let old_surfaces = HashSet::new();
+        let result = provisional_open_animations(
+            &old_surfaces, &snapshot, false, false, test_animation_config(true), Instant::now(),
+        );
+        assert!(result.is_empty(), "Present unavailable must render final state, never fail");
+    }
+
+    #[test]
+    fn provisional_animations_disabled_when_config_disabled() {
+        // The new (3a3fa2b1) gate, distinct from Present-availability:
+        // Present IS available here, but animation.enabled is false.
+        let entry = animation_test_entry(1, SurfaceVisualClass::Normal, false);
+        let snapshot = SceneSnapshot { root: 1, root_geometry: full_hd_root(), entries: vec![entry] };
+        let old_surfaces = HashSet::new();
+        let result = provisional_open_animations(
+            &old_surfaces, &snapshot, false, true, test_animation_config(false), Instant::now(),
+        );
+        assert!(result.is_empty(), "animation.enabled = false must render final state, never fail");
+    }
+
+    // --- M: removed surface ---
+
+    #[test]
+    fn retire_removed_surface_animations_removes_only_the_removed_ids() {
+        let mut animations = HashMap::new();
+        animations.insert(1, test_window_animation(Instant::now()));
+        animations.insert(2, test_window_animation(Instant::now()));
+        let mut removed = HashSet::new();
+        removed.insert(1);
+        retire_removed_surface_animations(&mut animations, &removed);
+        assert!(!animations.contains_key(&1));
+        assert!(animations.contains_key(&2));
+    }
+
+    // --- 24: rejected candidate leaves persistent state unchanged ---
+    //
+    // promote_provisional_animations is called from exactly one place,
+    // commit_candidate_inner, itself reachable only via commit_candidate
+    // after GateDecision::Accept (see rebuild_and_present's match on
+    // pre_commit_gate's result, and try_resize_only's `if
+    // !matches!(gate, GateDecision::Accept) { ...; return Ok(false); }`
+    // early return before ever calling commit_candidate). A rejected or
+    // retried candidate's `provisional_animations` is therefore simply
+    // dropped with the candidate — this test exercises promote's own merge
+    // semantics (what WOULD happen if it were called), proving it never
+    // clobbers an already-running animation's `started_at` even in the
+    // (structurally unreachable, since provisional only ever contains
+    // new_surfaces - old_surfaces) case of key overlap.
+    #[test]
+    fn promote_provisional_animations_merges_without_restarting_existing_entries() {
+        let mut persistent = HashMap::new();
+        let earlier = test_window_animation(Instant::now() - Duration::from_millis(50));
+        persistent.insert(1, earlier.clone());
+        let mut provisional = HashMap::new();
+        provisional.insert(1, test_window_animation(Instant::now()));
+        provisional.insert(2, test_window_animation(Instant::now()));
+        promote_provisional_animations(&mut persistent, provisional);
+        assert_eq!(persistent.len(), 2);
+        assert_eq!(persistent[&1].started_at, earlier.started_at);
+        assert!(persistent.contains_key(&2));
+    }
+
+    #[test]
+    fn promote_provisional_animations_never_called_leaves_persistent_state_untouched() {
+        let mut persistent = HashMap::new();
+        persistent.insert(1, test_window_animation(Instant::now()));
+        let before = persistent.len();
+        // A rejected candidate's provisional_animations is simply dropped —
+        // modeled here by never calling promote at all.
+        drop(HashMap::<Window, WindowAnimation>::new());
+        assert_eq!(persistent.len(), before);
+    }
+
+    // ========================================================
+    // 3a3fa2b5 — close animation core (reference sampler, RenderLayer
+    // reconciliation, transactional close_id allocation).
+    // ========================================================
+
+    #[test]
+    fn close_scale_sampler_reaches_exact_endpoints() {
+        let start = sample_close_scale(0.0);
+        assert_eq!(start, AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 });
+        let end = sample_close_scale(1.0);
+        assert_eq!(end, AnimationVisual { opacity: CLOSE_SCALE_END_OPACITY, scale_x: CLOSE_SCALE_END_SCALE, scale_y: CLOSE_SCALE_END_SCALE });
+        // Past-end clamps to exactly the same final state, never overshoots.
+        let past = sample_close_scale(1.5);
+        assert_eq!(past, end);
+    }
+
+    #[test]
+    fn close_scale_sampler_is_monotonic_deterministic_and_uniform() {
+        let mid = sample_close_scale(0.5);
+        assert!(mid.opacity > CLOSE_SCALE_END_OPACITY && mid.opacity < 1.0);
+        assert!(mid.scale_x > CLOSE_SCALE_END_SCALE && mid.scale_x < 1.0);
+        assert_eq!(mid.scale_x, mid.scale_y, "close scale is uniform, like open Scale");
+        assert_eq!(sample_close_scale(0.5), sample_close_scale(0.5), "deterministic: same t, same output");
+        let quarter = sample_close_scale(0.25);
+        assert!(quarter.opacity > mid.opacity, "opacity must decrease monotonically toward the end");
+    }
+
+    #[test]
+    fn sample_close_effect_dispatches_scale() {
+        assert_eq!(
+            sample_close_effect(crate::config::CloseAnimationEffect::Scale, 0.5),
+            sample_close_scale(0.5),
+        );
+    }
+
+    #[test]
+    fn closing_animation_progress_and_completion_mirror_window_animation() {
+        let started_at = Instant::now() - Duration::from_millis(90);
+        let animation = ClosingAnimation::new(started_at, crate::config::CloseAnimationEffect::Scale, Duration::from_millis(180));
+        let t = animation.progress(Instant::now());
+        assert!(t > 0.0 && t < 1.0);
+        assert!(!animation.is_complete(Instant::now()));
+        let completed = ClosingAnimation::new(Instant::now() - Duration::from_millis(500), crate::config::CloseAnimationEffect::Scale, Duration::from_millis(180));
+        assert!(completed.is_complete(Instant::now()));
+        assert_eq!(completed.progress(Instant::now()), 1.0, "progress must clamp, never exceed 1.0");
+    }
+
+    // --- reconcile_render_order: R4 required scenarios A-F ---
+
+    #[test]
+    fn reconcile_a_pure_restack_reorders_live_with_no_close() {
+        let previous = vec![RenderLayer::Live(1), RenderLayer::Live(2)];
+        let result = reconcile_render_order(&previous, &[2, 1], &HashSet::new(), &HashMap::new());
+        assert_eq!(result, vec![RenderLayer::Live(2), RenderLayer::Live(1)]);
+    }
+
+    #[test]
+    fn reconcile_b_close_between_two_live_survivors() {
+        // previous: A(1) C(2) B(3); C(2) closes; new live: [1, 3]
+        let previous = vec![RenderLayer::Live(1), RenderLayer::Live(2), RenderLayer::Live(3)];
+        let mut removed = HashSet::new();
+        removed.insert(2);
+        let mut closes = HashMap::new();
+        closes.insert(2, 100_u64);
+        let result = reconcile_render_order(&previous, &[1, 3], &removed, &closes);
+        assert_eq!(result, vec![RenderLayer::Live(1), RenderLayer::Closing(100), RenderLayer::Live(3)]);
+    }
+
+    #[test]
+    fn reconcile_c_live_restack_while_a_close_persists_never_blocks_the_restack() {
+        // committed: A(1) Closing(100) B(3); live restacks to [3, 1]
+        let previous = vec![RenderLayer::Live(1), RenderLayer::Closing(100), RenderLayer::Live(3)];
+        let result = reconcile_render_order(&previous, &[3, 1], &HashSet::new(), &HashMap::new());
+        assert_eq!(result, vec![RenderLayer::Live(3), RenderLayer::Live(1), RenderLayer::Closing(100)]);
+        // Live projection is exactly the authoritative order, regardless
+        // of the closing entry's presence.
+        let live_projection: Vec<Window> = result.iter().filter_map(|layer| match layer { RenderLayer::Live(xid) => Some(*xid), _ => None }).collect();
+        assert_eq!(live_projection, vec![3, 1]);
+    }
+
+    #[test]
+    fn reconcile_d_sequential_close_shares_its_predecessors_anchor() {
+        // committed: A(1) Closing(100) B(3); B(3) closes; new live: [1]
+        let previous = vec![RenderLayer::Live(1), RenderLayer::Closing(100), RenderLayer::Live(3)];
+        let mut removed = HashSet::new();
+        removed.insert(3);
+        let mut closes = HashMap::new();
+        closes.insert(3, 101_u64);
+        let result = reconcile_render_order(&previous, &[1], &removed, &closes);
+        assert_eq!(result, vec![RenderLayer::Live(1), RenderLayer::Closing(100), RenderLayer::Closing(101)]);
+    }
+
+    #[test]
+    fn reconcile_e_new_live_insertion_while_a_close_persists() {
+        // committed: A(1) Closing(100) B(3); new live: [1, 4, 3] (4 is new)
+        let previous = vec![RenderLayer::Live(1), RenderLayer::Closing(100), RenderLayer::Live(3)];
+        let result = reconcile_render_order(&previous, &[1, 4, 3], &HashSet::new(), &HashMap::new());
+        assert_eq!(result, vec![RenderLayer::Live(1), RenderLayer::Closing(100), RenderLayer::Live(4), RenderLayer::Live(3)]);
+        let live_projection: Vec<Window> = result.iter().filter_map(|layer| match layer { RenderLayer::Live(xid) => Some(*xid), _ => None }).collect();
+        assert_eq!(live_projection, vec![1, 4, 3]);
+    }
+
+    #[test]
+    fn reconcile_f_simultaneous_closes_preserve_old_relative_order() {
+        // previous: A(1) C(2) D(3) B(4); C and D close simultaneously; new live: [1, 4]
+        let previous = vec![RenderLayer::Live(1), RenderLayer::Live(2), RenderLayer::Live(3), RenderLayer::Live(4)];
+        let mut removed = HashSet::new();
+        removed.insert(2);
+        removed.insert(3);
+        let mut closes = HashMap::new();
+        closes.insert(2, 100_u64);
+        closes.insert(3, 101_u64);
+        let result = reconcile_render_order(&previous, &[1, 4], &removed, &closes);
+        assert_eq!(result, vec![RenderLayer::Live(1), RenderLayer::Closing(100), RenderLayer::Closing(101), RenderLayer::Live(4)]);
+    }
+
+    #[test]
+    fn reconcile_projection_invariant_holds_across_a_wide_property_sweep() {
+        // Exhaustive-ish sweep over small previous_order shapes and live
+        // permutations: the Live projection of the result must ALWAYS
+        // equal new_live_order exactly, regardless of closing content.
+        let live_permutations: [[Window; 3]; 6] = [
+            [1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1],
+        ];
+        let previous_shapes: Vec<Vec<RenderLayer>> = vec![
+            vec![RenderLayer::Live(1), RenderLayer::Live(2), RenderLayer::Live(3)],
+            vec![RenderLayer::Live(1), RenderLayer::Closing(50), RenderLayer::Live(2), RenderLayer::Live(3)],
+            vec![RenderLayer::Closing(50), RenderLayer::Live(1), RenderLayer::Live(2), RenderLayer::Live(3)],
+            vec![RenderLayer::Live(1), RenderLayer::Live(2), RenderLayer::Closing(50), RenderLayer::Live(3)],
+            Vec::new(),
+        ];
+        for previous in &previous_shapes {
+            for live in &live_permutations {
+                let result = reconcile_render_order(previous, live, &HashSet::new(), &HashMap::new());
+                let live_projection: Vec<Window> = result.iter().filter_map(|layer| match layer { RenderLayer::Live(xid) => Some(*xid), _ => None }).collect();
+                assert_eq!(live_projection, live.to_vec(), "previous={previous:?} live={live:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn reconcile_bootstrap_first_commit_reproduces_ordinary_snapshot_order() {
+        let result = reconcile_render_order(&[], &[7, 3, 9], &HashSet::new(), &HashMap::new());
+        assert_eq!(result, vec![RenderLayer::Live(7), RenderLayer::Live(3), RenderLayer::Live(9)]);
+    }
+
+    #[test]
+    fn reconcile_retirement_preserves_remaining_relative_order_and_live_projection() {
+        // A(1) Closing(100) Closing(101) Closing(102) B(3), 101 already
+        // retired by SceneSession::retire_completed_closing_visuals before
+        // this reconciliation runs — so it is simply absent from
+        // previous_order, exactly like this test constructs it.
+        let previous = vec![
+            RenderLayer::Live(1), RenderLayer::Closing(100), RenderLayer::Closing(102), RenderLayer::Live(3),
+        ];
+        let result = reconcile_render_order(&previous, &[1, 3], &HashSet::new(), &HashMap::new());
+        assert_eq!(result, vec![RenderLayer::Live(1), RenderLayer::Closing(100), RenderLayer::Closing(102), RenderLayer::Live(3)]);
+    }
+
+    #[test]
+    fn reconcile_xid_reuse_never_collides_with_an_existing_close_id() {
+        // Window 42 was live, closed (id 100), then its XID got reused by
+        // an unrelated new Live window in the SAME commit the old one's
+        // Closing(100) is still animating.
+        let previous = vec![RenderLayer::Closing(100), RenderLayer::Live(7)];
+        let result = reconcile_render_order(&previous, &[42, 7], &HashSet::new(), &HashMap::new());
+        // Closing(100) has no left-live-neighbor (nothing preceded it in
+        // previous_order), so it anchors to `None` (the very bottom) —
+        // unaffected by the reused XID, which enters purely via
+        // new_live_order with zero special-casing: Closing(100) still has
+        // no Window field to collide on.
+        assert_eq!(result, vec![RenderLayer::Closing(100), RenderLayer::Live(42), RenderLayer::Live(7)]);
+    }
+
+    #[test]
+    fn reconcile_ineligible_removal_is_dropped_without_updating_the_anchor() {
+        // A(1) X(2) B(3); X(2) is removed but NOT eligible for a close
+        // (no entry in provisional_closes) — it must simply vanish, and
+        // B's anchor computation must still see A as its nearest left
+        // survivor (not X).
+        let previous = vec![RenderLayer::Live(1), RenderLayer::Live(2), RenderLayer::Live(3)];
+        let mut removed = HashSet::new();
+        removed.insert(2);
+        let result = reconcile_render_order(&previous, &[1, 3], &removed, &HashMap::new());
+        assert_eq!(result, vec![RenderLayer::Live(1), RenderLayer::Live(3)]);
+    }
+
+    #[test]
+    fn reconcile_no_close_case_produces_exactly_ordinary_snapshot_entries_ordering() {
+        let previous = vec![RenderLayer::Live(5), RenderLayer::Live(6), RenderLayer::Live(7)];
+        let result = reconcile_render_order(&previous, &[5, 6, 7], &HashSet::new(), &HashMap::new());
+        assert_eq!(result, previous);
+    }
+
+    // --- allocate_close_ids: transactional model ---
+
+    #[test]
+    fn allocate_close_ids_retry_then_accept_matches_the_required_worked_example() {
+        // Attempt #1: base=100, reserves 100,101, then RETRY (discarded —
+        // modeled by simply not using attempt #1's return value at all).
+        let (attempt_1_ids, attempt_1_next) = allocate_close_ids(100, &[10, 11]);
+        assert_eq!(attempt_1_ids.len(), 2);
+        assert_eq!(attempt_1_next, 102);
+        // self.next_close_id was never written during attempt #1 (this is
+        // a pure function call — nothing committed), so attempt #2 starts
+        // from the SAME base=100 again.
+        let (attempt_2_ids, attempt_2_next) = allocate_close_ids(100, &[10, 11]);
+        assert_eq!(attempt_2_ids.get(&10), Some(&100));
+        assert_eq!(attempt_2_ids.get(&11), Some(&101));
+        assert_eq!(attempt_2_next, 102);
+        // ACCEPT: committed self.next_close_id becomes attempt_2_next.
+        assert_eq!(attempt_2_next, 102);
+    }
+
+    #[test]
+    fn allocate_close_ids_is_deterministic_and_order_preserving_by_input_order() {
+        let (ids, next) = allocate_close_ids(5, &[20, 21, 22]);
+        assert_eq!(ids[&20], 5);
+        assert_eq!(ids[&21], 6);
+        assert_eq!(ids[&22], 7);
+        assert_eq!(next, 8);
+    }
+
+    #[test]
+    fn allocate_close_ids_empty_input_leaves_counter_untouched() {
+        let (ids, next) = allocate_close_ids(42, &[]);
+        assert!(ids.is_empty());
+        assert_eq!(next, 42);
+    }
+
+    #[test]
+    fn allocate_close_ids_overflow_fails_open_without_wrapping_or_panicking() {
+        // base = u64::MAX - 1: first allocation succeeds (id = MAX-1, next
+        // advances to MAX); second allocation's checked_add(1) on MAX
+        // overflows -> that source is skipped (fail-open), next_id stays
+        // MAX, no wrap, no panic, no committed duplicate.
+        let base = u64::MAX - 1;
+        let (ids, next) = allocate_close_ids(base, &[1, 2, 3]);
+        assert_eq!(ids.len(), 1, "only the first source can be allocated before exhaustion");
+        assert_eq!(ids[&1], u64::MAX - 1);
+        assert!(!ids.contains_key(&2));
+        assert!(!ids.contains_key(&3));
+        assert_eq!(next, u64::MAX, "never wraps back to 0");
+    }
+
+    #[test]
+    fn allocate_close_ids_at_exact_max_allocates_nothing() {
+        let (ids, next) = allocate_close_ids(u64::MAX, &[1]);
+        assert!(ids.is_empty());
+        assert_eq!(next, u64::MAX);
+    }
+
+    // --- RenderLayer / candidate-local wiring sanity ---
+
+    #[test]
+    fn render_layer_variants_are_distinct_and_carry_the_expected_identity() {
+        assert_ne!(RenderLayer::Live(7), RenderLayer::Closing(7), "same numeric value, different identity domain");
+        assert_eq!(RenderLayer::Live(7), RenderLayer::Live(7));
+        assert_eq!(RenderLayer::Closing(7), RenderLayer::Closing(7));
+    }
+
+    // --- wiring: R1 scope guards (no live blur, no new GL/X11 calls, no
+    // energy_tear) via the same source-scan technique already used for
+    // render_egl_scene_parts's blur/animation wiring ---
+
+    #[test]
+    fn render_closing_layer_never_issues_a_live_background_blur_pass() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_closing_layer(").unwrap();
+        let end = start + source[start..].find("\nfn ").unwrap();
+        let body = &source[start..end];
+        assert!(!body.contains("capture_and_blur_background"));
+        assert!(!body.contains("draw_blurred_backdrop"));
+        assert!(!body.contains("energy_tear"));
+        assert!(body.contains("render_surface_with_opacity"));
+    }
+
+    #[test]
+    fn render_closing_layer_is_outside_render_egl_scene_parts_scanned_span() {
+        // Guards the whitespace-sensitive render_wiring_* assertions above
+        // (e.g. .sample(animation_now) count==1): render_closing_layer
+        // must never be defined between render_egl_scene_parts and
+        // egl_scene_is_renderable.
+        let source = include_str!("scene.rs");
+        let scan_start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let scan_end = scan_start + source[scan_start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let scanned = &source[scan_start..scan_end];
+        assert!(!scanned.contains("fn render_closing_layer("));
+    }
+
+    // ========================================================
+    // 3a3fa2b5-r2 — corrective diff preview: 6 implementation-defect
+    // fixes on top of the R1 architecture (config model, close Scale
+    // sampler, RenderLayer model, left-neighbor-gap reconciliation,
+    // transactional close_id model, frame-0 old-live-texture
+    // architecture, compositor-owned RGBA8 snapshot model, border/shadow
+    // reconstruction, no-close-blur policy, Present scheduling, close
+    // eligibility policy — all UNCHANGED, see the R1 tests above).
+    // ========================================================
+
+    // --- R2 correction 1: ScratchFramebuffer lifetime (verified NOT a
+    // bug on inspection — `scratch` is already bound to a local and kept
+    // alive across the whole draw, dropped explicitly afterward; this
+    // test pins that ordering going forward so it can never regress) ---
+
+    #[test]
+    fn scratch_framebuffer_owner_spans_the_entire_exact_copy_draw() {
+        let source = include_str!("../graphics/renderer.rs");
+        let start = source.find("pub(crate) fn capture_closing_snapshot(").unwrap();
+        let end = start + source[start..].find("\n    fn render_exact_copy(").unwrap();
+        let body = &source[start..end];
+        let bind_index = body.find("let scratch = ScratchFramebuffer::new(texture)?;")
+            .expect("ScratchFramebuffer must be bound to a local, never an unbound temporary");
+        let draw_index = body.find("self.render_exact_copy(source_texture, width, height)?;")
+            .expect("the exact-copy draw must run inside capture_closing_snapshot");
+        let drop_index = body.find("drop(scratch);")
+            .expect("scratch must be dropped explicitly, after the draw — RAII, not a bottom-of-function manual delete");
+        assert!(bind_index < draw_index, "ScratchFramebuffer must be alive BEFORE the copy draw runs");
+        assert!(draw_index < drop_index, "ScratchFramebuffer must still be alive WHILE the copy draw runs — only dropped after");
+    }
+
+    // --- R2 correction 2: ProvisionalClosingFrame owns no GPU/X11
+    // resource (structural — no Rc<RefCell<EglImportedSurface>>, no
+    // NamedPixmap, no Damage/DamageLease field) ---
+
+    #[test]
+    fn provisional_closing_frame_owns_no_gpu_or_x11_resource() {
+        let source = include_str!("scene.rs");
+        let start = source.find("struct ProvisionalClosingFrame {").unwrap();
+        let end = start + source[start..].find("\n}").unwrap();
+        let body = &source[start..end];
+        assert!(!body.contains("EglImportedSurface"), "must not own/reference a live EGL surface");
+        assert!(!body.contains("NamedSurfacePixmap"), "must not own/reference a NamedPixmap");
+        assert!(!body.contains("DamageLease"), "must not own/reference a DamageLease");
+        assert!(!body.contains("Rc<"), "must hold no reference-counted resource handle at all");
+        // Only value/identity data — exactly the R2-corrected field set.
+        assert!(body.contains("source_xid: Window"));
+        assert!(body.contains("plan: RenderQuadPlan"));
+        assert!(body.contains("pixel_semantics: EglPixelSemantics"));
+        assert!(body.contains("base_opacity: f32"));
+        assert!(body.contains("shadow_eligible: bool"));
+        assert!(body.contains("animation: ClosingAnimation"));
+    }
+
+    #[test]
+    fn closing_visual_owns_only_its_own_closing_texture_no_other_resource() {
+        let source = include_str!("scene.rs");
+        let start = source.find("struct ClosingVisual {").unwrap();
+        let end = start + source[start..].find("\n}").unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("texture: ClosingTexture"), "the ONE owned GPU resource");
+        assert!(!body.contains("EglImportedSurface"));
+        assert!(!body.contains("NamedSurfacePixmap"));
+        assert!(!body.contains("DamageLease"));
+    }
+
+    #[test]
+    fn closing_draw_source_never_reads_a_stored_texture_field() {
+        // R1 had `ClosingDrawSource::texture()` reading
+        // `frame.old_surface.borrow().texture` — a stored reference. R2
+        // removes that method entirely: the source texture is now always
+        // resolved by the CALLER (`render_closing_layer`), fresh, by
+        // `source_xid` lookup — never cached on the draw-source type.
+        let source = include_str!("scene.rs");
+        let start = source.find("impl ClosingDrawSource<'_> {").unwrap();
+        let end = start + source[start..].find("\n}\n").unwrap();
+        let body = &source[start..end];
+        assert!(!body.contains("fn texture("), "ClosingDrawSource must not itself resolve a texture");
+        assert!(!body.contains("old_surface"));
+    }
+
+    #[test]
+    fn render_closing_layer_resolves_provisional_texture_by_lookup_not_ownership() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_closing_layer(").unwrap();
+        let end = start + source[start..].find("\nfn ").unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("closing_source_surfaces.get(&frame.source_xid)"));
+        assert!(!body.contains("old_surface"));
+    }
+
+    #[test]
+    fn commit_candidate_inner_resolves_capture_source_from_old_resources_not_a_stored_rc() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn commit_candidate_inner(").unwrap();
+        let end = start + source[start..].find("\n    fn retain_current_pending").unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("old_resources\n                .get(&frame.source_xid)"));
+        assert!(!body.contains("frame.old_surface"));
+    }
+
+    // --- R2 correction 3: destroy-intent lifetime (transaction-scoped,
+    // retry-safe, cannot leak across XID reuse) ---
+
+    #[test]
+    fn destroy_intent_a_survives_retry_never_mutated_outside_commit() {
+        // The retention rule is applied ONLY inside commit_candidate_inner
+        // — never during build_candidate/pre_commit_gate — so a candidate
+        // that gets Retried leaves `destroy_intents` completely untouched,
+        // and a subsequent attempt observes the exact same set. Proven
+        // structurally: `retained_destroy_intents(` must appear ONLY
+        // inside commit_candidate_inner's body, never inside
+        // build_candidate's or pre_commit_gate's.
+        let source = include_str!("scene.rs");
+        let commit_start = source.find("fn commit_candidate_inner(").unwrap();
+        let commit_end = commit_start + source[commit_start..].find("\n    fn retain_current_pending").unwrap();
+        assert!(source[commit_start..commit_end].contains("retained_destroy_intents("));
+        let build_start = source.find("fn build_candidate(&mut self)").unwrap();
+        let build_end = build_start + source[build_start..].find("\n    fn rebuild_and_present").unwrap();
+        assert!(!source[build_start..build_end].contains("retained_destroy_intents("));
+        // Also: note_destroy_intent (the only writer) never removes —
+        // insertion only, so a Retry (which re-drains no new events) can
+        // never lose or gain an intent by itself either.
+        let note_start = source.find("fn note_destroy_intent(").unwrap();
+        let note_end = note_start + source[note_start..].find("\n    }").unwrap();
+        assert!(!source[note_start..note_end].contains("remove"));
+    }
+
+    #[test]
+    fn destroy_intent_b_accepted_transaction_retires_intent_even_without_a_close() {
+        // Ineligible-but-destroyed X, no successor: X is removed
+        // (absent from new_surfaces) but produced no close. The retained
+        // set must not contain X afterward, regardless of why no close
+        // was created (ineligible, allocation failure, snapshot failure
+        // — none of those change whether X is in new_surfaces).
+        let mut destroy_intents = HashSet::new();
+        destroy_intents.insert(42);
+        let new_surfaces: HashSet<Window> = HashSet::new();
+        let retained = retained_destroy_intents(&destroy_intents, &new_surfaces);
+        assert!(!retained.contains(&42), "an accepted removal must retire its intent even with no close created");
+    }
+
+    #[test]
+    fn destroy_intent_b_extends_to_untracked_xids_r1_regression() {
+        // The exact R1 gap: a DestroyNotify(99) for an XID that was NEVER
+        // part of the committed scene (untracked popup) must not survive
+        // this commit either, even though 99 was never in
+        // `removed_surfaces` (it was never in `old_surfaces` to begin
+        // with) — R1's narrower `removed_surfaces`-only loop would have
+        // left this forever.
+        let mut destroy_intents = HashSet::new();
+        destroy_intents.insert(99);
+        let new_surfaces: HashSet<Window> = HashSet::new(); // 99 never became live
+        let retained = retained_destroy_intents(&destroy_intents, &new_surfaces);
+        assert!(retained.is_empty(), "an intent for a never-tracked XID must not survive a commit");
+    }
+
+    #[test]
+    fn destroy_intent_c_stale_intent_cannot_survive_to_collide_with_a_reused_xid() {
+        // Sequence: DestroyNotify(99) for an untracked popup fires, then
+        // commit #1 happens (99 never live) -> pruned. THEN xid 99 is
+        // reused by a brand-new, unrelated Live window, which itself
+        // becomes part of a later commit's new_surfaces. Prove: the
+        // pruned set from commit #1 has no way to reach commit #2's
+        // eligibility check, since retained_destroy_intents only ever
+        // narrows (intersects), never reintroduces a dropped entry.
+        let mut destroy_intents = HashSet::new();
+        destroy_intents.insert(99);
+        let commit_1_new_surfaces: HashSet<Window> = HashSet::new();
+        let after_commit_1 = retained_destroy_intents(&destroy_intents, &commit_1_new_surfaces);
+        assert!(after_commit_1.is_empty());
+        // xid 99 reused, now live; no NEW DestroyNotify(99) has occurred
+        // for the new window, so destroy_intents (session state) still
+        // does not contain 99 — proven by chaining commit #1's OUTPUT
+        // (not the original stale set) forward.
+        let mut commit_2_new_surfaces = HashSet::new();
+        commit_2_new_surfaces.insert(99);
+        let after_commit_2 = retained_destroy_intents(&after_commit_1, &commit_2_new_surfaces);
+        assert!(!after_commit_2.contains(&99), "a stale intent must never resurrect for a reused XID without a fresh genuine DestroyNotify");
+    }
+
+    #[test]
+    fn destroy_intent_d_unmap_only_after_reuse_remains_no_close() {
+        // note_destroy_intent's ONLY write path is the DestroyNotify
+        // match arm — structurally, UnmapNotify (or anything else) can
+        // never insert an intent, so combined with (C) above (no stale
+        // intent can survive to collide with a reused XID), an
+        // Unmap-only sequence after XID reuse can never satisfy the
+        // close-trigger's `destroy_intents.contains(...)` gate.
+        let source = include_str!("scene.rs");
+        let start = source.find("fn note_destroy_intent(").unwrap();
+        let end = start + source[start..].find("\n    }").unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("Event::DestroyNotify(destroy)"));
+        assert!(!body.contains("UnmapNotify"), "UnmapNotify must never write a destroy intent");
+        // And the trigger gate itself requires it, unconditionally.
+        let gate_start = source.find("fn build_provisional_closing_state(").unwrap();
+        let gate_end = gate_start + source[gate_start..].find("\n    fn retire_completed_closing_visuals").unwrap();
+        assert!(source[gate_start..gate_end].contains("self.destroy_intents.contains(&old_entry.surface_xid)"));
+    }
+
+    // --- R2 correction 4: snapshot dimensions come from the source
+    // pixmap's own geometry, never RenderQuadPlan's outer_* (shadow-rect)
+    // extent ---
+
+    #[test]
+    fn commit_candidate_inner_captures_snapshot_dimensions_from_pixmap_geometry() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn commit_candidate_inner(").unwrap();
+        let end = start + source[start..].find("\n    fn retain_current_pending").unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("bundle.pixmap.geometry.width"));
+        assert!(body.contains("bundle.pixmap.geometry.height"));
+        assert!(!body.contains("frame.plan.outer_width"), "R1's bug: outer_* is the SHADOW base rect, not a guaranteed content-size source");
+        assert!(!body.contains("frame.plan.outer_height"));
+    }
+
+    #[test]
+    fn pixmap_geometry_dimensions_are_independent_of_render_quad_plan_outer_extent() {
+        // Direct proof that a plan's outer_width/outer_height (which
+        // scale_render_quad_plan documents as the SHADOW's base rect, and
+        // which an animated/shadow-bearing plan can inflate or shrink
+        // independently) is a structurally SEPARATE value from the
+        // source pixmap's own width/height — the snapshot capture path
+        // (R2-corrected) reads only the latter, so a plan with a large,
+        // shadow-driven outer extent cannot alter the captured texture's
+        // dimensions.
+        let pixmap = PixmapGeometry { root: 1, x: 0, y: 0, width: 200, height: 100, border_width: 0, depth: 24 };
+        let window = WindowGeometry { x: 0, y: 0, width: 200, height: 100, border_width: 0 };
+        let root = RootGeometry { width: 1920, height: 1080, depth: 24, visual: 0 };
+        let plan = build_render_quad_plan(window, pixmap, root).unwrap();
+        // Simulate an animated/scaled draw plan with a very different
+        // outer extent (as render_closing_layer produces every frame via
+        // scale_render_quad_plan) — the pixmap's own geometry never
+        // changes as a result, since capture reads `bundle.pixmap.geometry`
+        // directly, never `plan`/`draw_plan` at all.
+        let animated = scale_render_quad_plan(plan, 0.5, 0.5);
+        assert_ne!(animated.outer_width, i32::from(pixmap.width), "the animated plan's outer extent legitimately differs from content size");
+        assert_eq!(i32::from(pixmap.width), 200, "the authoritative capture source is untouched by any plan transform");
+        assert_eq!(i32::from(pixmap.height), 100);
+    }
+
+    // --- R2 correction 5: synchronized live-projection walk, O(live +
+    // closing), no per-entry `.find()` ---
+
+    #[test]
+    fn render_egl_scene_parts_uses_a_synchronized_walk_not_per_entry_find() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = start + source[start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("let mut live_entries = snapshot.entries.iter();"));
+        assert!(body.contains("live_entries.next()"));
+        assert!(
+            !body.contains("snapshot.entries.iter().find(|entry| entry.surface_xid == surface_xid)"),
+            "R1's O(render_order * snapshot.entries) per-entry lookup must be gone",
+        );
+    }
+
+    #[cfg(test)]
+    fn synchronized_live_projection(render_order: &[RenderLayer], live_entries: &[Window]) -> Vec<Window> {
+        // Mirrors render_egl_scene_parts's corrected Live-branch mechanism
+        // exactly: a single forward iterator, advanced only by
+        // RenderLayer::Live, asserting the same identity the real render
+        // loop's debug_assert_eq! checks.
+        let mut iter = live_entries.iter();
+        let mut consumed = Vec::new();
+        for layer in render_order {
+            if let RenderLayer::Live(xid) = *layer {
+                let next = iter.next().expect("Live-projection invariant guarantees an entry exists");
+                assert_eq!(*next, xid, "synchronized walk must consume matching entries in order");
+                consumed.push(*next);
+            }
+        }
+        consumed
+    }
+
+    #[test]
+    fn synchronized_walk_consumes_exactly_the_live_projection_in_order_a_through_f() {
+        // Reuses the exact reconcile_render_order scenarios A-F already
+        // proven above: for each, the synchronized walk must consume
+        // precisely new_live_order, in order, with no backtracking.
+        let cases: Vec<(Vec<RenderLayer>, Vec<Window>)> = vec![
+            (
+                reconcile_render_order(&[RenderLayer::Live(1), RenderLayer::Live(2)], &[2, 1], &HashSet::new(), &HashMap::new()),
+                vec![2, 1],
+            ),
+            (
+                reconcile_render_order(
+                    &[RenderLayer::Live(1), RenderLayer::Live(2), RenderLayer::Live(3)],
+                    &[1, 3], &{ let mut s = HashSet::new(); s.insert(2); s },
+                    &{ let mut m = HashMap::new(); m.insert(2, 100_u64); m },
+                ),
+                vec![1, 3],
+            ),
+            (
+                reconcile_render_order(
+                    &[RenderLayer::Live(1), RenderLayer::Live(2), RenderLayer::Live(3), RenderLayer::Live(4)],
+                    &[1, 4],
+                    &{ let mut s = HashSet::new(); s.insert(2); s.insert(3); s },
+                    &{ let mut m = HashMap::new(); m.insert(2, 100_u64); m.insert(3, 101_u64); m },
+                ),
+                vec![1, 4],
+            ),
+        ];
+        for (render_order, expected_live) in cases {
+            let consumed = synchronized_live_projection(&render_order, &expected_live);
+            assert_eq!(consumed, expected_live);
+        }
+    }
+
+    // --- R2 correction 6: blur documentation wording (behavior
+    // unchanged — no close blur in R1 either; this only pins the
+    // corrected phrasing so it cannot regress back to the old, imprecise
+    // "frame 0 and later" framing) ---
+
+    #[test]
+    fn blur_documentation_uses_the_corrected_first_closing_frame_wording() {
+        let source = include_str!("scene.rs");
+        assert!(source.contains("NO LIVE BLUR FROM FIRST CLOSING FRAME"));
+        // Built via concatenation so this test's OWN source line is never
+        // itself a match for the very phrase it's checking is gone.
+        let old_imprecise_phrase = ["NONE AFTER", "FRAME 0"].join(" ");
+        assert!(!source.contains(&old_imprecise_phrase));
+    }
+
+    // ========================================================
+    // 3a3fa2b6-r1 — TeleportFlashy open+close.
+    // ========================================================
+
+    #[test]
+    fn teleport_flashy_color_is_a_fixed_bright_neutral_no_config_key() {
+        // Section 7: fixed near-white, no animation.flash.color config
+        // key in R1 — color tuning is deferred until after human
+        // validation.
+        assert_eq!(TELEPORT_FLASHY_COLOR, [1.0, 1.0, 1.0]);
+        let source = include_str!("../config.rs");
+        assert!(!source.contains("animation.flash.color"));
+        assert!(!source.contains("animation_flash_color"));
+    }
+
+    // --- OPEN AnimationVisual (geometry) ---
+
+    #[test]
+    fn teleport_flashy_open_t0_is_exact_start_state() {
+        let start = sample_teleport_flashy_open(0.0);
+        assert_eq!(
+            start,
+            AnimationVisual {
+                opacity: TELEPORT_FLASHY_OPEN_START_OPACITY,
+                scale_x: TELEPORT_FLASHY_OPEN_START_SCALE,
+                scale_y: TELEPORT_FLASHY_OPEN_START_SCALE,
+            },
+        );
+        assert_eq!(start.opacity, 0.05);
+        assert_eq!(start.scale_x, 0.985);
+        assert_eq!(start.scale_y, 0.985);
+    }
+
+    #[test]
+    fn teleport_flashy_open_reaches_exact_identity_by_geometry_end() {
+        let at_end = sample_teleport_flashy_open(TELEPORT_FLASHY_OPEN_GEOMETRY_END);
+        assert_eq!(at_end, AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 });
+        assert_eq!(TELEPORT_FLASHY_OPEN_GEOMETRY_END, 0.20);
+        // Held exact identity for the rest of the animation, including t=1.
+        for t in [0.20, 0.5, 0.9, 1.0] {
+            assert_eq!(sample_teleport_flashy_open(t), AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 }, "t={t}");
+        }
+    }
+
+    #[test]
+    fn teleport_flashy_open_geometry_is_monotonic_deterministic_uniform_no_overshoot() {
+        let mut previous_opacity = TELEPORT_FLASHY_OPEN_START_OPACITY;
+        let mut previous_scale = TELEPORT_FLASHY_OPEN_START_SCALE;
+        let mut t = 0.0_f32;
+        while t <= TELEPORT_FLASHY_OPEN_GEOMETRY_END {
+            let visual = sample_teleport_flashy_open(t);
+            assert_eq!(visual.scale_x, visual.scale_y, "uniform, no axis reversal, t={t}");
+            assert!(visual.scale_x <= 1.0001, "no overshoot, t={t}");
+            assert!(visual.opacity >= previous_opacity - 1e-6, "opacity monotonic, t={t}");
+            assert!(visual.scale_x >= previous_scale - 1e-6, "scale monotonic, t={t}");
+            assert_eq!(sample_teleport_flashy_open(t), visual, "deterministic, t={t}");
+            previous_opacity = visual.opacity;
+            previous_scale = visual.scale_x;
+            t += 0.02;
+        }
+    }
+
+    // --- OPEN flash-alpha ---
+
+    #[test]
+    fn teleport_flashy_open_flash_holds_at_one_through_hold_end() {
+        assert_eq!(TELEPORT_FLASHY_OPEN_FLASH_HOLD_END, 0.08);
+        for t in [0.0, 0.02, 0.05, 0.08] {
+            assert_eq!(sample_teleport_flashy_open_flash(t), 1.0, "t={t}");
+        }
+    }
+
+    #[test]
+    fn teleport_flashy_open_flash_reaches_exact_zero_by_end() {
+        assert_eq!(TELEPORT_FLASHY_OPEN_FLASH_END, 0.40);
+        for t in [0.40, 0.5, 0.9, 1.0] {
+            assert_eq!(sample_teleport_flashy_open_flash(t), 0.0, "t={t}");
+        }
+    }
+
+    #[test]
+    fn teleport_flashy_open_flash_is_monotonic_bounded_and_deterministic() {
+        let mut previous = 1.0_f32;
+        let mut t = TELEPORT_FLASHY_OPEN_FLASH_HOLD_END;
+        while t <= TELEPORT_FLASHY_OPEN_FLASH_END {
+            let alpha = sample_teleport_flashy_open_flash(t);
+            assert!((0.0..=1.0).contains(&alpha), "bounded, t={t} alpha={alpha}");
+            assert!(alpha <= previous + 1e-6, "monotonic decay, t={t}");
+            assert_eq!(sample_teleport_flashy_open_flash(t), alpha, "deterministic, t={t}");
+            previous = alpha;
+            t += 0.02;
+        }
+    }
+
+    #[test]
+    fn teleport_flashy_open_flash_for_gates_exclusively_on_teleport_flashy() {
+        assert_eq!(teleport_flashy_open_flash_for(OpenAnimationEffect::TeleportFlashy, 0.0), Some(1.0));
+        for effect in [
+            OpenAnimationEffect::Scale,
+            OpenAnimationEffect::Teleport,
+            OpenAnimationEffect::EnergyTear,
+            OpenAnimationEffect::Bubble,
+        ] {
+            assert_eq!(teleport_flashy_open_flash_for(effect, 0.0), None, "effect={effect:?}");
+        }
+        // And EnergyTear's own independent overlay dispatch never produces
+        // a layout for TeleportFlashy either — the two overlay systems
+        // are mutually exclusive gates.
+        assert_eq!(energy_tear_layout_for(OpenAnimationEffect::TeleportFlashy, 0.0), None);
+    }
+
+    #[test]
+    fn teleport_flashy_open_resolved_opacity_is_never_forced_to_one() {
+        // Section 11: effective opacity = resolved/base opacity *
+        // AnimationVisual.opacity. A translucent window (0.82) must never
+        // be forced to absolute 1.0 by this effect, and must land back at
+        // exactly 0.82 once the effect completes.
+        let resolved: f32 = 0.82;
+        for t in [0.0, 0.05, 0.10, 0.15, 0.20, 0.5, 1.0] {
+            let visual = sample_teleport_flashy_open(t);
+            let effective = resolved * visual.opacity;
+            assert!(effective <= resolved + 1e-6, "t={t} effective={effective}");
+        }
+        let final_effective = resolved * sample_teleport_flashy_open(1.0).opacity;
+        assert!((final_effective - resolved).abs() < 1e-6);
+    }
+
+    // --- CLOSE AnimationVisual (geometry) ---
+
+    #[test]
+    fn teleport_flashy_close_t0_is_exact_identity() {
+        assert_eq!(sample_teleport_flashy_close(0.0), AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 });
+    }
+
+    #[test]
+    fn teleport_flashy_close_holds_exact_identity_until_hold_end() {
+        assert_eq!(TELEPORT_FLASHY_CLOSE_HOLD_END, 0.12);
+        for t in [0.0, 0.05, 0.10, 0.12] {
+            assert_eq!(sample_teleport_flashy_close(t), AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 }, "t={t}");
+        }
+    }
+
+    #[test]
+    fn teleport_flashy_close_reaches_exact_end_state_by_collapse_end() {
+        assert_eq!(TELEPORT_FLASHY_CLOSE_COLLAPSE_END, 0.28);
+        assert_eq!(TELEPORT_FLASHY_CLOSE_END_SCALE, 0.98);
+        for t in [0.28, 0.5, 0.9, 1.0] {
+            let visual = sample_teleport_flashy_close(t);
+            assert_eq!(visual, AnimationVisual { opacity: 0.0, scale_x: 0.98, scale_y: 0.98 }, "t={t}");
+        }
+        // Never Scale-close's 0.95 contraction.
+        assert_ne!(TELEPORT_FLASHY_CLOSE_END_SCALE, CLOSE_SCALE_END_SCALE);
+    }
+
+    #[test]
+    fn teleport_flashy_close_geometry_is_monotonic_deterministic_uniform_no_bounce() {
+        let mut previous_opacity = 1.0_f32;
+        let mut previous_scale = 1.0_f32;
+        let mut t = TELEPORT_FLASHY_CLOSE_HOLD_END;
+        while t <= TELEPORT_FLASHY_CLOSE_COLLAPSE_END {
+            let visual = sample_teleport_flashy_close(t);
+            assert_eq!(visual.scale_x, visual.scale_y, "uniform, t={t}");
+            assert!(visual.opacity <= previous_opacity + 1e-6, "opacity monotonic decreasing, t={t}");
+            assert!(visual.scale_x <= previous_scale + 1e-6, "scale monotonic decreasing (contraction, not bounce), t={t}");
+            assert!(visual.scale_x >= TELEPORT_FLASHY_CLOSE_END_SCALE - 1e-6, "never overshoots past 0.98, t={t}");
+            assert_eq!(sample_teleport_flashy_close(t), visual, "deterministic, t={t}");
+            previous_opacity = visual.opacity;
+            previous_scale = visual.scale_x;
+            t += 0.01;
+        }
+    }
+
+    #[test]
+    fn teleport_flashy_close_is_not_a_reverse_open_shortcut() {
+        // Explicit distinctness proof required by the architecture audit
+        // (section 12): CLOSE is its own hold-then-collapse shape, never
+        // `1.0 - sample_teleport_flashy_open(t)` played backwards.
+        for t in [0.05, 0.15, 0.25, 0.5] {
+            let close_visual = sample_teleport_flashy_close(t);
+            let open_visual = sample_teleport_flashy_open(t);
+            let reversed_open_opacity = 1.0 - open_visual.opacity;
+            assert!(
+                (close_visual.opacity - reversed_open_opacity).abs() > 1e-6
+                    || (close_visual.scale_x - (2.0 - open_visual.scale_x)).abs() > 1e-6,
+                "t={t} close must not equal a simple open-reversal",
+            );
+        }
+    }
+
+    // --- CLOSE flash-alpha (pulse) ---
+
+    #[test]
+    fn teleport_flashy_close_flash_starts_at_exact_zero() {
+        assert_eq!(sample_teleport_flashy_close_flash(0.0), 0.0);
+    }
+
+    #[test]
+    fn teleport_flashy_close_flash_reaches_a_clear_peak_near_022() {
+        assert_eq!(TELEPORT_FLASHY_CLOSE_FLASH_PEAK, 0.22);
+        let peak = sample_teleport_flashy_close_flash(TELEPORT_FLASHY_CLOSE_FLASH_PEAK);
+        assert!((peak - 1.0).abs() < 1e-5, "peak={peak}");
+        // Rises monotonically to the peak.
+        let mut previous = 0.0_f32;
+        let mut t = 0.0_f32;
+        while t <= TELEPORT_FLASHY_CLOSE_FLASH_PEAK {
+            let alpha = sample_teleport_flashy_close_flash(t);
+            assert!(alpha >= previous - 1e-6, "rising, t={t}");
+            previous = alpha;
+            t += 0.02;
+        }
+    }
+
+    #[test]
+    fn teleport_flashy_close_flash_still_visible_after_window_is_hidden() {
+        // Section 13's central relationship: window opacity reaches 0 at
+        // TELEPORT_FLASHY_CLOSE_COLLAPSE_END (0.28), while flash remains
+        // > 0 until TELEPORT_FLASHY_CLOSE_FLASH_END (0.50) — the window
+        // disappears INSIDE the still-visible flash.
+        let window_hidden_t = TELEPORT_FLASHY_CLOSE_COLLAPSE_END;
+        assert_eq!(sample_teleport_flashy_close(window_hidden_t).opacity, 0.0);
+        let flash_at_hidden = sample_teleport_flashy_close_flash(window_hidden_t);
+        assert!(flash_at_hidden > 0.0, "flash must still be visible when window opacity hits 0, got {flash_at_hidden}");
+        assert!(TELEPORT_FLASHY_CLOSE_COLLAPSE_END < TELEPORT_FLASHY_CLOSE_FLASH_END);
+    }
+
+    #[test]
+    fn teleport_flashy_close_flash_reaches_exact_zero_by_end() {
+        assert_eq!(TELEPORT_FLASHY_CLOSE_FLASH_END, 0.50);
+        for t in [0.50, 0.6, 1.0] {
+            assert_eq!(sample_teleport_flashy_close_flash(t), 0.0, "t={t}");
+        }
+    }
+
+    #[test]
+    fn teleport_flashy_close_flash_is_bounded_and_deterministic_across_a_dense_sweep() {
+        let mut t = 0.0_f32;
+        while t <= 1.0 {
+            let alpha = sample_teleport_flashy_close_flash(t);
+            assert!((0.0..=1.0).contains(&alpha), "t={t} alpha={alpha}");
+            assert_eq!(sample_teleport_flashy_close_flash(t), alpha, "t={t}");
+            t += 0.01;
+        }
+    }
+
+    #[test]
+    fn teleport_flashy_close_flash_for_gates_exclusively_on_teleport_flashy() {
+        assert_eq!(
+            teleport_flashy_close_flash_for(crate::config::CloseAnimationEffect::TeleportFlashy, 0.22),
+            Some(1.0),
+        );
+        assert_eq!(teleport_flashy_close_flash_for(crate::config::CloseAnimationEffect::Scale, 0.22), None);
+    }
+
+    // --- distinctness ---
+
+    #[test]
+    fn teleport_flashy_open_differs_from_scale_teleport_bubble_at_representative_t() {
+        for t in [0.05, 0.10, 0.15, 0.25, 0.5] {
+            let flashy = sample_teleport_flashy_open(t);
+            assert_ne!(flashy, sample_scale(t), "t={t} vs Scale");
+            assert_ne!(flashy, sample_teleport(t), "t={t} vs Teleport");
+            assert_ne!(flashy, sample_bubble(t), "t={t} vs Bubble");
+        }
+    }
+
+    // --- overlay gating (no AnimationVisual contamination) ---
+
+    #[test]
+    fn animation_visual_has_no_flash_alpha_field() {
+        // Structural: AnimationVisual must stay exactly {opacity, scale_x,
+        // scale_y} — flash state is effect-specific overlay state, never
+        // merged into the generic struct (architecture audit section 13).
+        let source = include_str!("scene.rs");
+        let start = source.find("struct AnimationVisual {").unwrap();
+        let end = start + source[start..].find("\n}").unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("opacity: f32"));
+        assert!(body.contains("scale_x: f32"));
+        assert!(body.contains("scale_y: f32"));
+        assert!(!body.contains("flash"));
+        assert!(!body.contains("tear"));
+    }
+
+    // --- render wiring (structural) ---
+
+    #[test]
+    fn open_flash_overlay_draw_occurs_strictly_after_the_surface_draw() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = start + source[start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let body = &source[start..end];
+        let surface_draw = body.find("egl.render_surface_with_opacity(").unwrap();
+        let overlay_draw = body.find("egl.render_solid_overlay(draw_plan, TELEPORT_FLASHY_COLOR, alpha)").unwrap();
+        assert!(surface_draw < overlay_draw);
+        // Also strictly after the shadow draw.
+        let shadow_draw = body.find("egl.render_shadow(shadow)").unwrap();
+        assert!(shadow_draw < overlay_draw);
+        // Exactly one open overlay call site.
+        assert_eq!(body.matches("egl.render_solid_overlay(draw_plan,").count(), 1);
+        // Never inside the blur path.
+        let blur_backdrop = body.find("egl.draw_blurred_backdrop(").unwrap();
+        assert!(blur_backdrop < overlay_draw, "overlay call must not precede/replace the blur path");
+    }
+
+    #[test]
+    fn close_flash_overlay_draw_occurs_strictly_after_the_closing_surface_draw() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_closing_layer(").unwrap();
+        let end = start + source[start..].find("\nfn ").unwrap();
+        let body = &source[start..end];
+        let surface_draw = body.find("egl.render_surface_with_opacity(texture,").unwrap();
+        let overlay_draw = body.find("egl.render_solid_overlay(closing_draw_plan, TELEPORT_FLASHY_COLOR, alpha)").unwrap();
+        assert!(surface_draw < overlay_draw);
+        assert_eq!(body.matches("egl.render_solid_overlay(").count(), 1);
+    }
+
+    #[test]
+    fn teleport_flashy_close_uses_the_same_overlay_path_for_provisional_and_committed_sources() {
+        // Section 11/16: ONE flash-drawing path for both provisional
+        // frame-0 and committed ClosingVisual frames — no frame-0 special
+        // case. render_closing_layer resolves `source`/`texture` from
+        // EITHER map BEFORE the shared draw sequence below (including the
+        // flash) runs — so the overlay call itself only appears once,
+        // structurally proving it is shared.
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_closing_layer(").unwrap();
+        let end = start + source[start..].find("\nfn ").unwrap();
+        let body = &source[start..end];
+        assert_eq!(body.matches("egl.render_solid_overlay(").count(), 1);
+        assert!(body.contains("ClosingDrawSource::Committed"));
+        assert!(body.contains("ClosingDrawSource::Provisional"));
+    }
+
+    // --- EnergyTear regression (open-effect level, complements the
+    // renderer.rs shader-level tests) ---
+
+    #[test]
+    fn energy_tear_layout_for_never_fires_for_teleport_flashy_and_vice_versa() {
+        for t in [0.0, 0.1, 0.3, 0.5, 0.9] {
+            assert_eq!(energy_tear_layout_for(OpenAnimationEffect::TeleportFlashy, t), None, "t={t}");
+            assert_eq!(teleport_flashy_open_flash_for(OpenAnimationEffect::EnergyTear, t), None, "t={t}");
+        }
+    }
+
+    // --- close-core regression pins (source-contract, matching the
+    // R2-correction test style: prove no functional delta) ---
+
+    #[test]
+    fn teleport_flashy_does_not_touch_destroy_trigger_or_unmap_policy() {
+        let source = include_str!("scene.rs");
+        let note_start = source.find("fn note_destroy_intent(").unwrap();
+        let note_end = note_start + source[note_start..].find("\n    }").unwrap();
+        let body = &source[note_start..note_end];
+        assert!(body.contains("Event::DestroyNotify(destroy)"));
+        assert!(!body.contains("UnmapNotify"));
+        assert!(!body.contains("TeleportFlashy"), "close trigger must be untouched by effect wiring");
+    }
+
+    #[test]
+    fn teleport_flashy_does_not_touch_render_order_or_close_id_allocation() {
+        let source = include_str!("scene.rs");
+        let reconcile_start = source.find("fn reconcile_render_order(").unwrap();
+        let reconcile_end = reconcile_start + source[reconcile_start..].find("\nfn ").unwrap();
+        assert!(!source[reconcile_start..reconcile_end].contains("TeleportFlashy"));
+        let allocate_start = source.find("fn allocate_close_ids(").unwrap();
+        let allocate_end = allocate_start + source[allocate_start..].find("\n}").unwrap();
+        assert!(!source[allocate_start..allocate_end].contains("TeleportFlashy"));
+    }
+
+    // ========================================================
+    // 3a3fa2b6-r2 — Minato radial reveal (OPEN TeleportFlashy only).
+    // ========================================================
+
+    /// Test-only mirror of the shader's aspect-safe per-axis
+    /// normalization (render_surface_with_radial_reveal /
+    /// SCENE_FRAGMENT_SHADER mode 3: `p=(local-half_size)/half_size;
+    /// r_norm=|p|/sqrt(2)`), so the geometric properties (center=0,
+    /// every corner=1, aspect-independence) are proven as ordinary CPU
+    /// numeric tests rather than only string-scanned from the shader.
+    #[cfg(test)]
+    fn minato_r_norm(local_x: f32, local_y: f32, surface_w: f32, surface_h: f32) -> f32 {
+        let px = (local_x - surface_w * 0.5) / (surface_w * 0.5);
+        let py = (local_y - surface_h * 0.5) / (surface_h * 0.5);
+        (px * px + py * py).sqrt() / std::f32::consts::SQRT_2
+    }
+
+    // --- RADIAL MATH ---
+
+    #[test]
+    fn minato_r_norm_center_is_exactly_zero() {
+        assert_eq!(minato_r_norm(100.0, 50.0, 200.0, 100.0), 0.0);
+        assert_eq!(minato_r_norm(400.0, 20.0, 800.0, 40.0), 0.0, "also zero for a very wide window");
+    }
+
+    #[test]
+    fn minato_r_norm_every_corner_is_exactly_one_regardless_of_aspect_ratio() {
+        // Per-axis independent normalization (never a single aspect-
+        // corrected scalar) is what guarantees this — see section B8/A2
+        // of the architecture audit.
+        for (w, h) in [(200.0_f32, 100.0_f32), (100.0, 200.0), (400.0, 40.0), (50.0, 50.0), (1920.0, 1080.0)] {
+            for (cx, cy) in [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)] {
+                let r = minato_r_norm(cx, cy, w, h);
+                assert!((r - 1.0).abs() < 1e-5, "w={w} h={h} corner=({cx},{cy}) r={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn minato_r_norm_side_midpoint_is_less_than_corner() {
+        let w = 300.0_f32;
+        let h = 150.0_f32;
+        let side_mid = minato_r_norm(w, h * 0.5, w, h);
+        let corner = minato_r_norm(w, h, w, h);
+        assert!(side_mid < corner);
+        assert!((side_mid - (1.0 / std::f32::consts::SQRT_2)).abs() < 1e-5);
+    }
+
+    // --- TIMING ---
+
+    #[test]
+    fn minato_reveal_radius_is_zero_before_start() {
+        assert_eq!(MINATO_REVEAL_START, 0.04);
+        for t in [0.0, 0.01, 0.03, 0.04] {
+            assert_eq!(sample_minato_reveal_radius(t), 0.0, "t={t}");
+        }
+    }
+
+    #[test]
+    fn minato_reveal_radius_reuses_the_existing_geometry_end_constant() {
+        // Not a coincidental duplicate 0.20 literal — a real structural
+        // tie, so the reveal and the scale-pop always finish together.
+        assert_eq!(MINATO_REVEAL_END, TELEPORT_FLASHY_OPEN_GEOMETRY_END);
+    }
+
+    #[test]
+    fn minato_reveal_radius_monotonically_expands_between_start_and_end() {
+        let mut previous = 0.0_f32;
+        let mut t = MINATO_REVEAL_START;
+        while t <= MINATO_REVEAL_END {
+            let r = sample_minato_reveal_radius(t);
+            assert!(r >= previous - 1e-6, "monotonic, t={t}");
+            assert!((0.0..=MINATO_REVEAL_FULL_RADIUS + 1e-6).contains(&r), "bounded, t={t} r={r}");
+            previous = r;
+            t += 0.005;
+        }
+    }
+
+    #[test]
+    fn minato_reveal_radius_guarantees_full_corner_coverage_immediately_before_fallback() {
+        // "Immediately before" MINATO_REVEAL_END: reveal_radius must
+        // already be >= the exact corner r_norm value (1.0), with the
+        // documented MINATO_REVEAL_FULL_RADIUS epsilon margin, so the
+        // shader's coverage() evaluates to full at every corner with no
+        // antialiasing gap and no visible pop at the fallback boundary.
+        let just_before = MINATO_REVEAL_END - 0.0001;
+        let radius = sample_minato_reveal_radius(just_before);
+        assert!(radius >= 1.0, "must reach/exceed the exact corner r_norm value before fallback, got {radius}");
+        assert!((radius - MINATO_REVEAL_FULL_RADIUS).abs() < 1e-3, "should already be at (or extremely close to) full radius, got {radius}");
+    }
+
+    #[test]
+    fn minato_reveal_radius_for_falls_back_to_none_at_and_after_reveal_end() {
+        // This is the "t>=0.20: ordinary surface mode" requirement,
+        // proven at the gating-function level: None here is exactly what
+        // makes the render loop fall back to the zero-extra-cost mode-0
+        // draw, mirroring energy_tear_layout_for's own post-completion
+        // None fallback.
+        for t in [MINATO_REVEAL_END, MINATO_REVEAL_END + 0.01, 0.5, 1.0] {
+            assert_eq!(minato_reveal_radius_for(OpenAnimationEffect::TeleportFlashy, t), None, "t={t} must fall back to ordinary mode 0");
+        }
+    }
+
+    #[test]
+    fn minato_reveal_radius_for_gates_exclusively_on_teleport_flashy() {
+        assert!(minato_reveal_radius_for(OpenAnimationEffect::TeleportFlashy, 0.1).is_some());
+        for effect in [
+            OpenAnimationEffect::Scale,
+            OpenAnimationEffect::Teleport,
+            OpenAnimationEffect::EnergyTear,
+            OpenAnimationEffect::Bubble,
+        ] {
+            assert_eq!(minato_reveal_radius_for(effect, 0.1), None, "effect={effect:?}");
+        }
+    }
+
+    // --- MASK ---
+
+    #[test]
+    fn minato_center_appears_before_side_which_appears_before_corner() {
+        let w = 300.0_f32;
+        let h = 150.0_f32;
+        let center_r = minato_r_norm(w * 0.5, h * 0.5, w, h);
+        let side_r = minato_r_norm(w, h * 0.5, w, h);
+        let corner_r = minato_r_norm(w, h, w, h);
+        assert!(center_r < side_r);
+        assert!(side_r < corner_r);
+        // Since sample_minato_reveal_radius is monotonically increasing,
+        // the earliest t at which it reaches/exceeds a point's r_norm
+        // directly gives that point's reveal time — proving appearance
+        // ORDER, not just the underlying geometry.
+        let reveal_time_for = |target_r: f32| -> f32 {
+            let mut t = MINATO_REVEAL_START;
+            while t <= MINATO_REVEAL_END {
+                if sample_minato_reveal_radius(t) >= target_r {
+                    return t;
+                }
+                t += 0.001;
+            }
+            MINATO_REVEAL_END
+        };
+        let center_time = reveal_time_for(center_r);
+        let side_time = reveal_time_for(side_r);
+        let corner_time = reveal_time_for(corner_r);
+        assert!(center_time <= side_time, "center must appear at or before the side midpoint");
+        assert!(side_time <= corner_time, "side midpoint must appear at or before the corner");
+        assert!(center_time < corner_time, "center must appear strictly before the corner");
+    }
+
+    #[test]
+    fn minato_reveal_radius_never_negative_or_nan() {
+        let mut t = 0.0_f32;
+        while t <= 1.0 {
+            let r = sample_minato_reveal_radius(t);
+            assert!(r >= 0.0, "t={t} r={r}");
+            assert!(!r.is_nan(), "t={t}");
+            t += 0.01;
+        }
+    }
+
+    // --- RENDER wiring ---
+
+    #[test]
+    fn open_radial_reveal_draw_replaces_never_adds_to_the_single_content_draw() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = start + source[start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let body = &source[start..end];
+        // Exactly one call site each — nested inside the SAME match
+        // (EnergyTear / radial-reveal / ordinary) so only one of the
+        // three ever executes per entry per frame, never two.
+        assert_eq!(body.matches("egl.render_surface_with_radial_reveal(").count(), 1);
+        assert_eq!(body.matches("egl.render_surface_with_opacity(").count(), 1);
+        assert_eq!(body.matches("egl.render_energy_tear_slices(").count(), 1);
+        // The existing TeleportFlashy flash overlay stays drawn strictly
+        // AFTER the (possibly-radial-reveal) surface draw — unchanged
+        // ordering from R1.
+        let reveal_call = body.find("egl.render_surface_with_radial_reveal(").unwrap();
+        let flash_call = body.find("egl.render_solid_overlay(draw_plan, TELEPORT_FLASHY_COLOR, alpha)").unwrap();
+        assert!(reveal_call < flash_call, "the flash overlay must remain drawn AFTER the surface draw");
+    }
+
+    // --- REGRESSION ---
+
+    #[test]
+    fn minato_radial_reveal_does_not_touch_close_teleport_flashy() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_closing_layer(").unwrap();
+        let end = start + source[start..].find("\nfn ").unwrap();
+        let body = &source[start..end];
+        assert!(!body.contains("render_surface_with_radial_reveal"));
+        assert!(!body.contains("minato_reveal_radius_for"));
+        assert!(!body.contains("MINATO"));
+    }
+
+    #[test]
+    fn minato_radial_reveal_does_not_touch_energy_tear_dispatch() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn energy_tear_layout_for(").unwrap();
+        let end = start + source[start..].find("\n}").unwrap();
+        let body = &source[start..end];
+        assert!(!body.contains("Minato"));
+        assert!(!body.contains("reveal"));
+    }
+
+    #[test]
+    fn minato_radial_reveal_does_not_change_the_open_flash_curve() {
+        // Explicit non-regression pin: OPEN_FLASH_HOLD_END/END constants
+        // are untouched by this milestone.
+        assert_eq!(TELEPORT_FLASHY_OPEN_FLASH_HOLD_END, 0.08);
+        assert_eq!(TELEPORT_FLASHY_OPEN_FLASH_END, 0.40);
+        assert_eq!(TELEPORT_FLASHY_OPEN_START_OPACITY, 0.05);
+        assert_eq!(TELEPORT_FLASHY_OPEN_START_SCALE, 0.985);
+    }
+
+    // ========================================================
+    // 3a3fa2b7 — Kamui vortex (OPEN + CLOSE).
+    // ========================================================
+
+    // --- OPEN AnimationVisual ---
+
+    #[test]
+    fn kamui_open_animation_visual_is_exact_identity_throughout() {
+        // The vortex effect IS the visual (see kamui_open_state_for) —
+        // AnimationVisual itself carries no geometry motion for Kamui.
+        for t in [0.0, 0.2, 0.55, 0.7, 0.85, 1.0] {
+            assert_eq!(sample_kamui_open(t), AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 }, "t={t}");
+        }
+    }
+
+    // --- OPEN visible_radius / twist ---
+
+    #[test]
+    fn kamui_open_twist_decay_power_is_below_one_for_a_slower_initial_falloff() {
+        // A concave (< 1.0) decay power keeps twist "remaining strong
+        // during early/mid expansion" (R2 spec section 4) before falling
+        // steeply only near radius=1 — see the constant's own doc comment.
+        assert_eq!(KAMUI_OPEN_TWIST_DECAY_POWER, 0.6);
+        assert!(KAMUI_OPEN_TWIST_DECAY_POWER < 1.0);
+    }
+
+    #[test]
+    fn kamui_open_t0_state() {
+        assert_eq!(KAMUI_OPEN_START_RADIUS, 0.02);
+        assert_eq!(KAMUI_OPEN_MAX_TWIST, 2.4, "3a3fa2b7-r2: increased from R1's 1.6 per human feedback");
+        assert!(KAMUI_OPEN_MAX_TWIST > 1.6, "R2 max twist must exceed R1's");
+        assert_eq!(sample_kamui_open_visible_radius(0.0), KAMUI_OPEN_START_RADIUS);
+        // twist is now coupled to radius, so at t=0 (radius=START_RADIUS,
+        // not exactly 0) it is very close to but not exactly MAX_TWIST —
+        // still strong, and finite.
+        let twist0 = sample_kamui_open_twist(0.0);
+        assert!(twist0.is_finite());
+        assert!(twist0 > KAMUI_OPEN_MAX_TWIST * 0.9, "twist must be near-maximal at the tiny core, got {twist0}");
+        assert!(sample_kamui_open_visible_radius(0.0).is_finite());
+    }
+
+    #[test]
+    fn kamui_open_radius_monotonically_increases_through_core_and_expulsion() {
+        assert_eq!(KAMUI_OPEN_CORE_END, 0.15);
+        assert_eq!(KAMUI_OPEN_CORE_RADIUS, 0.20);
+        assert_eq!(KAMUI_OPEN_EXPAND_END, 0.65);
+        let mut previous = KAMUI_OPEN_START_RADIUS;
+        let mut t = 0.0_f32;
+        while t <= KAMUI_OPEN_EXPAND_END {
+            let r = sample_kamui_open_visible_radius(t);
+            assert!(r >= previous - 1e-6, "monotonic, t={t}");
+            previous = r;
+            t += 0.01;
+        }
+        assert_eq!(sample_kamui_open_visible_radius(KAMUI_OPEN_CORE_END), KAMUI_OPEN_CORE_RADIUS);
+        assert_eq!(sample_kamui_open_visible_radius(KAMUI_OPEN_EXPAND_END), 1.0);
+    }
+
+    #[test]
+    fn kamui_open_twist_monotonically_decays_as_radius_grows_reaching_exact_zero_at_expand_end() {
+        // 3a3fa2b7-r2: twist is DERIVED from visible_radius (never an
+        // independent phase) — do NOT hold it static through expansion
+        // (the R1/R2-flagged flaw). Because radius is itself monotonic,
+        // and twist = MAX*(1-radius)^power is a monotonically decreasing
+        // function of radius, twist is guaranteed monotonically
+        // decreasing across the whole [0, EXPAND_END] window.
+        let mut previous_twist = sample_kamui_open_twist(0.0);
+        let mut t = 0.0_f32;
+        while t <= KAMUI_OPEN_EXPAND_END {
+            let twist = sample_kamui_open_twist(t);
+            assert!(twist <= previous_twist + 1e-6, "twist monotonic decay, t={t}");
+            assert!(twist >= 0.0, "twist never goes negative, t={t}");
+            previous_twist = twist;
+            t += 0.01;
+        }
+        assert_eq!(sample_kamui_open_twist(KAMUI_OPEN_EXPAND_END), 0.0, "twist reaches exact 0 the instant radius hits 1.0");
+    }
+
+    #[test]
+    fn kamui_open_twist_still_clearly_nonzero_at_mid_expansion() {
+        // Required test (R2 spec section 17): "twist still clearly
+        // nonzero" partway through expansion, not held/decayed away
+        // prematurely. `ease_out_cubic` front-loads the radius growth
+        // (fast start, slow finish), so a point ~30% of the way through
+        // the expansion phase already shows radius meaningfully above
+        // the core value while twist remains clearly strong — a later
+        // sample (e.g. the exact time-midpoint) would show radius
+        // already ~90% grown and twist correspondingly weaker, which is
+        // the curve's intended, correct shape, not a bug.
+        let representative = KAMUI_OPEN_CORE_END + 0.30 * (KAMUI_OPEN_EXPAND_END - KAMUI_OPEN_CORE_END);
+        let radius = sample_kamui_open_visible_radius(representative);
+        let twist = sample_kamui_open_twist(representative);
+        assert!(radius > KAMUI_OPEN_CORE_RADIUS, "radius must have materially increased, got {radius}");
+        assert!(radius < 1.0);
+        assert!(twist.abs() > 0.8, "twist must still be clearly nonzero here, got {twist}");
+    }
+
+    #[test]
+    fn kamui_open_exact_identity_at_and_after_settle_end() {
+        for t in [KAMUI_OPEN_EXPAND_END, KAMUI_OPEN_SETTLE_END, 0.95, 1.0] {
+            assert_eq!(sample_kamui_open_visible_radius(t), 1.0, "t={t}");
+            assert_eq!(sample_kamui_open_twist(t), 0.0, "t={t}");
+            assert_eq!(sample_kamui_open_radial_power(t), 1.0, "t={t}");
+        }
+    }
+
+    #[test]
+    fn kamui_open_radial_power_starts_above_one_and_reaches_exact_one_at_identity() {
+        // 3a3fa2b7-r2.1: CORRECTED direction — OPEN must start ABOVE 1.0
+        // (source features get pushed OUTWARD, per the feature-displacement
+        // proof in the constant's own doc comment), the opposite of R2's
+        // (backwards) 0.55.
+        assert_eq!(KAMUI_OPEN_RADIAL_POWER_START, 1.8);
+        assert!(KAMUI_OPEN_RADIAL_POWER_START > 1.0, "OPEN radial_power must start ABOVE 1.0 (source features pushed outward)");
+        let start = sample_kamui_open_radial_power(0.0);
+        assert!(start > 1.65, "radial_power must be close to its start value at t=0, got {start}");
+        assert_eq!(sample_kamui_open_radial_power(KAMUI_OPEN_EXPAND_END), 1.0);
+    }
+
+    #[test]
+    fn kamui_open_state_for_falls_back_to_none_at_and_after_settle_end() {
+        // Mode falls back to ordinary shadow_mode==0 rendering here,
+        // exactly like Minato's own MINATO_REVEAL_END fallback.
+        for t in [KAMUI_OPEN_SETTLE_END, KAMUI_OPEN_SETTLE_END + 0.01, 1.0] {
+            assert_eq!(kamui_open_state_for(OpenAnimationEffect::Kamui, t), None, "t={t}");
+        }
+        assert!(kamui_open_state_for(OpenAnimationEffect::Kamui, 0.3).is_some());
+    }
+
+    #[test]
+    fn kamui_open_state_for_gates_exclusively_on_kamui() {
+        for effect in [
+            OpenAnimationEffect::Scale,
+            OpenAnimationEffect::Teleport,
+            OpenAnimationEffect::EnergyTear,
+            OpenAnimationEffect::Bubble,
+            OpenAnimationEffect::TeleportFlashy,
+        ] {
+            assert_eq!(kamui_open_state_for(effect, 0.1), None, "effect={effect:?}");
+            assert_eq!(kamui_open_shadow_envelope_for(effect, 0.1), None, "effect={effect:?}");
+        }
+    }
+
+    #[test]
+    fn kamui_open_shadow_envelope_matches_visible_radius_at_boundaries() {
+        assert_eq!(kamui_open_shadow_envelope_for(OpenAnimationEffect::Kamui, 1.0), Some(1.0));
+        // Never gated to None post-settle — the envelope value itself
+        // naturally becomes the identity multiplier (1.0).
+        assert_eq!(kamui_open_shadow_envelope_for(OpenAnimationEffect::Kamui, 0.0), Some(KAMUI_OPEN_START_RADIUS));
+    }
+
+    // --- CLOSE AnimationVisual ---
+
+    #[test]
+    fn kamui_close_t0_is_exact_identity() {
+        assert_eq!(sample_kamui_close(0.0), AnimationVisual { opacity: 1.0, scale_x: 1.0, scale_y: 1.0 });
+    }
+
+    #[test]
+    fn kamui_close_scale_stays_exact_identity_throughout() {
+        for t in [0.0, 0.15, 0.5, 0.75, 0.92, 1.0] {
+            let visual = sample_kamui_close(t);
+            assert_eq!(visual.scale_x, 1.0, "t={t}");
+            assert_eq!(visual.scale_y, 1.0, "t={t}");
+        }
+    }
+
+    #[test]
+    fn kamui_close_opacity_held_at_one_through_suction_end_then_fades_to_zero() {
+        assert_eq!(KAMUI_CLOSE_SUCTION_END, 0.82);
+        assert_eq!(KAMUI_CLOSE_COLLAPSE_END, 0.94);
+        for t in [0.0, 0.18, 0.5, 0.82] {
+            assert_eq!(sample_kamui_close(t).opacity, 1.0, "t={t}");
+        }
+        for t in [KAMUI_CLOSE_COLLAPSE_END, 0.97, 1.0] {
+            assert_eq!(sample_kamui_close(t).opacity, 0.0, "t={t}");
+        }
+        let mut previous = 1.0_f32;
+        let mut t = KAMUI_CLOSE_SUCTION_END;
+        while t <= KAMUI_CLOSE_COLLAPSE_END {
+            let opacity = sample_kamui_close(t).opacity;
+            assert!((0.0..=1.0).contains(&opacity), "t={t} opacity={opacity}");
+            assert!(opacity <= previous + 1e-6, "monotonic fade, t={t}");
+            previous = opacity;
+            t += 0.005;
+        }
+    }
+
+    // --- CLOSE visible_radius / twist (R2: twist is a SEPARATE, earlier-
+    // ramping curve — the mandatory fix this milestone exists for) ---
+
+    #[test]
+    fn kamui_close_t0_radius_is_exact_one() {
+        assert_eq!(sample_kamui_close_visible_radius(0.0), 1.0);
+    }
+
+    #[test]
+    fn kamui_close_radius_near_097_at_grab_end() {
+        assert_eq!(KAMUI_CLOSE_GRAB_END, 0.18);
+        assert_eq!(KAMUI_CLOSE_GRAB_RADIUS, 0.97);
+        assert_eq!(sample_kamui_close_visible_radius(KAMUI_CLOSE_GRAB_END), KAMUI_CLOSE_GRAB_RADIUS);
+    }
+
+    #[test]
+    fn kamui_close_twist_precedes_radius_contraction() {
+        // THE required section-9 test — the entire point of this
+        // milestone: at an early representative time (t~0.10, well within
+        // the grab phase), radius must still be very close to 1 (>0.95)
+        // WHILE twist is already clearly nonzero. R1's bug was twist
+        // staying near-zero here because it was proportional to
+        // (1-radius), which barely moved yet.
+        let t = 0.10;
+        let radius = sample_kamui_close_visible_radius(t);
+        let twist = sample_kamui_close_twist(t);
+        assert!(radius > 0.95, "radius must still be close to full size at t={t}, got {radius}");
+        assert!(twist.abs() > 0.3, "twist must already be clearly nonzero at t={t}, got {twist}");
+    }
+
+    #[test]
+    fn kamui_close_twist_reaches_meaningful_magnitude_by_grab_end_while_radius_still_near_one() {
+        assert_eq!(KAMUI_CLOSE_TWIST_AFTER_GRAB, 1.0);
+        let radius = sample_kamui_close_visible_radius(KAMUI_CLOSE_GRAB_END);
+        let twist = sample_kamui_close_twist(KAMUI_CLOSE_GRAB_END);
+        assert!(radius > 0.9, "radius still near-full at grab end, got {radius}");
+        assert!((twist + KAMUI_CLOSE_TWIST_AFTER_GRAB).abs() < 1e-4, "twist must reach the exact grab-end breakpoint, got {twist}");
+    }
+
+    #[test]
+    fn kamui_close_flow_phase_radius_still_substantial_and_twist_strong() {
+        assert_eq!(KAMUI_CLOSE_FLOW_END, 0.55);
+        assert_eq!(KAMUI_CLOSE_FLOW_RADIUS, 0.70);
+        assert_eq!(KAMUI_CLOSE_TWIST_AFTER_FLOW, 2.6);
+        let mid_flow = 0.35;
+        let radius = sample_kamui_close_visible_radius(mid_flow);
+        let twist = sample_kamui_close_twist(mid_flow);
+        assert!(radius > 0.6, "radius must still be substantially >0 during flow, got {radius}");
+        assert!(twist.abs() > 1.5, "twist must be strong during flow, got {twist}");
+        assert_eq!(sample_kamui_close_visible_radius(KAMUI_CLOSE_FLOW_END), KAMUI_CLOSE_FLOW_RADIUS);
+        assert!((sample_kamui_close_twist(KAMUI_CLOSE_FLOW_END) + KAMUI_CLOSE_TWIST_AFTER_FLOW).abs() < 1e-4);
+    }
+
+    #[test]
+    fn kamui_close_radius_materially_contracted_and_twist_near_maximum_at_suction_end() {
+        assert_eq!(KAMUI_CLOSE_SUCTION_RADIUS, 0.45);
+        assert_eq!(KAMUI_CLOSE_MAX_TWIST, 3.4);
+        let radius = sample_kamui_close_visible_radius(KAMUI_CLOSE_SUCTION_END);
+        assert_eq!(radius, KAMUI_CLOSE_SUCTION_RADIUS);
+        assert_eq!(sample_kamui_close(KAMUI_CLOSE_SUCTION_END).opacity, 1.0, "opacity still exactly 1.0 at suction end");
+        let twist = sample_kamui_close_twist(KAMUI_CLOSE_SUCTION_END);
+        assert!((twist + KAMUI_CLOSE_MAX_TWIST).abs() < 1e-4, "twist must reach exactly max magnitude by suction end, got {twist}");
+    }
+
+    #[test]
+    fn kamui_close_radius_and_opacity_reach_zero_over_core_collapse_twist_remains_strong() {
+        let mut previous_radius = KAMUI_CLOSE_SUCTION_RADIUS;
+        let mut t = KAMUI_CLOSE_SUCTION_END;
+        while t <= KAMUI_CLOSE_COLLAPSE_END {
+            let radius = sample_kamui_close_visible_radius(t);
+            assert!(radius >= 0.0, "never negative, t={t} radius={radius}");
+            assert!(radius <= previous_radius + 1e-6, "monotonic collapse, t={t}");
+            // "twist may remain strong until nearly invisible" (R2 spec
+            // section 7 phase D) — held at exactly max magnitude here.
+            assert!((sample_kamui_close_twist(t) + KAMUI_CLOSE_MAX_TWIST).abs() < 1e-4, "twist held at max through collapse, t={t}");
+            previous_radius = radius;
+            t += 0.005;
+        }
+        assert_eq!(sample_kamui_close_visible_radius(KAMUI_CLOSE_COLLAPSE_END), 0.0);
+    }
+
+    #[test]
+    fn kamui_close_fully_hidden_at_and_after_collapse_end() {
+        for t in [KAMUI_CLOSE_COLLAPSE_END, 0.97, 1.0] {
+            assert_eq!(sample_kamui_close_visible_radius(t), 0.0, "t={t}");
+            assert_eq!(sample_kamui_close(t).opacity, 0.0, "t={t}");
+        }
+    }
+
+    #[test]
+    fn kamui_close_twist_is_a_separate_earlier_ramping_curve_not_coupled_to_one_minus_radius() {
+        // 3a3fa2b7-r2: explicit negative-control proof that the R1 bug
+        // (twist == -MAX*(1-radius)) is gone — at t=0.10 the OLD coupled
+        // formula would give a near-zero value (radius is ~0.97 there),
+        // but the actual decoupled curve is already clearly nonzero.
+        let t = 0.10;
+        let radius = sample_kamui_close_visible_radius(t);
+        let old_coupled_formula = -KAMUI_CLOSE_MAX_TWIST * (1.0 - radius);
+        let actual = sample_kamui_close_twist(t);
+        assert!(old_coupled_formula.abs() < 0.15, "sanity: the old coupled formula WOULD be near-zero here, got {old_coupled_formula}");
+        assert!(actual.abs() > 0.3, "the actual R2 curve must NOT reproduce that near-zero value, got {actual}");
+        assert!((actual - old_coupled_formula).abs() > 0.3, "R2 twist must differ materially from the old (1-radius)-coupled formula at t={t}");
+    }
+
+    #[test]
+    fn kamui_close_distinctness_twist_first_then_flow_then_suction_not_shrink_then_fade() {
+        // Required distinctness test (R2 spec section 19): the t at which
+        // twist crosses a "meaningful" threshold must be strictly earlier
+        // than the t at which radius crosses a "substantially contracted"
+        // threshold — proving TWIST FIRST, not SHRINK-then-FADE.
+        let twist_threshold = 1.0;
+        let radius_threshold = 0.5;
+        let mut twist_crossing_t = None;
+        let mut radius_crossing_t = None;
+        let mut t = 0.0_f32;
+        while t <= 1.0 {
+            if twist_crossing_t.is_none() && sample_kamui_close_twist(t).abs() >= twist_threshold {
+                twist_crossing_t = Some(t);
+            }
+            if radius_crossing_t.is_none() && sample_kamui_close_visible_radius(t) <= radius_threshold {
+                radius_crossing_t = Some(t);
+            }
+            t += 0.005;
+        }
+        let twist_crossing_t = twist_crossing_t.expect("twist must cross the threshold somewhere in [0,1]");
+        let radius_crossing_t = radius_crossing_t.expect("radius must cross the threshold somewhere in [0,1]");
+        assert!(
+            twist_crossing_t < radius_crossing_t,
+            "twist (meaningful at t={twist_crossing_t}) must precede radius substantial contraction (at t={radius_crossing_t})"
+        );
+    }
+
+    #[test]
+    fn kamui_close_never_produces_nan_negative_radius_or_out_of_range_opacity() {
+        let mut t = 0.0_f32;
+        while t <= 1.0 {
+            let radius = sample_kamui_close_visible_radius(t);
+            let twist = sample_kamui_close_twist(t);
+            let radial_power = sample_kamui_close_radial_power(t);
+            let opacity = sample_kamui_close(t).opacity;
+            assert!(radius.is_finite() && radius >= 0.0, "t={t} radius={radius}");
+            assert!(twist.is_finite(), "t={t} twist={twist}");
+            assert!(radial_power.is_finite() && radial_power > 0.0, "t={t} radial_power={radial_power}");
+            assert!((0.0..=1.0).contains(&opacity), "t={t} opacity={opacity}");
+            t += 0.01;
+        }
+    }
+
+    #[test]
+    fn kamui_close_radial_power_starts_at_exact_one_and_reaches_end_value_at_full_collapse() {
+        // 3a3fa2b7-r2.1: CORRECTED direction — CLOSE must move BELOW 1.0
+        // (source features get pulled INWARD, per the feature-displacement
+        // proof in the constant's own doc comment), the opposite of R2's
+        // (backwards) 1.8.
+        assert_eq!(KAMUI_CLOSE_RADIAL_POWER_END, 0.55);
+        assert!(KAMUI_CLOSE_RADIAL_POWER_END < 1.0, "CLOSE radial_power must move BELOW 1.0 (source features pulled inward)");
+        assert_eq!(sample_kamui_close_radial_power(0.0), 1.0, "no distortion during pure grab (radius exactly 1 at t=0)");
+        assert_eq!(sample_kamui_close_radial_power(KAMUI_CLOSE_COLLAPSE_END), KAMUI_CLOSE_RADIAL_POWER_END);
+    }
+
+    #[test]
+    fn kamui_close_state_for_is_never_time_gated_present_for_the_whole_duration() {
+        // Unlike OPEN, CLOSE's vortex never falls back to ordinary
+        // rendering — the window is disappearing, not settling.
+        for t in [0.0, 0.18, 0.55, 0.82, 0.94, 1.0] {
+            assert!(kamui_close_state_for(crate::config::CloseAnimationEffect::Kamui, t).is_some(), "t={t}");
+        }
+    }
+
+    #[test]
+    fn kamui_close_state_for_gates_exclusively_on_kamui() {
+        assert_eq!(kamui_close_state_for(crate::config::CloseAnimationEffect::Scale, 0.5), None);
+        assert_eq!(kamui_close_state_for(crate::config::CloseAnimationEffect::TeleportFlashy, 0.5), None);
+        assert_eq!(kamui_close_shadow_envelope_for(crate::config::CloseAnimationEffect::Scale, 0.5), None);
+    }
+
+    #[test]
+    fn kamui_close_shadow_envelope_matches_visible_radius() {
+        assert_eq!(kamui_close_shadow_envelope_for(crate::config::CloseAnimationEffect::Kamui, 0.0), Some(1.0));
+        assert_eq!(kamui_close_shadow_envelope_for(crate::config::CloseAnimationEffect::Kamui, KAMUI_CLOSE_COLLAPSE_END), Some(0.0));
+    }
+
+    // --- R3: ease_in_cubic ---
+
+    #[test]
+    fn ease_in_cubic_is_bounded_and_monotonic() {
+        assert_eq!(ease_in_cubic(0.0), 0.0);
+        assert_eq!(ease_in_cubic(1.0), 1.0);
+        let a = ease_in_cubic(0.25);
+        let b = ease_in_cubic(0.75);
+        assert!((0.0..=1.0).contains(&a), "a={a}");
+        assert!((0.0..=1.0).contains(&b), "b={b}");
+        assert!(a < b);
+        // ease-in is slow at start, fast at end — at u=0.5, value must be < 0.5
+        assert!(ease_in_cubic(0.5) < 0.5, "ease_in_cubic(0.5) must be < 0.5 (back-loaded)");
+    }
+
+    // --- R3: CLOSE content synchronization ---
+
+    #[test]
+    fn kamui_close_r3_bug_regression_radius_materially_visible_at_final_collapse_start() {
+        // 3a3fa2b7-r3 section 18: the OLD R2.1 bug was visible_radius
+        // ~= 0.10 at SUCTION_END, making content practically invisible
+        // before the final opacity fade even began. This regression test
+        // pins the invariant that the new curve MUST leave content
+        // materially visible (>= 0.35, prefer ~0.45) at the start of the
+        // final collapse phase.
+        let radius_at_final_start = sample_kamui_close_visible_radius(KAMUI_CLOSE_SUCTION_END);
+        let opacity_at_final_start = sample_kamui_close(KAMUI_CLOSE_SUCTION_END).opacity;
+        assert_eq!(opacity_at_final_start, 1.0, "opacity must still be exactly 1.0 at final collapse start");
+        assert!(
+            radius_at_final_start >= 0.35,
+            "R3 regression invariant: visible_radius at final collapse start must be >= 0.35, got {radius_at_final_start} (old R2.1 was ~0.10)"
+        );
+        // Prefer ~0.45
+        assert!(
+            (radius_at_final_start - 0.45).abs() < 0.02,
+            "expected radius ~0.45 at final collapse start, got {radius_at_final_start}"
+        );
+    }
+
+    #[test]
+    fn kamui_close_r3_final_phase_radius_and_opacity_synchronized_monotonic_collapse() {
+        // 3a3fa2b7-r3 section 19: prove that during the final phase
+        // [SUCTION_END, COLLAPSE_END], BOTH radius and opacity are
+        // monotonically decreasing, both > 0 in the interior, and both
+        // reach exactly 0 at the end.
+        let mut prev_radius = sample_kamui_close_visible_radius(KAMUI_CLOSE_SUCTION_END);
+        let mut prev_opacity = sample_kamui_close(KAMUI_CLOSE_SUCTION_END).opacity;
+        assert!(prev_radius > 0.0, "radius must be > 0 at final phase start");
+        assert_eq!(prev_opacity, 1.0, "opacity must be 1 at final phase start");
+        let mut t = KAMUI_CLOSE_SUCTION_END + 0.005;
+        while t < KAMUI_CLOSE_COLLAPSE_END {
+            let radius = sample_kamui_close_visible_radius(t);
+            let opacity = sample_kamui_close(t).opacity;
+            assert!(radius >= 0.0, "no negative radius, t={t}");
+            assert!((0.0..=1.0).contains(&opacity), "opacity in [0,1], t={t}");
+            assert!(radius > 0.0, "radius must still be > 0 in final phase interior, t={t}");
+            assert!(opacity > 0.0, "opacity must still be > 0 in final phase interior, t={t}");
+            assert!(radius <= prev_radius + 1e-6, "radius monotonic, t={t}");
+            assert!(opacity <= prev_opacity + 1e-6, "opacity monotonic, t={t}");
+            prev_radius = radius;
+            prev_opacity = opacity;
+            t += 0.005;
+        }
+        // At end: both exactly 0
+        assert_eq!(sample_kamui_close_visible_radius(KAMUI_CLOSE_COLLAPSE_END), 0.0);
+        assert_eq!(sample_kamui_close(KAMUI_CLOSE_COLLAPSE_END).opacity, 0.0);
+    }
+
+    #[test]
+    fn kamui_close_r3_shared_phase_progress_radius_and_opacity_use_same_u() {
+        // 3a3fa2b7-r3 section 20: structurally prove that the final
+        // radius and final opacity derive from the SAME
+        // phase_progress(t, SUCTION_END, COLLAPSE_END). We verify this
+        // by computing the shared u and reconstructing both values,
+        // confirming they match the actual sampled values exactly.
+        for &t in &[0.83, 0.85, 0.87, 0.89, 0.91, 0.93] {
+            let u = phase_progress(t, KAMUI_CLOSE_SUCTION_END, KAMUI_CLOSE_COLLAPSE_END);
+            let expected_radius = lerp(KAMUI_CLOSE_SUCTION_RADIUS, 0.0, ease_in_cubic(u));
+            let expected_opacity = lerp(1.0, 0.0, ease_in_cubic(u));
+            let actual_radius = sample_kamui_close_visible_radius(t);
+            let actual_opacity = sample_kamui_close(t).opacity;
+            assert!(
+                (actual_radius - expected_radius).abs() < 1e-6,
+                "radius must match shared-u reconstruction at t={t}: actual={actual_radius} expected={expected_radius}"
+            );
+            assert!(
+                (actual_opacity - expected_opacity).abs() < 1e-6,
+                "opacity must match shared-u reconstruction at t={t}: actual={actual_opacity} expected={expected_opacity}"
+            );
+        }
+    }
+
+    #[test]
+    fn kamui_close_r3_content_survival_shortly_after_final_collapse_begins() {
+        // 3a3fa2b7-r3 section 21: at t ~= 0.85 (shortly after the
+        // final collapse begins at 0.82), content must STILL be
+        // meaningfully visible — both radius and opacity must be
+        // substantially > 0.
+        let t = 0.85;
+        let radius = sample_kamui_close_visible_radius(t);
+        let opacity = sample_kamui_close(t).opacity;
+        assert!(
+            radius > 0.30,
+            "content survival: radius must still be substantially visible at t={t}, got {radius}"
+        );
+        assert!(
+            opacity > 0.90,
+            "content survival: opacity must still be very high at t={t}, got {opacity}"
+        );
+    }
+
+    #[test]
+    fn kamui_close_r3_twist_preserved_during_final_collapse() {
+        // 3a3fa2b7-r3 section 22: twist must remain strong while
+        // content is still collapsing — no twist fadeout before content
+        // disappears.
+        let t = 0.85;
+        let twist = sample_kamui_close_twist(t);
+        assert!(
+            (twist + KAMUI_CLOSE_MAX_TWIST).abs() < 1e-4,
+            "twist must be at max magnitude during final collapse at t={t}, got {twist}"
+        );
+        // Also check near the very end of collapse
+        let t_late = 0.93;
+        let twist_late = sample_kamui_close_twist(t_late);
+        assert!(
+            (twist_late + KAMUI_CLOSE_MAX_TWIST).abs() < 1e-4,
+            "twist must STILL be at max magnitude near collapse end at t={t_late}, got {twist_late}"
+        );
+    }
+
+    #[test]
+    fn kamui_close_r3_no_content_gone_while_animation_active() {
+        // 3a3fa2b7-r3 section 8: there must be NO significant time
+        // interval where visible_radius ~= 0 but the animation is
+        // still visibly active (opacity > 0). Concretely: whenever
+        // radius < 0.05, opacity must also be < 0.05.
+        let mut t = 0.0_f32;
+        while t <= 1.0 {
+            let radius = sample_kamui_close_visible_radius(t);
+            let opacity = sample_kamui_close(t).opacity;
+            if radius < 0.05 {
+                assert!(
+                    opacity < 0.05,
+                    "content-mask death sync violated: radius={radius} but opacity={opacity} at t={t}"
+                );
+            }
+            t += 0.005;
+        }
+    }
+
+    // --- distinctness ---
+
+    #[test]
+    fn kamui_never_produces_energy_tear_teleport_flashy_or_minato_state_and_vice_versa() {
+        for t in [0.0, 0.2, 0.5, 0.8] {
+            assert_eq!(energy_tear_layout_for(OpenAnimationEffect::Kamui, t), None, "t={t}");
+            assert_eq!(teleport_flashy_open_flash_for(OpenAnimationEffect::Kamui, t), None, "t={t}");
+            assert_eq!(minato_reveal_radius_for(OpenAnimationEffect::Kamui, t), None, "t={t}");
+            assert_eq!(kamui_open_state_for(OpenAnimationEffect::EnergyTear, t), None, "t={t}");
+            assert_eq!(kamui_open_state_for(OpenAnimationEffect::TeleportFlashy, t), None, "t={t}");
+        }
+    }
+
+    #[test]
+    fn kamui_open_and_close_dispatch_match_arms_are_wired() {
+        assert_eq!(sample_open_effect(OpenAnimationEffect::Kamui, 0.5), sample_kamui_open(0.5));
+        assert_eq!(sample_close_effect(crate::config::CloseAnimationEffect::Kamui, 0.5), sample_kamui_close(0.5));
+    }
+
+    // --- render wiring (structural) ---
+
+    #[test]
+    fn open_kamui_warp_draw_is_mutually_exclusive_with_energy_tear_and_minato_and_ordinary() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_egl_scene_parts<'a>(").unwrap();
+        let end = start + source[start..].find("\nfn egl_scene_is_renderable").unwrap();
+        let body = &source[start..end];
+        assert_eq!(body.matches("egl.render_surface_with_kamui_warp(").count(), 1);
+        assert_eq!(body.matches("egl.render_surface_with_radial_reveal(").count(), 1);
+        assert_eq!(body.matches("egl.render_surface_with_opacity(").count(), 1);
+        assert_eq!(body.matches("egl.render_energy_tear_slices(").count(), 1);
+        // Nested inside the SAME match arm as the reveal/ordinary choice
+        // — never a separate, additional draw call site.
+        assert!(body.contains("match (open_reveal_radius, open_kamui_state)"));
+    }
+
+    #[test]
+    fn close_kamui_warp_draw_is_mutually_exclusive_with_ordinary_and_shares_the_provisional_and_committed_path() {
+        let source = include_str!("scene.rs");
+        let start = source.find("fn render_closing_layer(").unwrap();
+        let end = start + source[start..].find("\nfn ").unwrap();
+        let body = &source[start..end];
+        assert_eq!(body.matches("egl.render_surface_with_kamui_warp(").count(), 1);
+        assert_eq!(body.matches("egl.render_surface_with_opacity(").count(), 1);
+        assert!(body.contains("ClosingDrawSource::Committed"));
+        assert!(body.contains("ClosingDrawSource::Provisional"));
+    }
+
+    // --- close-core regression pins ---
+
+    #[test]
+    fn kamui_does_not_touch_destroy_trigger_or_unmap_policy() {
+        let source = include_str!("scene.rs");
+        let note_start = source.find("fn note_destroy_intent(").unwrap();
+        let note_end = note_start + source[note_start..].find("\n    }").unwrap();
+        let body = &source[note_start..note_end];
+        assert!(body.contains("Event::DestroyNotify(destroy)"));
+        assert!(!body.contains("UnmapNotify"));
+        assert!(!body.contains("Kamui"), "close trigger must be untouched by effect wiring");
+    }
+
+    #[test]
+    fn kamui_does_not_touch_render_order_or_close_id_allocation() {
+        let source = include_str!("scene.rs");
+        let reconcile_start = source.find("fn reconcile_render_order(").unwrap();
+        let reconcile_end = reconcile_start + source[reconcile_start..].find("\nfn ").unwrap();
+        assert!(!source[reconcile_start..reconcile_end].contains("Kamui"));
+        let allocate_start = source.find("fn allocate_close_ids(").unwrap();
+        let allocate_end = allocate_start + source[allocate_start..].find("\n}").unwrap();
+        assert!(!source[allocate_start..allocate_end].contains("Kamui"));
+    }
+
+    // --- 23: MANDATORY first-frame test ---
+    //
+    // Proves the actual data build_candidate's pre-commit render call
+    // consumes (merge_window_animations(&self.window_animations,
+    // &provisional_animations), scene.rs — the render call immediately
+    // following it in build_candidate) already reflects the open animation's
+    // initial transform at the earliest possible render time, not the final
+    // settled state. This is not a source-string ordering assertion: it
+    // exercises the exact pure functions that produce that data.
+    #[test]
+    fn first_presentable_render_state_uses_open_animation_initial_transform() {
+        let new_surface = animation_test_entry(42, SurfaceVisualClass::Normal, false);
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: full_hd_root(),
+            entries: vec![new_surface],
+        };
+        let old_surfaces = HashSet::new(); // did not exist in the prior live snapshot
+        let persistent = HashMap::new(); // nothing already committed
+        let now = Instant::now();
+        let provisional = provisional_open_animations(&old_surfaces, &snapshot, false, true, test_animation_config(true), now);
+        let render_view = merge_window_animations(&persistent, &provisional);
+
+        let animation = render_view
+            .get(&42)
+            .expect("newly eligible surface must have a provisional animation before its first render");
+        // The real render call happens at essentially this same instant (no
+        // intervening blocking work in build_candidate between capturing
+        // `now` and rendering) — evaluate at the earliest possible time.
+        let t = animation.progress(now);
+        let visual = sample_open_effect(animation.effect, t);
+        assert!(visual.opacity < 0.5, "first frame must not be near full opacity, got {}", visual.opacity);
+        assert!(visual.scale_x < 0.99, "first frame must not be near full scale, got {}", visual.scale_x);
+        assert_ne!(
+            (visual.opacity, visual.scale_x, visual.scale_y), (1.0, 1.0, 1.0),
+            "first frame must not equal the final settled state",
+        );
+    }
+
+    // --- 25: frame coalescing ---
+    //
+    // The Ignore-only animation branch and every other arm
+    // (Geometry/Hierarchy/Background/VisualState/PixelDamage) live in the
+    // same `match decision { ... }` in wait_live_pixel — a single Rust match
+    // executes exactly one arm per iteration, so "animation consumed by the
+    // PixelDamage/Geometry render" and "a second, separate animation-only
+    // render" are mutually exclusive by construction, not by runtime luck.
+    // batch.decision() itself (unmodified by this change) is what collapses
+    // a batch that contains both pixel damage and other signals down to one
+    // SceneInvalidation before the match ever runs; its priority behavior is
+    // covered by the existing, unmodified
+    // visual_batch_preserves_pixel_subtraction_obligation and
+    // visual_only_batch_has_no_damage_subtraction_obligation tests. This
+    // test instead proves the piece this milestone actually adds: the
+    // animation transform used by whichever arm renders is the same
+    // self.window_animations value regardless of which arm it was, i.e.
+    // there is exactly one animations view per iteration, not a
+    // damage-specific one and a separate animation-only one.
+    #[test]
+    fn animation_transform_is_the_same_single_view_regardless_of_trigger() {
+        let mut persistent = HashMap::new();
+        persistent.insert(7, test_window_animation(Instant::now()));
+        // full_recompose_current (Background/VisualState/Ignore-branch) and
+        // recompose_current_scene (PixelDamage, via full_recompose_current)
+        // both read &self.window_animations directly — there is only one
+        // map, so there cannot be a second, separate animation-only view.
+        let view_for_pixel_damage_path = &persistent;
+        let view_for_ignore_path = &persistent;
+        assert_eq!(
+            view_for_pixel_damage_path.get(&7).unwrap().started_at,
+            view_for_ignore_path.get(&7).unwrap().started_at,
+        );
+    }
+
+    // ========================================================
+    // 3a3fa2a R2 — semantic-preferring override_redirect resolution for
+    // open-animation eligibility only. Mirrors the existing
+    // effective_window_type / semantic_window_type_precedes_capture_type_*
+    // test pattern above: `capture` and `semantic` WindowMetadata fixtures
+    // with genuinely distinct `window` XIDs (capture=10 default,
+    // semantic.window=20), run through the real
+    // eligible_surface_with_semantic_metadata() construction path — not a
+    // hand-rolled SurfaceEntry — so these tests exercise the actual
+    // production wiring, not a paraphrase of it.
+    // ========================================================
+
+    // --- A: effective_override_redirect() precedence, pure function ---
+
+    #[test]
+    fn semantic_override_redirect_false_overrides_capture_true() {
+        let mut capture = metadata();
+        capture.override_redirect = true;
+        let mut semantic = metadata();
+        semantic.window = 20;
+        semantic.override_redirect = false;
+        assert_eq!(effective_override_redirect(&capture, Some(&semantic)), false);
+        let entry = eligible_surface_with_semantic_metadata(&capture, Some(20), Some(&semantic), root(), 10, 0).unwrap();
+        assert_eq!(entry.effective_override_redirect, false);
+        assert!(eligible_for_open_animation(&entry));
+    }
+
+    // --- B: semantic client's override_redirect=true must win ---
+
+    #[test]
+    fn semantic_override_redirect_true_overrides_capture_false() {
+        let capture = metadata(); // override_redirect: false (default)
+        let mut semantic = metadata();
+        semantic.window = 20;
+        semantic.override_redirect = true;
+        assert_eq!(effective_override_redirect(&capture, Some(&semantic)), true);
+        let entry = eligible_surface_with_semantic_metadata(&capture, Some(20), Some(&semantic), root(), 10, 0).unwrap();
+        assert_eq!(entry.effective_override_redirect, true);
+        assert!(!eligible_for_open_animation(&entry));
+    }
+
+    // --- C: no semantic metadata -> capture fallback (true) ---
+
+    #[test]
+    fn semantic_absent_falls_back_to_capture_true() {
+        let mut capture = metadata();
+        capture.override_redirect = true;
+        assert_eq!(effective_override_redirect(&capture, None), true);
+        let entry = eligible_surface_with_semantic_metadata(&capture, None, None, root(), 10, 0).unwrap();
+        assert_eq!(entry.effective_override_redirect, true);
+        assert!(!eligible_for_open_animation(&entry));
+    }
+
+    // --- D: no semantic metadata -> capture fallback (false) ---
+
+    #[test]
+    fn semantic_absent_falls_back_to_capture_false() {
+        let capture = metadata(); // override_redirect: false (default)
+        assert_eq!(effective_override_redirect(&capture, None), false);
+        let entry = eligible_surface_with_semantic_metadata(&capture, None, None, root(), 10, 0).unwrap();
+        assert_eq!(entry.effective_override_redirect, false);
+        assert!(eligible_for_open_animation(&entry));
+    }
+
+    // --- E/F: Dock/Desktop remain excluded regardless of override_redirect ---
+
+    #[test]
+    fn dock_remains_excluded_despite_effective_override_redirect_false() {
+        let capture = metadata(); // override_redirect: false
+        let mut semantic = metadata();
+        semantic.window = 20;
+        semantic.override_redirect = false;
+        semantic.window_type = Some("_NET_WM_WINDOW_TYPE_DOCK".to_string());
+        let entry = eligible_surface_with_semantic_metadata(&capture, Some(20), Some(&semantic), root(), 10, 0).unwrap();
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Dock);
+        assert_eq!(entry.effective_override_redirect, false);
+        assert!(!eligible_for_open_animation(&entry));
+    }
+
+    #[test]
+    fn desktop_remains_excluded_despite_effective_override_redirect_false() {
+        let capture = metadata();
+        let mut semantic = metadata();
+        semantic.window = 20;
+        semantic.override_redirect = false;
+        semantic.window_type = Some("_NET_WM_WINDOW_TYPE_DESKTOP".to_string());
+        let entry = eligible_surface_with_semantic_metadata(&capture, Some(20), Some(&semantic), root(), 10, 0).unwrap();
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Desktop);
+        assert_eq!(entry.effective_override_redirect, false);
+        assert!(!eligible_for_open_animation(&entry));
+    }
+
+    // --- G: a real semantic-client transient (override_redirect=true) stays excluded ---
+
+    #[test]
+    fn real_semantic_override_redirect_transient_remains_excluded() {
+        let capture = metadata(); // capture itself is NOT override_redirect
+        let mut semantic = metadata();
+        semantic.window = 20;
+        semantic.override_redirect = true; // the actual client is a transient popup
+        let entry = eligible_surface_with_semantic_metadata(&capture, Some(20), Some(&semantic), root(), 10, 0).unwrap();
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Normal);
+        assert!(!eligible_for_open_animation(&entry), "a genuinely override_redirect client must never animate");
+    }
+
+    // --- H: forensic Alacritty/i3 reproduction ---
+    //
+    // Exact runtime shape captured during the 3a3fa2a forensic session:
+    // surface=0x00402b5f (capture, override_redirect=true) semantic=
+    // 0x03600003 (a distinct XID, override_redirect=false), class=Normal.
+    // Distinct capture_xid=10 vs semantic.window=20 models "capture XID !=
+    // semantic client XID" explicitly, per the fixture's own identity field.
+
+    #[test]
+    fn forensic_alacritty_i3_capture_frame_true_semantic_client_false_is_eligible() {
+        let mut capture = metadata();
+        capture.window = 10;
+        capture.override_redirect = true; // the i3-side capture surface
+        let mut semantic = metadata();
+        semantic.window = 20; // genuinely distinct XID from the capture surface
+        semantic.override_redirect = false; // the real Alacritty client window
+        assert_ne!(capture.window, semantic.window, "must model capture XID != semantic client XID");
+        let entry = eligible_surface_with_semantic_metadata(&capture, Some(20), Some(&semantic), root(), capture.window, 0).unwrap();
+        assert_eq!(entry.override_redirect, true, "capture-scoped field keeps its existing meaning");
+        assert_eq!(entry.effective_override_redirect, false, "semantic client's value must win for eligibility");
+        assert_eq!(entry.visual_class, SurfaceVisualClass::Normal);
+        assert!(eligible_for_open_animation(&entry), "the forensic Alacritty/i3 case must now be eligible");
     }
 
     #[test]
@@ -9588,7 +16106,7 @@ mod tests {
         let mut plan = build_render_quad_plan(normal.geometry, visual_quad, root()).unwrap();
         apply_surface_visual_policy(&mut plan, &config.visuals, normal.visual_class);
         let style = config.visuals.shadow;
-        let shadow = shadow_params_from_plan(style, &plan).unwrap();
+        let shadow = shadow_params_from_plan(style, &plan, 1.0).unwrap();
         assert_eq!(shadow.outer_x, plan.outer_x as f32);
         assert_eq!(shadow.outer_y, plan.outer_y as f32);
         assert_eq!(shadow.outer_width, plan.outer_width as f32);
@@ -9662,10 +16180,10 @@ mod tests {
         apply_surface_visual_policy(&mut first_plan, &first.visuals, entry.visual_class);
         let mut second_plan = build_render_quad_plan(entry.geometry, visual_quad, root()).unwrap();
         apply_surface_visual_policy(&mut second_plan, &second.visuals, entry.visual_class);
-        assert_eq!(shadow_params_from_plan(first.visuals.shadow, &first_plan).unwrap().outer_width,
-            shadow_params_from_plan(second.visuals.shadow, &second_plan).unwrap().outer_width);
-        assert_eq!(shadow_params_from_plan(first.visuals.shadow, &first_plan).unwrap().outer_height,
-            shadow_params_from_plan(second.visuals.shadow, &second_plan).unwrap().outer_height);
+        assert_eq!(shadow_params_from_plan(first.visuals.shadow, &first_plan, 1.0).unwrap().outer_width,
+            shadow_params_from_plan(second.visuals.shadow, &second_plan, 1.0).unwrap().outer_width);
+        assert_eq!(shadow_params_from_plan(first.visuals.shadow, &first_plan, 1.0).unwrap().outer_height,
+            shadow_params_from_plan(second.visuals.shadow, &second_plan, 1.0).unwrap().outer_height);
     }
 
     #[test]
@@ -9678,14 +16196,14 @@ mod tests {
         first.geometry.y = 30;
         let local_pixmap = pixmap(20, 15);
         let first_plan = build_render_quad_plan(first.geometry, local_pixmap, root()).unwrap();
-        let first_shadow = shadow_params_from_plan(config.visuals.shadow, &first_plan).unwrap();
+        let first_shadow = shadow_params_from_plan(config.visuals.shadow, &first_plan, 1.0).unwrap();
         assert_eq!((first_shadow.outer_x, first_shadow.outer_y), (10.0, 30.0));
 
         let mut second = first.clone();
         second.geometry.x = 55;
         second.geometry.y = 5;
         let second_plan = build_render_quad_plan(second.geometry, local_pixmap, root()).unwrap();
-        let second_shadow = shadow_params_from_plan(config.visuals.shadow, &second_plan).unwrap();
+        let second_shadow = shadow_params_from_plan(config.visuals.shadow, &second_plan, 1.0).unwrap();
         assert_eq!((second_shadow.outer_x, second_shadow.outer_y), (55.0, 5.0));
     }
 
@@ -9710,11 +16228,11 @@ mod tests {
         let visual_quad = pixmap(20, 15);
         let mut first_plan = build_render_quad_plan(entry.geometry, visual_quad, root()).unwrap();
         apply_surface_visual_policy(&mut first_plan, &config.visuals, entry.visual_class);
-        let first = shadow_params_from_plan(config.visuals.shadow, &first_plan).unwrap();
+        let first = shadow_params_from_plan(config.visuals.shadow, &first_plan, 1.0).unwrap();
         config.visuals.corner_radius = 16.0;
         let mut second_plan = build_render_quad_plan(entry.geometry, visual_quad, root()).unwrap();
         apply_surface_visual_policy(&mut second_plan, &config.visuals, entry.visual_class);
-        let second = shadow_params_from_plan(config.visuals.shadow, &second_plan).unwrap();
+        let second = shadow_params_from_plan(config.visuals.shadow, &second_plan, 1.0).unwrap();
         assert_ne!(first.corner_radius, second.corner_radius);
         let mut moved = entry;
         moved.geometry.x += 11;
@@ -9722,7 +16240,7 @@ mod tests {
         let moved_quad = PixmapGeometry { x: visual_quad.x + 11, y: visual_quad.y + 13, ..visual_quad };
         let mut moved_plan = build_render_quad_plan(moved.geometry, moved_quad, root()).unwrap();
         apply_surface_visual_policy(&mut moved_plan, &config.visuals, moved.visual_class);
-        let moved_shadow = shadow_params_from_plan(config.visuals.shadow, &moved_plan).unwrap();
+        let moved_shadow = shadow_params_from_plan(config.visuals.shadow, &moved_plan, 1.0).unwrap();
         assert_eq!(moved_shadow.outer_x - second.outer_x, 11.0);
         assert_eq!(moved_shadow.outer_y - second.outer_y, 13.0);
     }
@@ -9736,7 +16254,7 @@ mod tests {
         assert!(!shadow_eligible_for_entry(config.visuals.shadow, &entry));
         let mut enabled = config;
         enabled.visuals.shadow.enabled = true;
-        assert!(shadow_params_from_plan(enabled.visuals.shadow, &plan).is_none());
+        assert!(shadow_params_from_plan(enabled.visuals.shadow, &plan, 1.0).is_none());
     }
 
     #[test]

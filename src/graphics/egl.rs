@@ -834,6 +834,64 @@ impl EglSceneRenderer {
         Ok(())
     }
 
+    /// 3a3fa2b6-r2 (Minato radial reveal) — thin wrapper mirroring
+    /// `render_surface_with_opacity`'s own shape: supplies
+    /// root_width/root_height, otherwise a direct pass-through. No
+    /// resource allocation, no state ownership.
+    pub fn render_surface_with_radial_reveal(
+        &self,
+        texture: u32,
+        plan: crate::x11::scene::RenderQuadPlan,
+        pixel_semantics: crate::x11::scene::EglPixelSemantics,
+        opacity: renderer::SurfaceOpacity,
+        reveal_radius: f32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer
+            .as_ref()
+            .ok_or("EGL scene renderer is unavailable")?
+            .render_surface_with_radial_reveal(
+                texture,
+                plan,
+                pixel_semantics,
+                self.width as i32,
+                self.height as i32,
+                opacity,
+                reveal_radius,
+            )?;
+        Ok(())
+    }
+
+    /// 3a3fa2b7 (Kamui vortex) — thin wrapper mirroring
+    /// `render_surface_with_radial_reveal`'s own shape: supplies
+    /// root_width/root_height, otherwise a direct pass-through. No
+    /// resource allocation, no state ownership.
+    pub fn render_surface_with_kamui_warp(
+        &self,
+        texture: u32,
+        plan: crate::x11::scene::RenderQuadPlan,
+        pixel_semantics: crate::x11::scene::EglPixelSemantics,
+        opacity: renderer::SurfaceOpacity,
+        visible_radius: f32,
+        twist: f32,
+        radial_power: f32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer
+            .as_ref()
+            .ok_or("EGL scene renderer is unavailable")?
+            .render_surface_with_kamui_warp(
+                texture,
+                plan,
+                pixel_semantics,
+                self.width as i32,
+                self.height as i32,
+                opacity,
+                visible_radius,
+                twist,
+                radial_power,
+            )?;
+        Ok(())
+    }
+
     pub fn render_shadow(
         &self,
         params: crate::graphics::renderer::ShadowParams,
@@ -842,6 +900,39 @@ impl EglSceneRenderer {
             .as_ref()
             .ok_or("EGL scene renderer is unavailable")?
             .render_shadow(params, self.width as i32, self.height as i32)?;
+        Ok(())
+    }
+
+    /// 3a3fa2b3 — thin wrapper mirroring `render_shadow`'s own shape:
+    /// supplies root_width/root_height, otherwise a direct pass-through.
+    pub fn render_energy_tear_slices(
+        &self,
+        texture: u32,
+        pixel_semantics: crate::x11::scene::EglPixelSemantics,
+        opacity: renderer::SurfaceOpacity,
+        render_plan: &crate::x11::scene::EnergyTearRenderPlan,
+    ) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer
+            .as_ref()
+            .ok_or("EGL scene renderer is unavailable")?
+            .render_energy_tear_slices(texture, pixel_semantics, opacity, render_plan, self.width as i32, self.height as i32)?;
+        Ok(())
+    }
+
+    /// 3a3fa2b6 — thin wrapper mirroring `render_shadow`'s/
+    /// `render_energy_tear_slices`'s own shape: supplies
+    /// root_width/root_height, otherwise a direct pass-through. No
+    /// resource allocation, no state ownership.
+    pub fn render_solid_overlay(
+        &self,
+        plan: crate::x11::scene::RenderQuadPlan,
+        color: [f32; 3],
+        alpha: f32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer
+            .as_ref()
+            .ok_or("EGL scene renderer is unavailable")?
+            .render_solid_overlay(plan, color, alpha, self.width as i32, self.height as i32)?;
         Ok(())
     }
 
@@ -877,6 +968,23 @@ impl EglSceneRenderer {
             .as_mut()
             .ok_or("EGL scene renderer is unavailable")?
             .draw_blurred_backdrop(texture, params, corner_radius)
+    }
+
+    /// 3a3fa2b5 — thin wrapper mirroring `capture_and_blur_background`'s
+    /// own shape: a direct pass-through to `SceneRenderer::
+    /// capture_closing_snapshot`, which does the actual GPU-side-only
+    /// exact-copy capture (no XGetImage, no glReadPixels, no persisted
+    /// FBO).
+    pub fn capture_closing_snapshot(
+        &mut self,
+        source_texture: u32,
+        width: i32,
+        height: i32,
+    ) -> Result<u32, Box<dyn Error>> {
+        self.scene_renderer
+            .as_ref()
+            .ok_or("EGL scene renderer is unavailable")?
+            .capture_closing_snapshot(source_texture, width, height)
     }
 
     pub fn swap(&self) -> Result<(), Box<dyn Error>> {

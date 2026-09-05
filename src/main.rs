@@ -360,7 +360,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             return Err("--compositor-scene-x11-probe cannot be combined with another mode".into());
         }
         let config = scene_config_from_cli(
-            config::CompositorConfig { visuals: startup_config.visuals, blur_enabled: startup_config.blur_enabled },
+            config::CompositorConfig { visuals: startup_config.visuals, blur_enabled: startup_config.blur_enabled, animation: startup_config.animation },
             compositor_corner_radius,
             compositor_border_width,
             compositor_border_color.as_deref(),
@@ -505,7 +505,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     if capture_window.is_none() {
         let config = scene_config_from_cli(
-            config::CompositorConfig { visuals: startup_config.visuals, blur_enabled: startup_config.blur_enabled },
+            config::CompositorConfig { visuals: startup_config.visuals, blur_enabled: startup_config.blur_enabled, animation: startup_config.animation },
             compositor_corner_radius,
             compositor_border_width,
             compositor_border_color.as_deref(),

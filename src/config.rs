@@ -4,11 +4,78 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CompositorConfig {
     pub(crate) visuals: VisualConfig,
     pub(crate) blur_enabled: bool,
+    pub(crate) animation: AnimationConfig,
+}
+
+/// 3a3fa2b1/b2-r2/b3/b4-r1/b6-r1/b7 — user-selectable open-animation
+/// effect. `Scale`, `Teleport`, `EnergyTear`, `Bubble`, `TeleportFlashy`,
+/// and `Kamui` exist so far; the parser must reject any other token
+/// (including future effect names) with a clear config error rather than
+/// accept a non-functional effect — see `resolve_animation`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OpenAnimationEffect {
+    Scale,
+    Teleport,
+    EnergyTear,
+    Bubble,
+    TeleportFlashy,
+    Kamui,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OpenAnimationConfig {
+    pub(crate) effect: OpenAnimationEffect,
+    pub(crate) duration: Duration,
+}
+
+/// 3a3fa2b5/b6-r1/b7 — separate enum from `OpenAnimationEffect` on
+/// purpose: close-side lifecycle state must never semantically pretend
+/// to be an open animation (see `ClosingAnimation` in scene.rs). `Scale`,
+/// `TeleportFlashy`, and `Kamui` exist so far — `teleport`/`energy_tear`/
+/// `bubble` remain explicitly out of scope as CLOSE effects for this
+/// milestone (they remain valid OPEN effects, unrelated).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CloseAnimationEffect {
+    Scale,
+    TeleportFlashy,
+    Kamui,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CloseAnimationConfig {
+    pub(crate) enabled: bool,
+    pub(crate) effect: CloseAnimationEffect,
+    pub(crate) duration: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AnimationConfig {
+    pub(crate) enabled: bool,
+    pub(crate) open: OpenAnimationConfig,
+    pub(crate) close: CloseAnimationConfig,
+}
+
+impl Default for AnimationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            open: OpenAnimationConfig {
+                effect: OpenAnimationEffect::Scale,
+                duration: Duration::from_millis(180),
+            },
+            close: CloseAnimationConfig {
+                enabled: false,
+                effect: CloseAnimationEffect::Scale,
+                duration: Duration::from_millis(180),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,6 +226,12 @@ pub(crate) struct ParsedGlobalConfig {
     pub(crate) opacity_inactive: Option<f32>,
     pub(crate) opacity_urgent: Option<f32>,
     pub(crate) blur_enabled: Option<bool>,
+    pub(crate) animation_enabled: Option<bool>,
+    pub(crate) animation_open_effect: Option<String>,
+    pub(crate) animation_open_duration: Option<f32>,
+    pub(crate) animation_close_enabled: Option<bool>,
+    pub(crate) animation_close_effect: Option<String>,
+    pub(crate) animation_close_duration: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -203,6 +276,7 @@ pub(crate) struct ValidatedConfig {
     pub(crate) visuals: VisualConfig,
     pub(crate) blur_enabled: bool,
     pub(crate) rules: Vec<WindowRule>,
+    pub(crate) animation: AnimationConfig,
 }
 
 impl Default for ValidatedConfig {
@@ -216,7 +290,7 @@ impl Default for ValidatedConfig {
             extent: 18.0,
             strength: 0.28,
         };
-        Self { visuals, blur_enabled: true, rules: Vec::new() }
+        Self { visuals, blur_enabled: true, rules: Vec::new(), animation: AnimationConfig::default() }
     }
 }
 
@@ -290,6 +364,7 @@ impl ParsedConfig {
             urgent: global.opacity_urgent.unwrap_or(1.0),
         };
         config.blur_enabled = global.blur_enabled.unwrap_or(true);
+        config.animation = resolve_animation(&global)?;
         validate_visuals(&config.visuals)?;
         config.rules = self.rules.into_iter().map(validate_rule).collect::<Result<_, _>>()?;
         Ok(config)
@@ -364,9 +439,75 @@ fn parse_global(global: &mut ParsedGlobalConfig, key: &str, value: &str, line: u
         "opacity.inactive" => assign!(opacity_inactive, number),
         "opacity.urgent" => assign!(opacity_urgent, number),
         "blur.enabled" => assign!(blur_enabled, bool_value),
+        "animation.enabled" => assign!(animation_enabled, bool_value),
+        "animation.open.effect" => assign!(animation_open_effect, token_value),
+        "animation.open.duration" => assign!(animation_open_duration, number),
+        "animation.close.enabled" => assign!(animation_close_enabled, bool_value),
+        "animation.close.effect" => assign!(animation_close_effect, token_value),
+        "animation.close.duration" => assign!(animation_close_duration, number),
         _ => return Err(error(line, section, "unknown key")),
     }
     Ok(())
+}
+
+/// 3a3fa2b1 — resolves and validates `animation.*`. Bounds are checked
+/// unconditionally, regardless of `animation.enabled`, matching this
+/// file's existing precedent for shadow's unconditional finite/range
+/// checks (`validate_visuals`) versus its enabled-conditional ones.
+fn resolve_animation(global: &ParsedGlobalConfig) -> Result<AnimationConfig, ParseError> {
+    let section = Some("global".to_owned());
+    let effect = match global.animation_open_effect.as_deref() {
+        None => OpenAnimationEffect::Scale,
+        Some("scale") => OpenAnimationEffect::Scale,
+        Some("teleport") => OpenAnimationEffect::Teleport,
+        Some("energy_tear") => OpenAnimationEffect::EnergyTear,
+        Some("bubble") => OpenAnimationEffect::Bubble,
+        Some("teleport_flashy") => OpenAnimationEffect::TeleportFlashy,
+        Some("kamui") => OpenAnimationEffect::Kamui,
+        Some(_) => return Err(error(0, section, "unknown animation effect")),
+    };
+    let duration_ms = global.animation_open_duration.unwrap_or(180.0);
+    if !duration_ms.is_finite() || duration_ms < 50.0 || duration_ms > 3000.0 {
+        return Err(error(0, section, "animation.open.duration must be between 50 and 3000 milliseconds"));
+    }
+    let close = resolve_close_animation(global)?;
+    Ok(AnimationConfig {
+        enabled: global.animation_enabled.unwrap_or(false),
+        open: OpenAnimationConfig {
+            effect,
+            duration: Duration::from_millis(duration_ms.round() as u64),
+        },
+        close,
+    })
+}
+
+/// 3a3fa2b5/b6-r1/b7 — resolves and validates `animation.close.*`.
+/// Mirrors `resolve_animation`'s exact policy shape: duration bounds are
+/// checked unconditionally, regardless of `animation.close.enabled` (same
+/// unconditional-validation precedent as open's own duration, and as
+/// shadow's finite/range checks in `validate_visuals`). R1 supported
+/// exactly `scale`; b6-r1 added `teleport_flashy`; b7 adds `kamui`. Every
+/// other token — including `teleport`/`energy_tear`/`bubble`, all valid
+/// OPEN effects — is still rejected, since this milestone deliberately
+/// does not expose those as CLOSE effects.
+fn resolve_close_animation(global: &ParsedGlobalConfig) -> Result<CloseAnimationConfig, ParseError> {
+    let section = Some("global".to_owned());
+    let effect = match global.animation_close_effect.as_deref() {
+        None => CloseAnimationEffect::Scale,
+        Some("scale") => CloseAnimationEffect::Scale,
+        Some("teleport_flashy") => CloseAnimationEffect::TeleportFlashy,
+        Some("kamui") => CloseAnimationEffect::Kamui,
+        Some(_) => return Err(error(0, section, "unknown close animation effect")),
+    };
+    let duration_ms = global.animation_close_duration.unwrap_or(180.0);
+    if !duration_ms.is_finite() || duration_ms < 50.0 || duration_ms > 3000.0 {
+        return Err(error(0, section, "animation.close.duration must be between 50 and 3000 milliseconds"));
+    }
+    Ok(CloseAnimationConfig {
+        enabled: global.animation_close_enabled.unwrap_or(false),
+        effect,
+        duration: Duration::from_millis(duration_ms.round() as u64),
+    })
 }
 
 fn parse_rule(rule: &mut ParsedRule, key: &str, value: &str, line: usize) -> Result<(), ParseError> {
@@ -494,6 +635,7 @@ impl Default for CompositorConfig {
         Self {
             visuals: VisualConfig::default(),
             blur_enabled: true,
+            animation: AnimationConfig::default(),
         }
     }
 }
@@ -647,8 +789,11 @@ mod tests {
     use super::{CompositorConfig, ConfigLoadError, ConfigLoadOutcome, ConfigPathEnvironment,
         OpacityConfig, ParsedConfig, RuleActions, StartupConfigRequest, ValidatedConfig,
         WindowMetadataForRule, WindowType, load_startup_config, resolve_blur,
-        resolve_config_path, resolve_rule_actions};
+        resolve_config_path, resolve_rule_actions,
+        AnimationConfig, OpenAnimationConfig, OpenAnimationEffect,
+        CloseAnimationConfig, CloseAnimationEffect};
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     #[test]
     fn defaults_preserve_current_visual_semantics() {
@@ -834,6 +979,289 @@ mod tests {
         assert!(!defaults.visuals.shadow.enabled);
         assert_eq!(defaults.visuals.opacity, OpacityConfig { focused: 1.0, inactive: 1.0, urgent: 1.0 });
         let _snapshot = std::sync::Arc::new(defaults);
+    }
+
+    // ========================================================
+    // 3a3fa2b1 — animation config model.
+    // ========================================================
+
+    // --- A: no animation keys -> compiled defaults ---
+
+    #[test]
+    fn no_animation_keys_yields_disabled_scale_180ms_defaults() {
+        let config = ParsedConfig::parse("[global]\nblur.enabled = true").unwrap().validate().unwrap();
+        assert_eq!(
+            config.animation,
+            AnimationConfig {
+                enabled: false,
+                open: OpenAnimationConfig { effect: OpenAnimationEffect::Scale, duration: Duration::from_millis(180) },
+                close: CloseAnimationConfig { enabled: false, effect: CloseAnimationEffect::Scale, duration: Duration::from_millis(180) },
+            },
+        );
+    }
+
+    #[test]
+    fn empty_config_also_yields_the_same_animation_defaults() {
+        let config = ParsedConfig::parse("[global]").unwrap().validate().unwrap();
+        assert_eq!(config.animation, AnimationConfig::default());
+    }
+
+    // --- B: animation.enabled = true ---
+
+    #[test]
+    fn animation_enabled_true_is_honored() {
+        let config = ParsedConfig::parse("[global]\nanimation.enabled = true").unwrap().validate().unwrap();
+        assert!(config.animation.enabled);
+        // omitted effect/duration still resolve to their own defaults
+        assert_eq!(config.animation.open.effect, OpenAnimationEffect::Scale);
+        assert_eq!(config.animation.open.duration, Duration::from_millis(180));
+    }
+
+    // --- C: effect = scale parses ---
+
+    #[test]
+    fn effect_scale_parses() {
+        let config = ParsedConfig::parse("[global]\nanimation.enabled = true\nanimation.open.effect = scale").unwrap().validate().unwrap();
+        assert_eq!(config.animation.open.effect, OpenAnimationEffect::Scale);
+    }
+
+    // --- D/E/F: teleport now parses (R2); bubble/fire still rejected ---
+
+    #[test]
+    fn effect_teleport_parses() {
+        // 3a3fa2b2-r2: teleport is now a supported effect (was rejected
+        // through b1/b2-r1).
+        let config = ParsedConfig::parse("[global]\nanimation.enabled = true\nanimation.open.effect = teleport").unwrap().validate().unwrap();
+        assert_eq!(config.animation.open.effect, OpenAnimationEffect::Teleport);
+    }
+
+    #[test]
+    fn effect_energy_tear_parses() {
+        // 3a3fa2b3: energy_tear is a new supported effect, additive
+        // alongside scale/teleport.
+        let config = ParsedConfig::parse("[global]\nanimation.enabled = true\nanimation.open.effect = energy_tear").unwrap().validate().unwrap();
+        assert_eq!(config.animation.open.effect, OpenAnimationEffect::EnergyTear);
+    }
+
+    #[test]
+    fn effect_bubble_parses() {
+        // 3a3fa2b4-r1: bubble is a new supported effect, additive
+        // alongside scale/teleport/energy_tear.
+        let config = ParsedConfig::parse("[global]\nanimation.enabled = true\nanimation.open.effect = bubble").unwrap().validate().unwrap();
+        assert_eq!(config.animation.open.effect, OpenAnimationEffect::Bubble);
+    }
+
+    #[test]
+    fn effect_fire_rejected() {
+        assert!(ParsedConfig::parse("[global]\nanimation.open.effect = fire").unwrap().validate().is_err());
+    }
+
+    // --- G: any other unknown effect token rejected ---
+
+    #[test]
+    fn unknown_effect_token_rejected() {
+        assert!(ParsedConfig::parse("[global]\nanimation.open.effect = spin").unwrap().validate().is_err());
+    }
+
+    // --- H/I: duration bounds accepted ---
+
+    #[test]
+    fn duration_50_accepted() {
+        let config = ParsedConfig::parse("[global]\nanimation.open.duration = 50").unwrap().validate().unwrap();
+        assert_eq!(config.animation.open.duration, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn duration_3000_accepted() {
+        let config = ParsedConfig::parse("[global]\nanimation.open.duration = 3000").unwrap().validate().unwrap();
+        assert_eq!(config.animation.open.duration, Duration::from_millis(3000));
+    }
+
+    // --- J/K: duration bounds rejected ---
+
+    #[test]
+    fn duration_49_rejected() {
+        assert!(ParsedConfig::parse("[global]\nanimation.open.duration = 49").unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn duration_3001_rejected() {
+        assert!(ParsedConfig::parse("[global]\nanimation.open.duration = 3001").unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn duration_0_and_negative_rejected() {
+        assert!(ParsedConfig::parse("[global]\nanimation.open.duration = 0").unwrap().validate().is_err());
+        assert!(ParsedConfig::parse("[global]\nanimation.open.duration = -5").unwrap().validate().is_err());
+    }
+
+    // --- L: invalid duration rejected even when enabled=false ---
+
+    #[test]
+    fn invalid_duration_rejected_even_when_disabled() {
+        assert!(ParsedConfig::parse("[global]\nanimation.enabled = false\nanimation.open.duration = 1").unwrap().validate().is_err());
+        // b4-r1: "bubble" is now a valid effect too, so the invalid-value
+        // probe here uses "fire" (still unsupported) to keep testing the
+        // same thing this test always tested — an invalid value is
+        // rejected even while animation.enabled = false.
+        assert!(ParsedConfig::parse("[global]\nanimation.enabled = false\nanimation.open.effect = fire").unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn invalid_duration_number_is_a_parse_time_error() {
+        assert!(ParsedConfig::parse("[global]\nanimation.open.duration = nope").is_err());
+    }
+
+    #[test]
+    fn animation_daily_driver_profile_reproduces_temporary_exaggerated_values() {
+        // Exact snippet a human would use post-apply to reproduce the
+        // currently-running temporary 0.70/800ms validation behavior.
+        let config = ParsedConfig::parse(
+            "[global]\nanimation.enabled = true\nanimation.open.effect = scale\nanimation.open.duration = 800",
+        ).unwrap().validate().unwrap();
+        assert!(config.animation.enabled);
+        assert_eq!(config.animation.open.effect, OpenAnimationEffect::Scale);
+        assert_eq!(config.animation.open.duration, Duration::from_millis(800));
+    }
+
+    // ========================================================
+    // 3a3fa2b5 — close animation config model.
+    // ========================================================
+
+    #[test]
+    fn no_close_keys_yields_disabled_scale_180ms_defaults() {
+        let config = ParsedConfig::parse("[global]\nblur.enabled = true").unwrap().validate().unwrap();
+        assert_eq!(
+            config.animation.close,
+            CloseAnimationConfig { enabled: false, effect: CloseAnimationEffect::Scale, duration: Duration::from_millis(180) },
+        );
+    }
+
+    #[test]
+    fn empty_config_also_yields_the_same_close_defaults() {
+        let config = ParsedConfig::parse("[global]").unwrap().validate().unwrap();
+        assert_eq!(config.animation.close, AnimationConfig::default().close);
+    }
+
+    #[test]
+    fn close_enabled_true_is_honored_independently_of_open() {
+        let config = ParsedConfig::parse("[global]\nanimation.close.enabled = true").unwrap().validate().unwrap();
+        assert!(config.animation.close.enabled);
+        assert!(!config.animation.enabled);
+        assert_eq!(config.animation.close.effect, CloseAnimationEffect::Scale);
+        assert_eq!(config.animation.close.duration, Duration::from_millis(180));
+    }
+
+    #[test]
+    fn close_effect_scale_parses() {
+        let config = ParsedConfig::parse("[global]\nanimation.close.enabled = true\nanimation.close.effect = scale").unwrap().validate().unwrap();
+        assert_eq!(config.animation.close.effect, CloseAnimationEffect::Scale);
+    }
+
+    #[test]
+    fn close_effect_open_only_tokens_are_rejected() {
+        // 3a3fa2b6-r1/b7: teleport_flashy and kamui are now valid CLOSE
+        // effects too (see close_effect_teleport_flashy_parses /
+        // close_effect_kamui_parses below) — removed from this rejection
+        // list. teleport/energy_tear/bubble remain OPEN-only.
+        for token in ["teleport", "energy_tear", "bubble", "fire", "spin"] {
+            let source = format!("[global]\nanimation.close.effect = {token}");
+            assert!(
+                ParsedConfig::parse(&source).unwrap().validate().is_err(),
+                "close effect must reject {token}",
+            );
+        }
+    }
+
+    #[test]
+    fn close_effect_teleport_flashy_parses() {
+        let config = ParsedConfig::parse("[global]\nanimation.close.enabled = true\nanimation.close.effect = teleport_flashy").unwrap().validate().unwrap();
+        assert_eq!(config.animation.close.effect, CloseAnimationEffect::TeleportFlashy);
+    }
+
+    #[test]
+    fn open_effect_teleport_flashy_parses() {
+        let config = ParsedConfig::parse("[global]\nanimation.open.effect = teleport_flashy").unwrap().validate().unwrap();
+        assert_eq!(config.animation.open.effect, OpenAnimationEffect::TeleportFlashy);
+    }
+
+    #[test]
+    fn open_effects_scale_teleport_energy_tear_bubble_still_parse() {
+        for (token, expected) in [
+            ("scale", OpenAnimationEffect::Scale),
+            ("teleport", OpenAnimationEffect::Teleport),
+            ("energy_tear", OpenAnimationEffect::EnergyTear),
+            ("bubble", OpenAnimationEffect::Bubble),
+        ] {
+            let source = format!("[global]\nanimation.open.effect = {token}");
+            let config = ParsedConfig::parse(&source).unwrap().validate().unwrap();
+            assert_eq!(config.animation.open.effect, expected, "token={token}");
+        }
+    }
+
+    #[test]
+    fn open_effect_kamui_parses() {
+        let config = ParsedConfig::parse("[global]\nanimation.open.effect = kamui").unwrap().validate().unwrap();
+        assert_eq!(config.animation.open.effect, OpenAnimationEffect::Kamui);
+    }
+
+    #[test]
+    fn close_effect_kamui_parses() {
+        let config = ParsedConfig::parse("[global]\nanimation.close.enabled = true\nanimation.close.effect = kamui").unwrap().validate().unwrap();
+        assert_eq!(config.animation.close.effect, CloseAnimationEffect::Kamui);
+    }
+
+    #[test]
+    fn open_effect_teleport_flashy_still_parses_alongside_kamui() {
+        // 3a3fa2b7: confirms adding Kamui did not disturb the existing
+        // TeleportFlashy token/variant.
+        let config = ParsedConfig::parse("[global]\nanimation.open.effect = teleport_flashy").unwrap().validate().unwrap();
+        assert_eq!(config.animation.open.effect, OpenAnimationEffect::TeleportFlashy);
+    }
+
+    #[test]
+    fn close_duration_50_and_3000_accepted() {
+        let low = ParsedConfig::parse("[global]\nanimation.close.duration = 50").unwrap().validate().unwrap();
+        assert_eq!(low.animation.close.duration, Duration::from_millis(50));
+        let high = ParsedConfig::parse("[global]\nanimation.close.duration = 3000").unwrap().validate().unwrap();
+        assert_eq!(high.animation.close.duration, Duration::from_millis(3000));
+    }
+
+    #[test]
+    fn close_duration_out_of_bounds_rejected() {
+        assert!(ParsedConfig::parse("[global]\nanimation.close.duration = 49").unwrap().validate().is_err());
+        assert!(ParsedConfig::parse("[global]\nanimation.close.duration = 3001").unwrap().validate().is_err());
+        assert!(ParsedConfig::parse("[global]\nanimation.close.duration = 0").unwrap().validate().is_err());
+        assert!(ParsedConfig::parse("[global]\nanimation.close.duration = -5").unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn invalid_close_duration_rejected_even_when_close_disabled() {
+        assert!(ParsedConfig::parse("[global]\nanimation.close.enabled = false\nanimation.close.duration = 1").unwrap().validate().is_err());
+        assert!(ParsedConfig::parse("[global]\nanimation.close.enabled = false\nanimation.close.effect = fire").unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn close_animation_requires_both_master_and_close_gate_documented_via_fields() {
+        // No runtime gate function exists for this (the gate is a plain
+        // `&&` at the call site in scene.rs::build_provisional_closing_state)
+        // — this test only pins that both flags are independently
+        // observable and independently default to false.
+        let config = ParsedConfig::parse("[global]\nanimation.enabled = true").unwrap().validate().unwrap();
+        assert!(config.animation.enabled);
+        assert!(!config.animation.close.enabled);
+        let config = ParsedConfig::parse("[global]\nanimation.close.enabled = true").unwrap().validate().unwrap();
+        assert!(!config.animation.enabled);
+        assert!(config.animation.close.enabled);
+    }
+
+    #[test]
+    fn open_and_close_effect_are_independent_types_and_defaults() {
+        let config = ParsedConfig::parse(
+            "[global]\nanimation.enabled = true\nanimation.open.effect = bubble\nanimation.close.enabled = true\nanimation.close.effect = scale",
+        ).unwrap().validate().unwrap();
+        assert_eq!(config.animation.open.effect, OpenAnimationEffect::Bubble);
+        assert_eq!(config.animation.close.effect, CloseAnimationEffect::Scale);
     }
 
     #[test]
