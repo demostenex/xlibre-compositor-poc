@@ -8254,6 +8254,19 @@ fn render_egl_scene_parts<'a>(
         let mut plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
             .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
         apply_surface_visual_policy(&mut plan, visuals, entry.visual_class);
+        if entry.semantic_client_xid.is_none() {
+            // No semantic client means this is an untracked override-redirect
+            // popup (menu/tooltip/dropdown) that classify_surface_visual_class
+            // still labels Normal (see eligibility_excludes_override_redirect_
+            // even_when_classified_normal) — the same condition shadow_eligible_
+            // for_entry already uses to withhold shadows. Such surfaces are
+            // self-decorated by their own toolkit; drawing our WM border/
+            // corner-radius quad on top of their real (often non-rectangular,
+            // still-settling) geometry is what produces the stray outline
+            // rectangle seen floating near popups after a click.
+            plan.corner_radius = 0.0;
+            plan.border_width = 0.0;
+        }
         plan.border_color = entry.resolved_border_color.map(f32::from_bits);
 
         // 3a3fa2b1-s1: resolve the animated surface plan/opacity ONCE,
