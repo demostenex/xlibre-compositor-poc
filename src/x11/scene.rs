@@ -19,7 +19,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 
 use crate::graphics::egl::{EglImportedSurface, EglSceneRenderer};
-use crate::config::CompositorConfig;
+use crate::config::{CompositorConfig, FrameRuleAction, WindowMetadataForRule, resolve_rule_actions};
 use super::capture::{WindowGeometry, WindowMetadata};
 use super::compositor::{selection_clear_matches, CompositorOwnership};
 use super::connection::X11Connection;
@@ -1299,6 +1299,15 @@ struct VisualAtoms {
     fullscreen: xproto::Atom,
     blur_behind_region: xproto::Atom,
     effect_owner: xproto::Atom,
+    frame_policy: xproto::Atom,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FramePolicy {
+    #[default]
+    Default,
+    Request,
+    Suppress,
 }
 
 /// One `x, y, width, height` group from a `_KDE_NET_WM_BLUR_BEHIND_REGION`
@@ -1362,7 +1371,7 @@ enum BackgroundCandidate {
     Preserve,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct SurfaceEntry {
     surface_xid: Window,
     semantic_client_xid: Option<Window>,
@@ -1370,6 +1379,10 @@ struct SurfaceEntry {
     /// is an effect-authority reference only; it is never semantic identity
     /// and never owns compositor resources.
     effect_owner: Option<Window>,
+    frame_policy: FramePolicy,
+    opacity_rule: Option<f32>,
+    wm_class_instance: Option<String>,
+    wm_class_class: Option<String>,
     /// The surface's own explicit blur request. This is populated only for
     /// surfaces without a usable semantic client; managed-client blur stays
     /// on the existing semantic-client cache path.
@@ -3206,7 +3219,7 @@ impl PerfForensics {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct SceneSnapshot {
     root: Window,
     root_geometry: RootGeometry,
@@ -3377,6 +3390,14 @@ fn eligible_surface_with_semantic_metadata(
         surface_xid,
         semantic_client_xid,
         effect_owner: None,
+        frame_policy: FramePolicy::Default,
+        opacity_rule: None,
+        wm_class_instance: semantic_metadata
+            .and_then(|candidate| candidate.wm_class_instance.clone())
+            .or_else(|| metadata.wm_class_instance.clone()),
+        wm_class_class: semantic_metadata
+            .and_then(|candidate| candidate.wm_class_class.clone())
+            .or_else(|| metadata.wm_class_class.clone()),
         own_blur_request: BlurRequest::None,
         lifecycle_xid: surface_xid,
         geometry: metadata.geometry,
@@ -3447,6 +3468,45 @@ fn apply_surface_visual_policy(
     plan.corner_radius = effective_corner_radius(config.corner_radius, plan.width, plan.height);
     plan.border_width = effective_border_width(config.border.width, plan.width, plan.height);
     plan.border_color = config.border.inactive_color;
+}
+
+fn rule_metadata(entry: &SurfaceEntry) -> WindowMetadataForRule<'_> {
+    WindowMetadataForRule {
+        class: entry.wm_class_class.as_deref(),
+        instance: entry.wm_class_instance.as_deref(),
+        window_type: Some(match entry.visual_class {
+            SurfaceVisualClass::Normal => crate::config::WindowType::Normal,
+            SurfaceVisualClass::Dock => crate::config::WindowType::Dock,
+            SurfaceVisualClass::Desktop => crate::config::WindowType::Desktop,
+        }),
+    }
+}
+
+fn initialize_surface_config_rules(snapshot: &mut SceneSnapshot, config: &CompositorConfig) {
+    for entry in &mut snapshot.entries {
+        let actions = resolve_rule_actions(&config.rules, rule_metadata(entry));
+        if matches!(entry.frame_policy, FramePolicy::Default) {
+            entry.frame_policy = match actions.frame {
+                Some(FrameRuleAction::Request) => FramePolicy::Request,
+                Some(FrameRuleAction::Suppress) => FramePolicy::Suppress,
+                Some(FrameRuleAction::Default) | None => FramePolicy::Default,
+            };
+        }
+        entry.opacity_rule = actions.opacity;
+    }
+}
+
+fn resolve_surface_frame_policy(plan: &mut RenderQuadPlan, entry: &SurfaceEntry) {
+    let eligible = match entry.frame_policy {
+        FramePolicy::Suppress => false,
+        FramePolicy::Request => matches!(entry.visual_class, SurfaceVisualClass::Normal),
+        FramePolicy::Default => entry.semantic_client_xid.is_some()
+            && matches!(entry.visual_class, SurfaceVisualClass::Normal),
+    };
+    if !eligible {
+        plan.corner_radius = 0.0;
+        plan.border_width = 0.0;
+    }
 }
 
 fn shadow_eligible_for_entry(
@@ -3532,6 +3592,21 @@ fn initialize_surface_effect_metadata(
                 Err(error) => return Err(error),
             };
         }
+    }
+    Ok(())
+}
+
+fn initialize_surface_frame_policy(
+    connection: &X11Connection,
+    snapshot: &mut SceneSnapshot,
+    atom: xproto::Atom,
+) -> Result<(), Box<dyn Error>> {
+    for entry in &mut snapshot.entries {
+        entry.frame_policy = match read_frame_policy(connection, entry.surface_xid, atom) {
+            Ok(policy) => policy,
+            Err(error) if super::capture::is_bad_window_error(error.as_ref()) => FramePolicy::Default,
+            Err(error) => return Err(error),
+        };
     }
     Ok(())
 }
@@ -3718,9 +3793,14 @@ fn resolved_surface_opacity(
     urgency: &HashMap<Window, CachedClientVisualState>,
 ) -> f32 {
     if entry.fullscreen
-        || entry.semantic_client_xid.is_none()
         || !matches!(entry.visual_class, SurfaceVisualClass::Normal)
     {
+        return 1.0;
+    }
+    if let Some(opacity) = entry.opacity_rule {
+        return opacity;
+    }
+    if entry.semantic_client_xid.is_none() {
         return 1.0;
     }
     match border_visual_state(entry, active_window, urgency) {
@@ -5625,8 +5705,8 @@ impl<'a> SceneSession<'a> {
             scheduler: FrameScheduler::new(),
             present,
             state: SceneState::PlaceholderReady,
-            _config: config,
             shadow_style: config.visuals.shadow,
+            _config: config,
             ignored_configure_windows: HashSet::new(),
             diagnostics: Diagnostics3a3f8b3a::from_environment(),
             window_animations: HashMap::new(),
@@ -5757,6 +5837,7 @@ impl<'a> SceneSession<'a> {
                 }
                 let Some(mut plan) = build_render_quad_plan(old_entry.geometry, bundle.pixmap.geometry, snapshot.root_geometry) else { continue; };
                 apply_surface_visual_policy(&mut plan, &self._config.visuals, old_entry.visual_class);
+                resolve_surface_frame_policy(&mut plan, old_entry);
                 plan.border_color = old_entry.resolved_border_color.map(f32::from_bits);
                 eligible_sources.push(old_entry.surface_xid);
                 frame_inputs.insert(
@@ -5865,6 +5946,12 @@ impl<'a> SceneSession<'a> {
             &mut snapshot,
             self.visual_atoms,
         )?;
+        initialize_surface_frame_policy(
+            self.connection,
+            &mut snapshot,
+            self.visual_atoms.frame_policy,
+        )?;
+        initialize_surface_config_rules(&mut snapshot, &self._config);
         let mut compound_target = None;
         if let Some(update) = self.pending_hierarchy_geometry {
             self.diagnostics.compound_hierarchy_geometry_observed += 1;
@@ -8254,19 +8341,7 @@ fn render_egl_scene_parts<'a>(
         let mut plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
             .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
         apply_surface_visual_policy(&mut plan, visuals, entry.visual_class);
-        if entry.semantic_client_xid.is_none() {
-            // No semantic client means this is an untracked override-redirect
-            // popup (menu/tooltip/dropdown) that classify_surface_visual_class
-            // still labels Normal (see eligibility_excludes_override_redirect_
-            // even_when_classified_normal) — the same condition shadow_eligible_
-            // for_entry already uses to withhold shadows. Such surfaces are
-            // self-decorated by their own toolkit; drawing our WM border/
-            // corner-radius quad on top of their real (often non-rectangular,
-            // still-settling) geometry is what produces the stray outline
-            // rectangle seen floating near popups after a click.
-            plan.corner_radius = 0.0;
-            plan.border_width = 0.0;
-        }
+        resolve_surface_frame_policy(&mut plan, entry);
         plan.border_color = entry.resolved_border_color.map(f32::from_bits);
 
         // 3a3fa2b1-s1: resolve the animated surface plan/opacity ONCE,
@@ -8777,12 +8852,50 @@ fn acquire_visual_atoms(connection: &X11Connection) -> Result<VisualAtoms, Box<d
         fullscreen: intern(b"_NET_WM_STATE_FULLSCREEN")?,
         blur_behind_region: intern(b"_KDE_NET_WM_BLUR_BEHIND_REGION")?,
         effect_owner: intern(b"_XOMPOSITE_EFFECT_OWNER")?,
+        frame_policy: intern(b"_XOMPOSITE_FRAME_POLICY")?,
     })
 }
 
 fn read_active_window(connection: &X11Connection, root: Window, atom: xproto::Atom) -> Result<Option<Window>, Box<dyn Error>> {
     let reply = connection.inner.get_property(false, root, atom, xproto::AtomEnum::WINDOW, 0, 1)?.reply()?;
     Ok(reply.value32().and_then(|mut values| values.next()).filter(|window| *window != x11rb::NONE))
+}
+
+fn parse_frame_policy_property(
+    property_type: xproto::Atom,
+    cardinal_type: xproto::Atom,
+    format: u8,
+    value_len: u32,
+    bytes_after: u32,
+    value: &[u8],
+) -> FramePolicy {
+    if property_type != cardinal_type || format != 32 || value_len != 1 || bytes_after != 0 || value.len() != 4 {
+        return FramePolicy::Default;
+    }
+    match u32::from_ne_bytes(value.try_into().expect("validated CARDINAL value length")) {
+        1 => FramePolicy::Request,
+        2 => FramePolicy::Suppress,
+        _ => FramePolicy::Default,
+    }
+}
+
+fn read_frame_policy(
+    connection: &X11Connection,
+    surface: Window,
+    atom: xproto::Atom,
+) -> Result<FramePolicy, Box<dyn Error>> {
+    let reply = connection
+        .inner
+        .get_property(false, surface, atom, xproto::AtomEnum::CARDINAL, 0, 1)?
+        .reply()?;
+    Ok(parse_frame_policy_property(
+        reply.type_,
+        xproto::AtomEnum::CARDINAL.into(),
+        reply.format,
+        reply.value_len,
+        reply.bytes_after,
+        &reply.value,
+    ))
 }
 
 fn read_client_urgency(
@@ -9649,7 +9762,9 @@ mod tests {
         entry_has_visible_contribution, prune_invisible_entries,
         resource_identity_fields_match,
         damage_identity_compatible,
-        BlurRequest, BlurRegionRect, parse_blur_behind_region, parse_effect_owner_property,
+        BlurRequest, BlurRegionRect, FramePolicy, parse_blur_behind_region, parse_effect_owner_property,
+        parse_frame_policy_property, resolve_surface_frame_policy,
+        initialize_surface_config_rules,
         is_visual_property_notify, resolved_blur_request_with_auxiliary,
         permitted_blur_request, resolved_blur_request, resolve_snapshot_fullscreen,
         ClientRootGeometry, client_root_geometry_from_translation,
@@ -10112,7 +10227,8 @@ mod tests {
             override_redirect: false,
             has_wm_state: false,
             map_state: MapState::VIEWABLE,
-            wm_class: None,
+            wm_class_instance: None,
+            wm_class_class: None,
             window_type: None,
             role: crate::x11::capture::WindowRole::Unknown,
         }
@@ -10255,7 +10371,8 @@ mod tests {
             override_redirect: false,
             has_wm_state: true,
             map_state: MapState::VIEWABLE,
-            wm_class: None,
+            wm_class_instance: None,
+            wm_class_class: None,
             window_type: None,
             role: crate::x11::capture::WindowRole::Client,
         };
@@ -11631,6 +11748,10 @@ mod tests {
             surface_xid: 0x0040_0000,
             semantic_client_xid: None,
             effect_owner: None,
+            frame_policy: FramePolicy::Default,
+            opacity_rule: None,
+            wm_class_instance: None,
+            wm_class_class: None,
             own_blur_request: BlurRequest::None,
             lifecycle_xid: 0x0040_0000,
             geometry,
@@ -11665,6 +11786,10 @@ mod tests {
             surface_xid,
             semantic_client_xid: None,
             effect_owner: None,
+            frame_policy: FramePolicy::Default,
+            opacity_rule: None,
+            wm_class_instance: None,
+            wm_class_class: None,
             own_blur_request: BlurRequest::None,
             lifecycle_xid: surface_xid,
             geometry: geo(0, 0, 100, 100),
@@ -16322,6 +16447,139 @@ mod tests {
     }
 
     #[test]
+    fn frame_policy_parser_accepts_only_one_cardinal32_value() {
+        let cardinal = 9;
+        let value = |value: u32| value.to_ne_bytes().to_vec();
+        assert_eq!(parse_frame_policy_property(x11rb::NONE, cardinal, 0, 0, 0, &[]), FramePolicy::Default);
+        assert_eq!(parse_frame_policy_property(cardinal, cardinal, 32, 1, 0, &value(0)), FramePolicy::Default);
+        assert_eq!(parse_frame_policy_property(cardinal, cardinal, 32, 1, 0, &value(1)), FramePolicy::Request);
+        assert_eq!(parse_frame_policy_property(cardinal, cardinal, 32, 1, 0, &value(2)), FramePolicy::Suppress);
+        assert_eq!(parse_frame_policy_property(cardinal, cardinal, 32, 1, 0, &value(3)), FramePolicy::Default);
+        assert_eq!(parse_frame_policy_property(8, cardinal, 32, 1, 0, &value(1)), FramePolicy::Default);
+        assert_eq!(parse_frame_policy_property(cardinal, cardinal, 16, 1, 0, &value(1)), FramePolicy::Default);
+        assert_eq!(parse_frame_policy_property(cardinal, cardinal, 32, 0, 0, &value(1)), FramePolicy::Default);
+        assert_eq!(parse_frame_policy_property(cardinal, cardinal, 32, 2, 0, &value(1)), FramePolicy::Default);
+        assert_eq!(parse_frame_policy_property(cardinal, cardinal, 32, 1, 4, &value(1)), FramePolicy::Default);
+        assert_eq!(parse_frame_policy_property(cardinal, cardinal, 32, 1, 0, &[1, 0, 0]), FramePolicy::Default);
+    }
+
+    #[test]
+    fn frame_policy_resolver_preserves_default_and_allows_only_normal_requests() {
+        let config = crate::config::CompositorConfig::with_corner_radius(12.0)
+            .unwrap()
+            .with_border_colors(2.0, [1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0])
+            .unwrap();
+        let mut popup = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        let mut plan = build_render_quad_plan(popup.geometry, pixmap(20, 20), root()).unwrap();
+        apply_surface_visual_policy(&mut plan, &config.visuals, popup.visual_class);
+        resolve_surface_frame_policy(&mut plan, &popup);
+        assert_eq!((plan.border_width, plan.corner_radius), (0.0, 0.0));
+
+        popup.frame_policy = FramePolicy::Request;
+        let visual_class = popup.visual_class;
+        let mut requested = build_render_quad_plan(popup.geometry, pixmap(20, 20), root()).unwrap();
+        apply_surface_visual_policy(&mut requested, &config.visuals, popup.visual_class);
+        resolve_surface_frame_policy(&mut requested, &popup);
+        assert_eq!((requested.border_width, requested.corner_radius), (2.0, 10.0));
+        assert_eq!(popup.visual_class, visual_class);
+        assert!(!shadow_eligible_for_entry(config.visuals.shadow, &popup));
+        assert_eq!(resolved_surface_opacity(&config.visuals, &popup, None, &HashMap::new()), 1.0);
+        assert_eq!(popup.resolved_blur_request, BlurRequest::None);
+
+        popup.frame_policy = FramePolicy::Suppress;
+        let mut suppressed = build_render_quad_plan(popup.geometry, pixmap(20, 20), root()).unwrap();
+        apply_surface_visual_policy(&mut suppressed, &config.visuals, popup.visual_class);
+        resolve_surface_frame_policy(&mut suppressed, &popup);
+        assert_eq!((suppressed.border_width, suppressed.corner_radius), (0.0, 0.0));
+
+        popup.frame_policy = FramePolicy::Request;
+        popup.visual_class = SurfaceVisualClass::Dock;
+        let mut dock = build_render_quad_plan(popup.geometry, pixmap(20, 20), root()).unwrap();
+        apply_surface_visual_policy(&mut dock, &config.visuals, popup.visual_class);
+        resolve_surface_frame_policy(&mut dock, &popup);
+        assert_eq!((dock.border_width, dock.corner_radius), (0.0, 0.0));
+    }
+
+    #[test]
+    fn compositor_rules_style_unbound_conky_without_changing_client_identity() {
+        let parsed = crate::config::ParsedConfig::parse(
+            "[rule \"conky\"]\nclass = \"conky\"\ninstance = \"conky\"\nframe = request\nopacity = 0.72\nblur = true\nshadow = true",
+        ).unwrap().validate().unwrap();
+        let mut config = crate::config::CompositorConfig::defaults();
+        config.visuals.corner_radius = 12.0;
+        config.visuals.border.width = 2.0;
+        config.rules = parsed.rules.into();
+        let mut entry = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        entry.wm_class_instance = Some("conky".to_owned());
+        entry.wm_class_class = Some("conky".to_owned());
+        let mut snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
+        initialize_surface_config_rules(&mut snapshot, &config);
+        let entry = snapshot.entries.pop().unwrap();
+        assert_eq!(entry.frame_policy, FramePolicy::Request);
+        assert_eq!(entry.opacity_rule, Some(0.72));
+        assert_eq!(entry.resolved_blur_request, BlurRequest::None);
+        assert!(!entry.shadow_eligible);
+        let mut plan = build_render_quad_plan(entry.geometry, pixmap(20, 20), root()).unwrap();
+        apply_surface_visual_policy(&mut plan, &config.visuals, entry.visual_class);
+        resolve_surface_frame_policy(&mut plan, &entry);
+        assert_eq!(entry.semantic_client_xid, None);
+        assert_eq!(resolved_surface_opacity(&config.visuals, &entry, None, &HashMap::new()), 0.72);
+        assert_eq!((plan.border_width, plan.corner_radius), (2.0, 10.0));
+    }
+
+    #[test]
+    fn explicit_client_frame_policy_precedes_matching_rule() {
+        let parsed = crate::config::ParsedConfig::parse(
+            "[rule \"conky\"]\nclass = \"conky\"\nframe = suppress",
+        ).unwrap().validate().unwrap();
+        let mut config = crate::config::CompositorConfig::defaults();
+        config.rules = parsed.rules.into();
+        let mut entry = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        entry.wm_class_instance = Some("conky".to_owned());
+        entry.wm_class_class = Some("conky".to_owned());
+        entry.frame_policy = FramePolicy::Request;
+        let mut snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
+        initialize_surface_config_rules(&mut snapshot, &config);
+        assert_eq!(snapshot.entries[0].frame_policy, FramePolicy::Request);
+
+        let parsed = crate::config::ParsedConfig::parse(
+            "[rule \"conky\"]\nclass = \"conky\"\nframe = request",
+        ).unwrap().validate().unwrap();
+        let mut config = crate::config::CompositorConfig::defaults();
+        config.rules = parsed.rules.into();
+        let mut entry = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        entry.wm_class_instance = Some("conky".to_owned());
+        entry.wm_class_class = Some("conky".to_owned());
+        entry.frame_policy = FramePolicy::Suppress;
+        let mut snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
+        initialize_surface_config_rules(&mut snapshot, &config);
+        assert_eq!(snapshot.entries[0].frame_policy, FramePolicy::Suppress);
+    }
+
+    #[test]
+    fn opacity_rules_preserve_normal_fullscreen_and_non_normal_safety() {
+        let config = crate::config::CompositorConfig::defaults().with_opacity(0.72, 0.81, 0.63).unwrap();
+        let mut entry = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
+        entry.opacity_rule = Some(0.72);
+        assert_eq!(resolved_surface_opacity(&config.visuals, &entry, None, &HashMap::new()), 0.72);
+        entry.fullscreen = true;
+        assert_eq!(resolved_surface_opacity(&config.visuals, &entry, None, &HashMap::new()), 1.0);
+        entry.fullscreen = false;
+        entry.visual_class = SurfaceVisualClass::Dock;
+        assert_eq!(resolved_surface_opacity(&config.visuals, &entry, None, &HashMap::new()), 1.0);
+
+        entry.visual_class = SurfaceVisualClass::Normal;
+        entry.opacity_rule = None;
+        entry.frame_policy = FramePolicy::Request;
+        assert_eq!(resolved_surface_opacity(&config.visuals, &entry, None, &HashMap::new()), 1.0);
+        entry.opacity_rule = Some(0.72);
+        let mut plan = build_render_quad_plan(entry.geometry, pixmap(20, 20), root()).unwrap();
+        apply_surface_visual_policy(&mut plan, &config.visuals, entry.visual_class);
+        resolve_surface_frame_policy(&mut plan, &entry);
+        assert_eq!((plan.border_width, plan.corner_radius), (0.0, 0.0));
+    }
+
+    #[test]
     fn shadow_policy_uses_active_visual_quad_and_excludes_non_normal_surfaces() {
         let mut config = crate::config::CompositorConfig::defaults();
         config.visuals.corner_radius = 18.0;
@@ -16406,7 +16664,7 @@ mod tests {
         let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
         let mut first = crate::config::CompositorConfig::defaults();
         first.visuals.shadow = crate::config::ShadowConfig { enabled: true, extent: 8.0, strength: 0.25, ..crate::config::ShadowConfig::default() };
-        let mut second = first;
+        let mut second = first.clone();
         second.visuals.border.width = 9.0;
         let visual_quad = pixmap(20, 15);
         let mut first_plan = build_render_quad_plan(entry.geometry, visual_quad, root()).unwrap();
@@ -16500,6 +16758,7 @@ mod tests {
             fullscreen: 43,
             blur_behind_region: 44,
             effect_owner: 45,
+            frame_policy: 46,
         };
         let state = read_net_wm_state(Some([7, 43, 42].into_iter()), atoms);
         assert!(state.demands_attention);
@@ -16653,7 +16912,7 @@ mod tests {
     fn auxiliary_property_notify_is_scoped_to_tracked_surface() {
         let atoms = VisualAtoms {
             active_window: 1, wm_hints: 2, net_wm_state: 3,
-            demands_attention: 42, fullscreen: 43, blur_behind_region: 44, effect_owner: 45,
+            demands_attention: 42, fullscreen: 43, blur_behind_region: 44, effect_owner: 45, frame_policy: 46,
         };
         let mut popup = eligible_surface(&metadata(), None, root(), 10, 0).unwrap();
         popup.override_redirect = true;
@@ -16684,7 +16943,7 @@ mod tests {
     fn blur_behind_region_property_notify_is_visual_state_scoped() {
         let atoms = VisualAtoms {
             active_window: 1, wm_hints: 2, net_wm_state: 3,
-            demands_attention: 42, fullscreen: 43, blur_behind_region: 44, effect_owner: 45,
+            demands_attention: 42, fullscreen: 43, blur_behind_region: 44, effect_owner: 45, frame_policy: 46,
         };
         let entry = eligible_surface(&metadata(), Some(20), root(), 10, 0).unwrap();
         let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };

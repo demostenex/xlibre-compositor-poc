@@ -434,7 +434,8 @@ mod tests {
                     override_redirect: false,
                     has_wm_state: false,
                     map_state,
-                    wm_class: None,
+                    wm_class_instance: None,
+                    wm_class_class: None,
                     window_type: None,
                     role: WindowRole::Unknown,
                 }

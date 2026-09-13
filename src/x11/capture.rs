@@ -61,7 +61,8 @@ pub struct WindowMetadata {
     pub override_redirect: bool,
     pub has_wm_state: bool,
     pub map_state: MapState,
-    pub wm_class: Option<String>,
+    pub wm_class_instance: Option<String>,
+    pub wm_class_class: Option<String>,
     pub window_type: Option<String>,
     pub role: WindowRole,
 }
@@ -445,6 +446,7 @@ impl X11Connection {
             override_redirect: Some(attributes.override_redirect),
             has_wm_state,
         });
+        let (wm_class_instance, wm_class_class) = self.read_wm_class(window)?;
         Ok(WindowMetadata {
             window,
             geometry: WindowGeometry {
@@ -460,13 +462,14 @@ impl X11Connection {
             override_redirect: attributes.override_redirect,
             has_wm_state,
             map_state: attributes.map_state,
-            wm_class: self.read_wm_class(window)?,
+            wm_class_instance,
+            wm_class_class,
             window_type: self.read_window_type(window)?,
             role,
         })
     }
 
-    fn read_wm_class(&self, window: Window) -> Result<Option<String>, Box<dyn Error>> {
+    fn read_wm_class(&self, window: Window) -> Result<(Option<String>, Option<String>), Box<dyn Error>> {
         let atom = self.inner.intern_atom(false, b"WM_CLASS")?.reply()?.atom;
         let property = self
             .inner
@@ -544,17 +547,13 @@ fn is_name_window_pixmap_observation_error(error: &ReplyError) -> bool {
     )
 }
 
-fn parse_wm_class(property: &GetPropertyReply) -> Option<String> {
-    if property.value.is_empty() {
-        return None;
-    }
-    let values = property
-        .value
-        .split(|byte| *byte == 0)
-        .filter(|value| !value.is_empty())
-        .map(|value| String::from_utf8_lossy(value).into_owned())
-        .collect::<Vec<_>>();
-    (!values.is_empty()).then(|| values.join("/"))
+fn parse_wm_class(property: &GetPropertyReply) -> (Option<String>, Option<String>) {
+    let mut values = property.value.split(|byte| *byte == 0);
+    let instance = values.next().filter(|value| !value.is_empty())
+        .map(|value| String::from_utf8_lossy(value).into_owned());
+    let class = values.next().filter(|value| !value.is_empty())
+        .map(|value| String::from_utf8_lossy(value).into_owned());
+    (instance, class)
 }
 
 pub(crate) fn print_metadata(label: &str, metadata: &WindowMetadata) {
@@ -584,8 +583,9 @@ pub(crate) fn print_metadata(label: &str, metadata: &WindowMetadata) {
         }
     );
     println!(
-        "WM_CLASS: {}",
-        metadata.wm_class.as_deref().unwrap_or("<absent>")
+        "WM_CLASS: instance={} class={}",
+        metadata.wm_class_instance.as_deref().unwrap_or("<absent>"),
+        metadata.wm_class_class.as_deref().unwrap_or("<absent>")
     );
     println!(
         "_NET_WM_WINDOW_TYPE: {}",

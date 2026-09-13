@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CompositorConfig {
     pub(crate) visuals: VisualConfig,
     pub(crate) blur_enabled: bool,
     pub(crate) animation: AnimationConfig,
+    pub(crate) rules: Arc<[WindowRule]>,
 }
 
 /// 3a3fa2b1/b2-r2/b3/b4-r1/b6-r1/b7 — user-selectable open-animation
@@ -242,6 +243,15 @@ pub(crate) struct ParsedRule {
     pub(crate) window_type: Option<String>,
     pub(crate) blur: Option<bool>,
     pub(crate) shadow: Option<bool>,
+    pub(crate) frame: Option<FrameRuleAction>,
+    pub(crate) opacity: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrameRuleAction {
+    Default,
+    Request,
+    Suppress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,13 +268,15 @@ pub(crate) struct RuleMatch {
     pub(crate) window_type: Option<WindowType>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RuleActions {
     pub(crate) blur: Option<bool>,
     pub(crate) shadow: Option<bool>,
+    pub(crate) frame: Option<FrameRuleAction>,
+    pub(crate) opacity: Option<f32>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowRule {
     pub(crate) name: String,
     pub(crate) matcher: RuleMatch,
@@ -518,6 +530,13 @@ fn parse_rule(rule: &mut ParsedRule, key: &str, value: &str, line: usize) -> Res
         "window_type" => rule.window_type = Some(string_value(value, line, section)?),
         "blur" => rule.blur = Some(bool_value(value, line, section)?),
         "shadow" => rule.shadow = Some(bool_value(value, line, section)?),
+        "frame" => rule.frame = Some(match value {
+            "default" => FrameRuleAction::Default,
+            "request" => FrameRuleAction::Request,
+            "suppress" => FrameRuleAction::Suppress,
+            _ => return Err(error(line, section, "expected default, request, or suppress")),
+        }),
+        "opacity" => rule.opacity = Some(number(value, line, section)?),
         _ => return Err(error(line, Some(format!("rule {}", rule.name)), "unknown key")),
     }
     Ok(())
@@ -556,13 +575,18 @@ fn validate_rule(rule: ParsedRule) -> Result<WindowRule, ParseError> {
         "desktop" => Ok(WindowType::Desktop),
         _ => Err(error(0, Some(format!("rule {}", rule.name)), "unknown window_type")),
     }).transpose()?;
-    if rule.blur.is_none() && rule.shadow.is_none() {
+    if rule.blur.is_none() && rule.shadow.is_none() && rule.frame.is_none() && rule.opacity.is_none() {
         return Err(error(0, Some(format!("rule {}", rule.name)), "rule must specify an action"));
+    }
+    if let Some(opacity) = rule.opacity
+        && (!opacity.is_finite() || !(0.0..=1.0).contains(&opacity))
+    {
+        return Err(error(0, Some(format!("rule {}", rule.name)), "opacity must be within 0..=1"));
     }
     Ok(WindowRule {
         name: rule.name,
         matcher: RuleMatch { class: rule.class, instance: rule.instance, window_type },
-        actions: RuleActions { blur: rule.blur, shadow: rule.shadow },
+        actions: RuleActions { blur: rule.blur, shadow: rule.shadow, frame: rule.frame, opacity: rule.opacity },
     })
 }
 
@@ -589,10 +613,12 @@ pub(crate) fn resolve_rule_actions(
     rules: &[WindowRule],
     metadata: WindowMetadataForRule<'_>,
 ) -> RuleActions {
-    let mut result = RuleActions { blur: None, shadow: None };
+    let mut result = RuleActions { blur: None, shadow: None, frame: None, opacity: None };
     for rule in rules.iter().filter(|rule| rule.matches(metadata)) {
         if rule.actions.blur.is_some() { result.blur = rule.actions.blur; }
         if rule.actions.shadow.is_some() { result.shadow = rule.actions.shadow; }
+        if rule.actions.frame.is_some() { result.frame = rule.actions.frame; }
+        if rule.actions.opacity.is_some() { result.opacity = rule.actions.opacity; }
     }
     result
 }
@@ -636,6 +662,7 @@ impl Default for CompositorConfig {
             visuals: VisualConfig::default(),
             blur_enabled: true,
             animation: AnimationConfig::default(),
+            rules: Arc::from([]),
         }
     }
 }
@@ -787,7 +814,7 @@ impl CompositorConfig {
 #[cfg(test)]
 mod tests {
     use super::{CompositorConfig, ConfigLoadError, ConfigLoadOutcome, ConfigPathEnvironment,
-        OpacityConfig, ParsedConfig, RuleActions, StartupConfigRequest, ValidatedConfig,
+        FrameRuleAction, OpacityConfig, ParsedConfig, RuleActions, StartupConfigRequest, ValidatedConfig,
         WindowMetadataForRule, WindowType, load_startup_config, resolve_blur,
         resolve_config_path, resolve_rule_actions,
         AnimationConfig, OpenAnimationConfig, OpenAnimationEffect,
@@ -1277,7 +1304,31 @@ mod tests {
     fn rules_use_last_matching_fieldwise_precedence() {
         let config = ParsedConfig::parse("[rule \"broad\"]\nclass = \"App\"\nblur = true\nshadow = false\n\n[rule \"exception\"]\ninstance = \"special\"\nblur = false").unwrap().validate().unwrap();
         let metadata = WindowMetadataForRule { class: Some("App"), instance: Some("special"), window_type: Some(WindowType::Normal) };
-        assert_eq!(resolve_rule_actions(&config.rules, metadata), RuleActions { blur: Some(false), shadow: Some(false) });
+        assert_eq!(resolve_rule_actions(&config.rules, metadata), RuleActions { blur: Some(false), shadow: Some(false), frame: None, opacity: None });
+    }
+
+    #[test]
+    fn rules_parse_frame_and_opacity_actions() {
+        let config = ParsedConfig::parse(
+            "[rule \"conky\"]\nclass = \"conky\"\ninstance = \"conky\"\nframe = request\nopacity = 0.72",
+        ).unwrap().validate().unwrap();
+        assert_eq!(config.rules[0].actions.frame, Some(FrameRuleAction::Request));
+        assert_eq!(config.rules[0].actions.opacity, Some(0.72));
+        for value in ["default", "request", "suppress"] {
+            let input = format!("[rule \"x\"]\nclass = \"x\"\nframe = {value}");
+            assert!(ParsedConfig::parse(&input).unwrap().validate().is_ok());
+        }
+        for value in ["0.0", "1.0"] {
+            let input = format!("[rule \"x\"]\nclass = \"x\"\nopacity = {value}");
+            assert!(ParsedConfig::parse(&input).unwrap().validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn rules_reject_invalid_frame_and_opacity_actions() {
+        assert!(ParsedConfig::parse("[rule \"x\"]\nclass = \"x\"\nframe = invalid").is_err());
+        assert!(ParsedConfig::parse("[rule \"x\"]\nclass = \"x\"\nopacity = 1.1").unwrap().validate().is_err());
+        assert!(ParsedConfig::parse("[rule \"x\"]\nclass = \"x\"\nopacity = -0.1").unwrap().validate().is_err());
     }
 
     #[test]
