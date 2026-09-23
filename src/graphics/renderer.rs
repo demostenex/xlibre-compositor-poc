@@ -699,6 +699,44 @@ struct ScratchFramebuffer {
     fbo: u32,
 }
 
+/// Temporary target used to render a scene into an already allocated texture.
+/// The framebuffer is deliberately short-lived; the texture remains owned by
+/// the caller and is suitable for later composition.
+pub(crate) struct TextureRenderTarget {
+    state: BlurGlState,
+    scratch: ScratchFramebuffer,
+}
+
+impl TextureRenderTarget {
+    pub(crate) fn new(texture: u32, width: i32, height: i32) -> Result<Self, Box<dyn Error>> {
+        if width <= 0 || height <= 0 {
+            return Err("offscreen render target dimensions must be positive".into());
+        }
+        let state = BlurGlState::save();
+        let scratch = match ScratchFramebuffer::new(texture) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                drop(state);
+                return Err(error);
+            }
+        };
+        unsafe {
+            gl::Disable(gl::SCISSOR_TEST);
+            gl::Viewport(0, 0, width, height);
+        }
+        Ok(Self { state, scratch })
+    }
+}
+
+impl Drop for TextureRenderTarget {
+    fn drop(&mut self) {
+        let _ = (&self.state, &self.scratch);
+        // Rust drops struct fields in declaration order. Therefore
+        // BlurGlState restores the caller's framebuffer/state first; the
+        // now-unbound temporary FBO is then deleted by ScratchFramebuffer.
+    }
+}
+
 impl ScratchFramebuffer {
     fn new(texture: u32) -> Result<Self, Box<dyn Error>> {
         let mut fbo = 0;
@@ -1110,6 +1148,13 @@ impl SceneRenderer {
         unsafe {
             gl::ClearColor(0.0, 0.0, 0.0, 1.0);
             gl::Clear(gl::COLOR_BUFFER_BIT);
+        }
+    }
+
+pub(crate) fn clear_transparent(&self) {
+        let color = [0.0_f32, 0.0, 0.0, 0.0];
+        unsafe {
+            gl::ClearBufferfv(gl::COLOR, 0, color.as_ptr());
         }
     }
 
@@ -1807,6 +1852,32 @@ impl Drop for SceneRenderer {
 
 pub fn delete_texture(texture: u32) {
     unsafe { gl::DeleteTextures(1, &texture); }
+}
+
+pub(crate) fn allocate_rgba8_texture(width: i32, height: i32) -> Result<u32, Box<dyn Error>> {
+    if width <= 0 || height <= 0 {
+        return Err("offscreen texture dimensions must be positive".into());
+    }
+    let mut texture = 0;
+    unsafe {
+        gl::GenTextures(1, &mut texture);
+        if texture != 0 {
+            gl::BindTexture(gl::TEXTURE_2D, texture);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+            gl::TexImage2D(
+                gl::TEXTURE_2D, 0, gl::RGBA8 as i32, width, height, 0,
+                gl::RGBA, gl::UNSIGNED_BYTE, std::ptr::null(),
+            );
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+        }
+    }
+    if texture == 0 {
+        return Err("glGenTextures returned a zero offscreen texture name".into());
+    }
+    Ok(texture)
 }
 
 impl Drop for CaptureRenderer {

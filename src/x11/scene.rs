@@ -1291,6 +1291,11 @@ struct BackgroundAtoms {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkspaceAtoms {
+    current_desktop: xproto::Atom,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VisualAtoms {
     active_window: xproto::Atom,
     wm_hints: xproto::Atom,
@@ -2805,6 +2810,16 @@ fn eligible_for_open_animation(entry: &SurfaceEntry) -> bool {
     // window whose canonical capture surface happens to be override_redirect
     // (e.g. an i3-internal wrapper) must not be rejected on that basis.
     matches!(entry.visual_class, SurfaceVisualClass::Normal) && !entry.effective_override_redirect
+}
+
+fn workspace_snapshot_eligible(entry: &SurfaceEntry) -> bool {
+    matches!(entry.visual_class, SurfaceVisualClass::Normal)
+        && !entry.override_redirect
+        && !entry.effective_override_redirect
+        && entry.backend == BackendCompatibility::Renderable
+        && entry.map_state == xproto::MapState::VIEWABLE
+        && entry.geometry.width > 0
+        && entry.geometry.height > 0
 }
 
 /// Candidate-local, pure, and temporary: never touches persistent
@@ -4421,6 +4436,48 @@ struct SurfaceResourceBundle<'a> {
     egl: Option<Rc<std::cell::RefCell<EglImportedSurface>>>,
 }
 
+#[allow(dead_code)]
+struct WorkspaceSnapshot {
+    texture: u32,
+    width: u16,
+    height: u16,
+    released: bool,
+}
+
+impl WorkspaceSnapshot {
+    fn new(texture: u32, width: u16, height: u16) -> Self {
+        Self { texture, width, height, released: false }
+    }
+
+    fn destroy(&mut self) {
+        if !self.released {
+            self.released = true;
+            crate::graphics::renderer::delete_texture(self.texture);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.released = true;
+    }
+
+    fn dimensions(&self) -> (u16, u16) {
+        (self.width, self.height)
+    }
+}
+
+impl Drop for WorkspaceSnapshot {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+#[allow(dead_code)]
+struct WorkspaceTransitionState {
+    from_desktop: u32,
+    to_desktop: u32,
+    snapshot: WorkspaceSnapshot,
+}
+
 /// 3a3fa2b5 — single-owner RAII for one compositor-owned GPU texture (see
 /// `EglSceneRenderer::capture_closing_snapshot`). Deliberately NOT
 /// `Rc<RefCell<_>>` like `EglImportedSurface`: a `ClosingVisual` has
@@ -4485,6 +4542,7 @@ struct ClosingVisual {
     animation: ClosingAnimation,
     #[allow(dead_code)]
     source_xid: Window,
+    workspace_content: bool,
 }
 
 /// 3a3fa2b5-r2 — candidate-local, PURE value-type frame-0 data for a
@@ -4511,6 +4569,7 @@ struct ProvisionalClosingFrame {
     base_opacity: f32,
     shadow_eligible: bool,
     animation: ClosingAnimation,
+    workspace_content: bool,
 }
 
 /// 3a3fa2b5 — unifies "committed" and "provisional" closing sources so
@@ -5376,7 +5435,10 @@ struct SceneSession<'a> {
     egl_surfaces: HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
     background: Option<ImportedBackground>,
     background_atoms: BackgroundAtoms,
+    workspace_atoms: WorkspaceAtoms,
     visual_atoms: VisualAtoms,
+    last_current_desktop: Option<u32>,
+    workspace_transition: Option<WorkspaceTransitionState>,
     active_window: Option<Window>,
     active_window_initialized: bool,
     urgency: HashMap<Window, CachedClientVisualState>,
@@ -5630,6 +5692,7 @@ impl<'a> SceneSession<'a> {
         ensure_damage_version(connection)?;
         let visual_formats = VisualFormatCache::acquire(connection)?;
         let background_atoms = acquire_background_atoms(connection)?;
+        let workspace_atoms = acquire_workspace_atoms(connection)?;
         let visual_atoms = acquire_visual_atoms(connection)?;
         let signal = SignalWake::install()?;
         let ownership = CompositorOwnership::claim(connection)?;
@@ -5692,7 +5755,10 @@ impl<'a> SceneSession<'a> {
             egl_surfaces: HashMap::new(),
             background: None,
             background_atoms,
+            workspace_atoms,
             visual_atoms,
+            last_current_desktop: read_current_desktop(connection, root, workspace_atoms.current_desktop),
+            workspace_transition: None,
             active_window: None,
             active_window_initialized: false,
             urgency: HashMap::new(),
@@ -5765,6 +5831,102 @@ impl<'a> SceneSession<'a> {
             self.urgency.insert(client, cached);
         }
         Ok(())
+    }
+
+    fn capture_workspace_snapshot(&mut self) -> Result<WorkspaceSnapshot, Box<dyn Error>> {
+        let mut snapshot = self.current_snapshot().clone();
+        let root_geometry = snapshot.root_geometry;
+        snapshot.entries.retain(|entry| {
+            workspace_snapshot_eligible(entry)
+                && entry_has_visible_contribution(entry, self.shadow_style, root_geometry)
+        });
+        let live_order: HashSet<Window> = snapshot.entries.iter().map(|entry| entry.surface_xid).collect();
+        let render_order = self
+            .render_order
+            .iter()
+            .filter_map(|layer| match layer {
+                RenderLayer::Live(xid) if live_order.contains(xid) => Some(RenderLayer::Live(*xid)),
+                RenderLayer::Closing(id) if self.closing_visuals.get(id).is_some_and(|visual| visual.workspace_content) => Some(RenderLayer::Closing(*id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let animations = self
+            .window_animations
+            .iter()
+            .filter(|(xid, _)| live_order.contains(xid))
+            .map(|(xid, animation)| (*xid, animation.clone()))
+            .collect::<HashMap<_, _>>();
+        let provisional = HashMap::new();
+        let (width, height) = (snapshot.root_geometry.width, snapshot.root_geometry.height);
+        let texture = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?
+            .allocate_workspace_snapshot(width, height)?;
+        let resource = WorkspaceSnapshot::new(texture, width, height);
+        let result = {
+            let egl = self.egl.as_mut().ok_or("EGL scene renderer is unavailable")?;
+            let target = egl.bind_texture_render_target(texture, width, height)?;
+            let result = render_egl_scene_parts(
+                egl,
+                None,
+                true,
+                self.shadow_style,
+                &self._config.visuals,
+                &snapshot,
+                &self.egl_surfaces,
+                &self.pixmaps,
+                &animations,
+                &render_order,
+                &self.closing_visuals,
+                &provisional,
+                &self.egl_surfaces,
+            );
+            drop(target);
+            result
+        };
+        if let Err(error) = result {
+            return Err(error);
+        }
+        debug_assert_eq!(resource.dimensions(), (width, height));
+        Ok(resource)
+    }
+
+    fn observe_current_desktop(&mut self, event: &Event) {
+        let Event::PropertyNotify(property) = event else { return; };
+        if property.window != self.root || property.atom != self.workspace_atoms.current_desktop {
+            return;
+        }
+        let Some(current) = read_current_desktop(self.connection, self.root, self.workspace_atoms.current_desktop) else {
+            return;
+        };
+        match observe_workspace_desktop(self.last_current_desktop, current) {
+            WorkspaceDesktopObservation::Initialize(current) => self.last_current_desktop = Some(current),
+            WorkspaceDesktopObservation::Unchanged => {}
+            WorkspaceDesktopObservation::Changed { from, to } => {
+                let capture = self.capture_workspace_snapshot();
+                let (last, transition_active) = workspace_state_after_capture(
+                    self.last_current_desktop,
+                    to,
+                    capture.is_ok(),
+                    self.workspace_transition.is_some(),
+                );
+                self.last_current_desktop = last;
+                match capture {
+                    Ok(snapshot) if transition_active => {
+                        self.workspace_transition = Some(WorkspaceTransitionState {
+                            from_desktop: from,
+                            to_desktop: to,
+                            snapshot,
+                        });
+                    }
+                    Ok(_) => {
+                        self.workspace_transition = None;
+                    }
+                    Err(error) => {
+                        eprintln!("WORKSPACE_SNAPSHOT_FAILED from={from} to={to}: {error}");
+                        self.workspace_transition = None;
+                    }
+                }
+            }
+        }
     }
 
     /// 3a3fa2b5 — the ONLY place `destroy_intents` is ever written.
@@ -5874,6 +6036,11 @@ impl<'a> SceneSession<'a> {
                     base_opacity,
                     shadow_eligible,
                     animation: ClosingAnimation::new(Instant::now(), animation.close.effect, animation.close.duration),
+                    workspace_content: self
+                        .snapshot
+                        .as_ref()
+                        .and_then(|live| live.entries.iter().find(|entry| entry.surface_xid == source_xid))
+                        .is_some_and(workspace_snapshot_eligible),
                 },
             );
         }
@@ -6192,6 +6359,7 @@ impl<'a> SceneSession<'a> {
             let _ = self.present_opportunity(&event);
             let geometry_update = configure_geometry_update(&event, candidate);
             if geometry_update.is_none() && matches!(event, Event::ConfigureNotify(_)) { self.diagnostics.record_geometry_rejected(geometry_source); }
+            self.observe_current_desktop(&event);
             let visual_invalidation = self.maybe_update_visual_state(&event)?;
             let invalidation = if is_background_property_notify(&event, self.root, self.background_atoms) {
                 SceneInvalidation::Background
@@ -6650,6 +6818,7 @@ impl<'a> SceneSession<'a> {
                         shadow_eligible: frame.shadow_eligible,
                         animation: frame.animation,
                         source_xid: frame.source_xid,
+                        workspace_content: frame.workspace_content,
                     });
                 }
                 Err(error) => {
@@ -6881,6 +7050,7 @@ impl<'a> SceneSession<'a> {
                 batch_event_count += 1;
                 let geometry_update = configure_geometry_update(&first, self.current_snapshot());
                 let classify_start = Instant::now();
+                self.observe_current_desktop(&first);
                 let visual_invalidation = self.maybe_update_visual_state(&first)?;
                 let invalidation = visual_invalidation.unwrap_or_else(|| {
                 self.classify_session_event(first.clone(), self.current_snapshot(), &self.damage_registry, &self.damage_registry)
@@ -6912,6 +7082,7 @@ impl<'a> SceneSession<'a> {
                     batch_event_count += 1;
                     let geometry_update = configure_geometry_update(&event, self.current_snapshot());
                     let classify_start = Instant::now();
+                    self.observe_current_desktop(&event);
                     let visual_invalidation = self.maybe_update_visual_state(&event)?;
                     let invalidation = visual_invalidation.unwrap_or_else(|| {
                     self.classify_session_event(event.clone(), self.current_snapshot(), &self.damage_registry, &self.damage_registry)
@@ -7436,6 +7607,7 @@ impl<'a> SceneSession<'a> {
             let geometry_source = geometry_event_source(&event, snapshot);
             self.diagnostics.record_geometry_source(geometry_source);
             let classify_start = Instant::now();
+            self.observe_current_desktop(&event);
             let visual_invalidation = self.maybe_update_visual_state(&event)?;
             let invalidation = visual_invalidation.unwrap_or_else(|| {
                 self.classify_session_event(event.clone(), self.current_snapshot(), &self.damage_registry, &self.damage_registry)
@@ -7502,7 +7674,7 @@ impl<'a> SceneSession<'a> {
         let egl = self.egl.as_mut().ok_or("EGL scene renderer is unavailable")?;
         let render_start = Instant::now();
         let result = render_egl_scene_parts(
-            egl, background, shadow_style, visuals, snapshot, surfaces, pixmaps, animations,
+            egl, background, false, shadow_style, visuals, snapshot, surfaces, pixmaps, animations,
             render_order, closing_committed, &empty_closing_provisional,
             // 3a3fa2b5-r2: no in-flight candidate here (ordinary committed
             // redraw) — `surfaces` already IS `&self.egl_surfaces`, and
@@ -7817,6 +7989,7 @@ impl<'a> SceneSession<'a> {
         let result = render_egl_scene_parts(
             self.egl.as_mut().ok_or("EGL scene renderer is unavailable")?,
             self.background.as_ref(),
+            false,
             self.shadow_style,
             &self._config.visuals,
             snapshot,
@@ -7898,6 +8071,7 @@ impl<'a> SceneSession<'a> {
             self.note_destroy_intent(&event);
             let snapshot = self.snapshot.as_ref().expect("published scene snapshot must exist while live");
             self.diagnostics.record_configure(&event, snapshot);
+            self.observe_current_desktop(&event);
             let visual_invalidation = self.maybe_update_visual_state(&event)?;
             let invalidation = visual_invalidation.unwrap_or_else(|| {
                 self.classify_session_event(
@@ -8030,6 +8204,9 @@ impl<'a> SceneSession<'a> {
         };
         if egl_current {
             let egl = self.egl.as_ref().expect("EGL renderer exists when current");
+            if let Some(transition) = self.workspace_transition.as_mut() {
+                transition.snapshot.destroy();
+            }
             if let Some(background) = self.background.as_mut() {
                 if let Err(error) = egl.destroy_import(&mut background.surface) {
                     first_error.get_or_insert(error);
@@ -8048,6 +8225,9 @@ impl<'a> SceneSession<'a> {
                 visual.texture.destroy();
             }
         } else {
+            if let Some(transition) = self.workspace_transition.as_mut() {
+                transition.snapshot.disarm();
+            }
             if let Some(background) = self.background.as_mut() {
                 background.surface.disarm();
             }
@@ -8273,6 +8453,7 @@ fn plan_region_backdrop(
 fn render_egl_scene_parts<'a>(
     egl: &mut EglSceneRenderer,
     background: Option<&ImportedBackground>,
+    transparent_background: bool,
     shadow_style: crate::config::ShadowConfig,
     visuals: &crate::config::VisualConfig,
     snapshot: &SceneSnapshot,
@@ -8284,7 +8465,7 @@ fn render_egl_scene_parts<'a>(
     closing_provisional: &HashMap<u64, ProvisionalClosingFrame>,
     closing_source_surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
 ) -> Result<(), Box<dyn Error>> {
-    egl.clear()?;
+    if transparent_background { egl.clear_transparent()?; } else { egl.clear()?; }
     // 3a3fa2a: one clock reading for every entry in this render, so all
     // simultaneously animating surfaces advance in lockstep within a frame.
     let animation_now = Instant::now();
@@ -8840,6 +9021,12 @@ fn acquire_background_atoms(connection: &X11Connection) -> Result<BackgroundAtom
     })
 }
 
+fn acquire_workspace_atoms(connection: &X11Connection) -> Result<WorkspaceAtoms, Box<dyn Error>> {
+    Ok(WorkspaceAtoms {
+        current_desktop: connection.inner.intern_atom(false, b"_NET_CURRENT_DESKTOP")?.reply()?.atom,
+    })
+}
+
 fn acquire_visual_atoms(connection: &X11Connection) -> Result<VisualAtoms, Box<dyn Error>> {
     let intern = |name: &[u8]| -> Result<xproto::Atom, Box<dyn Error>> {
         Ok(connection.inner.intern_atom(false, name)?.reply()?.atom)
@@ -8859,6 +9046,66 @@ fn acquire_visual_atoms(connection: &X11Connection) -> Result<VisualAtoms, Box<d
 fn read_active_window(connection: &X11Connection, root: Window, atom: xproto::Atom) -> Result<Option<Window>, Box<dyn Error>> {
     let reply = connection.inner.get_property(false, root, atom, xproto::AtomEnum::WINDOW, 0, 1)?.reply()?;
     Ok(reply.value32().and_then(|mut values| values.next()).filter(|window| *window != x11rb::NONE))
+}
+
+fn parse_current_desktop_property(
+    property_type: xproto::Atom,
+    cardinal_type: xproto::Atom,
+    format: u8,
+    value_len: u32,
+    bytes_after: u32,
+    value: &[u8],
+) -> Option<u32> {
+    if property_type != cardinal_type || format != 32 || value_len != 1 || bytes_after != 0 || value.len() != 4 {
+        return None;
+    }
+    Some(u32::from_ne_bytes(value.try_into().ok()?))
+}
+
+fn read_current_desktop(connection: &X11Connection, root: Window, atom: xproto::Atom) -> Option<u32> {
+    let reply = connection
+        .inner
+        .get_property(false, root, atom, xproto::AtomEnum::CARDINAL, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    parse_current_desktop_property(
+        reply.type_,
+        xproto::AtomEnum::CARDINAL.into(),
+        reply.format,
+        reply.value_len,
+        reply.bytes_after,
+        &reply.value,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceDesktopObservation {
+    Initialize(u32),
+    Unchanged,
+    Changed { from: u32, to: u32 },
+}
+
+fn observe_workspace_desktop(last: Option<u32>, current: u32) -> WorkspaceDesktopObservation {
+    match last {
+        None => WorkspaceDesktopObservation::Initialize(current),
+        Some(previous) if previous == current => WorkspaceDesktopObservation::Unchanged,
+        Some(previous) => WorkspaceDesktopObservation::Changed { from: previous, to: current },
+    }
+}
+
+fn workspace_state_after_capture(
+    last: Option<u32>,
+    current: u32,
+    capture_succeeded: bool,
+    transition_was_active: bool,
+) -> (Option<u32>, bool) {
+    match observe_workspace_desktop(last, current) {
+        WorkspaceDesktopObservation::Initialize(_) | WorkspaceDesktopObservation::Unchanged => {
+            (last.or(Some(current)), transition_was_active)
+        }
+        WorkspaceDesktopObservation::Changed { .. } => (Some(current), capture_succeeded),
+    }
 }
 
 fn parse_frame_policy_property(
@@ -9824,7 +10071,9 @@ mod tests {
         eligible_for_open_animation, provisional_open_animations,
         merge_window_animations, scale_render_quad_plan,
         promote_provisional_animations, retire_removed_surface_animations,
-        effective_override_redirect,
+        effective_override_redirect, workspace_snapshot_eligible,
+        parse_current_desktop_property, observe_workspace_desktop,
+        workspace_state_after_capture, WorkspaceDesktopObservation, WorkspaceSnapshot,
     };
     use crate::config::{AnimationConfig, OpenAnimationConfig, OpenAnimationEffect};
     use crate::x11::capture::WindowGeometry;
@@ -9845,6 +10094,71 @@ mod tests {
             depth: 24,
             visual: 0x21,
         }
+    }
+
+    #[test]
+    fn current_desktop_parser_requires_one_cardinal32_value() {
+        let cardinal = 9;
+        let value = |desktop: u32| desktop.to_ne_bytes().to_vec();
+        assert_eq!(parse_current_desktop_property(cardinal, cardinal, 32, 1, 0, &value(2)), Some(2));
+        assert_eq!(parse_current_desktop_property(8, cardinal, 32, 1, 0, &value(2)), None);
+        assert_eq!(parse_current_desktop_property(cardinal, cardinal, 16, 1, 0, &value(2)), None);
+        assert_eq!(parse_current_desktop_property(cardinal, cardinal, 32, 0, 0, &value(2)), None);
+        assert_eq!(parse_current_desktop_property(cardinal, cardinal, 32, 1, 0, &[2, 0, 0]), None);
+        assert_eq!(parse_current_desktop_property(cardinal, cardinal, 32, 1, 4, &value(2)), None);
+    }
+
+    #[test]
+    fn current_desktop_observation_has_deterministic_startup_and_change_semantics() {
+        assert_eq!(observe_workspace_desktop(None, 1), WorkspaceDesktopObservation::Initialize(1));
+        assert_eq!(observe_workspace_desktop(Some(1), 1), WorkspaceDesktopObservation::Unchanged);
+        assert_eq!(observe_workspace_desktop(Some(1), 2), WorkspaceDesktopObservation::Changed { from: 1, to: 2 });
+        assert_eq!(workspace_state_after_capture(Some(1), 2, true, false), (Some(2), true));
+        assert_eq!(workspace_state_after_capture(Some(1), 2, false, true), (Some(2), false));
+        assert_eq!(workspace_state_after_capture(Some(1), 1, false, true), (Some(1), true));
+    }
+
+    #[test]
+    fn workspace_snapshot_filter_excludes_global_and_auxiliary_surfaces() {
+        let mut managed = eligible_surface(&metadata(), None, root(), 1, 0).unwrap();
+        assert!(workspace_snapshot_eligible(&managed));
+
+        managed.visual_class = SurfaceVisualClass::Dock;
+        assert!(!workspace_snapshot_eligible(&managed));
+        managed.visual_class = SurfaceVisualClass::Desktop;
+        assert!(!workspace_snapshot_eligible(&managed));
+        managed.visual_class = SurfaceVisualClass::Normal;
+        managed.override_redirect = true;
+        assert!(!workspace_snapshot_eligible(&managed));
+        managed.override_redirect = false;
+        managed.effective_override_redirect = true;
+        assert!(!workspace_snapshot_eligible(&managed));
+        managed.effective_override_redirect = false;
+        managed.map_state = MapState::UNMAPPED;
+        assert!(!workspace_snapshot_eligible(&managed));
+        managed.map_state = MapState::VIEWABLE;
+        managed.backend = BackendCompatibility::BackendUnsupported;
+        assert!(!workspace_snapshot_eligible(&managed));
+        managed.backend = BackendCompatibility::Renderable;
+        managed.geometry.x = 1000;
+        assert!(!entry_has_visible_contribution(&managed, crate::config::ShadowConfig::default(), root()));
+    }
+
+    #[test]
+    fn workspace_snapshot_filter_does_not_use_semantic_client_or_frame_policy_as_veto() {
+        let mut managed = eligible_surface(&metadata(), None, root(), 1, 0).unwrap();
+        managed.semantic_client_xid = None;
+        managed.frame_policy = FramePolicy::Request;
+        assert!(workspace_snapshot_eligible(&managed));
+        managed.frame_policy = FramePolicy::Suppress;
+        assert!(workspace_snapshot_eligible(&managed));
+    }
+
+    #[test]
+    fn workspace_snapshot_dimensions_are_single_source_values() {
+        let mut snapshot = WorkspaceSnapshot::new(7, root().width, root().height);
+        assert_eq!(snapshot.dimensions(), (root().width, root().height));
+        snapshot.disarm();
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

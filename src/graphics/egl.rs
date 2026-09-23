@@ -800,6 +800,24 @@ impl EglSceneRenderer {
         Ok(())
     }
 
+    pub(crate) fn clear_transparent(&self) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer.as_ref().ok_or("EGL scene renderer is unavailable")?.clear_transparent();
+        Ok(())
+    }
+
+    pub(crate) fn allocate_workspace_snapshot(&self, width: u16, height: u16) -> Result<u32, Box<dyn Error>> {
+        renderer::allocate_rgba8_texture(i32::from(width), i32::from(height))
+    }
+
+    pub(crate) fn bind_texture_render_target(
+        &self,
+        texture: u32,
+        width: u16,
+        height: u16,
+    ) -> Result<renderer::TextureRenderTarget, Box<dyn Error>> {
+        renderer::TextureRenderTarget::new(texture, i32::from(width), i32::from(height))
+    }
+
     pub fn render_surface(
         &self,
         texture: u32,
