@@ -5,7 +5,8 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt, Window};
 
 use super::capture::{
-    is_bad_window_error, print_metadata, WindowHierarchy, WindowMetadata, WindowRole,
+    is_bad_window_error, is_stale_hierarchy_metadata_error, print_metadata, WindowHierarchy,
+    WindowMetadata, WindowRole,
 };
 use super::connection::X11Connection;
 
@@ -41,6 +42,31 @@ pub(crate) struct HierarchySnapshot {
     pub(crate) children: Vec<HierarchyBinding>,
 }
 
+fn stale_root_child_binding(
+    root_child: Window,
+    error: &(dyn Error + 'static),
+) -> Option<HierarchyBinding> {
+    is_bad_window_error(error).then(|| HierarchyBinding::stale(root_child))
+}
+
+fn initial_root_child_metadata<T>(
+    result: Result<T, Box<dyn Error>>,
+) -> Result<Option<T>, Box<dyn Error>> {
+    match result {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if is_stale_hierarchy_metadata_error(error.as_ref()) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn descendant_metadata<T>(result: Result<T, Box<dyn Error>>) -> Result<Option<T>, Box<dyn Error>> {
+    match result {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if is_stale_hierarchy_metadata_error(error.as_ref()) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 impl X11Connection {
     pub(crate) fn snapshot_hierarchy(&self) -> Result<HierarchySnapshot, Box<dyn Error>> {
         let root = self.inner.setup().roots[self.screen_num()].root;
@@ -50,10 +76,10 @@ impl X11Connection {
         for root_child in root_tree.children {
             match self.inspect_root_child(root, root_child) {
                 Ok(binding) => children.push(binding),
-                Err(error) if is_bad_window_error(error.as_ref()) => {
-                    children.push(HierarchyBinding::stale(root_child));
-                }
-                Err(error) => return Err(error),
+                Err(error) => match stale_root_child_binding(root_child, error.as_ref()) {
+                    Some(binding) => children.push(binding),
+                    None => return Err(error),
+                },
             }
         }
 
@@ -71,11 +97,35 @@ impl X11Connection {
             top_level: root_child,
             root,
         };
+
+        let surface_candidate = match initial_root_child_metadata(
+            self.window_metadata(root_child, hierarchy),
+        )? {
+            Some(metadata) => metadata,
+            None => return Ok(HierarchyBinding::stale(root_child)),
+        };
+
+        let root_tree = match self.inner.query_tree(root_child)?.reply() {
+            Ok(tree) if tree.root == root && tree.parent == root => tree,
+            Ok(_) => return Ok(HierarchyBinding::stale(root_child)),
+            Err(error) if is_bad_window_error(&error) => {
+                return Ok(HierarchyBinding::stale(root_child));
+            }
+            Err(error) => return Err(Box::new(error)),
+        };
+
         let mut semantic_client_xids = Vec::new();
+        if surface_candidate.role == WindowRole::Client {
+            semantic_client_xids.push(root_child);
+        }
         let mut descendants = Vec::new();
         let mut visited = HashSet::from([root_child]);
-        let mut pending = vec![(root_child, root)];
-        let mut surface_candidate = None;
+        let mut pending = root_tree
+            .children
+            .into_iter()
+            .map(|child| (child, root_child))
+            .collect::<Vec<_>>();
+        let surface_candidate = Some(surface_candidate);
         let mut stale = false;
 
         while let Some((window, expected_parent)) = pending.pop() {
@@ -92,22 +142,17 @@ impl X11Connection {
                 Err(error) => return Err(Box::new(error)),
             };
 
-            let metadata = match self.window_metadata(window, hierarchy) {
-                Ok(metadata) => metadata,
-                Err(error) if is_bad_window_error(error.as_ref()) => {
+            let metadata = match descendant_metadata(self.window_metadata(window, hierarchy))? {
+                Some(metadata) => metadata,
+                None => {
                     stale = true;
                     continue;
                 }
-                Err(error) => return Err(error),
             };
             if metadata.role == WindowRole::Client {
                 semantic_client_xids.push(window);
             }
-            if window == root_child {
-                surface_candidate = Some(metadata);
-            } else {
-                descendants.push(metadata);
-            }
+            descendants.push(metadata);
             for child in tree.children {
                 if visited.insert(child) {
                     pending.push((child, window));
@@ -208,7 +253,69 @@ pub(crate) fn print_snapshot(snapshot: &HierarchySnapshot) {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_binding_status, BindingStatus};
+    use super::{
+        classify_binding_status, descendant_metadata, initial_root_child_metadata,
+        stale_root_child_binding, BindingStatus,
+    };
+    use std::error::Error;
+    use x11rb::errors::ReplyError;
+    use x11rb::protocol::ErrorKind;
+    use x11rb::x11_utils::X11Error;
+
+    fn reply_error(kind: ErrorKind) -> Box<dyn Error> {
+        Box::new(ReplyError::X11Error(X11Error {
+            error_kind: kind,
+            error_code: 9,
+            sequence: 1,
+            bad_value: 42,
+            minor_opcode: 0,
+            major_opcode: 14,
+            extension_name: None,
+            request_name: Some("GetGeometry"),
+        }))
+    }
+
+    #[test]
+    fn initial_root_child_metadata_bad_drawable_and_bad_window_are_stale() {
+        for kind in [ErrorKind::Drawable, ErrorKind::Window] {
+            assert!(initial_root_child_metadata::<()>(Err(reply_error(kind)))
+                .expect("stale metadata must not propagate")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn initial_root_child_metadata_bad_match_propagates() {
+        let error = initial_root_child_metadata::<()>(Err(reply_error(ErrorKind::Match)))
+            .expect_err("unrelated X11 errors must propagate");
+        assert!(matches!(
+            error.downcast_ref::<ReplyError>(),
+            Some(ReplyError::X11Error(error)) if error.error_kind == ErrorKind::Match
+        ));
+    }
+
+    #[test]
+    fn descendant_metadata_bad_drawable_and_bad_window_mark_stale() {
+        for kind in [ErrorKind::Drawable, ErrorKind::Window] {
+            assert!(descendant_metadata::<()>(Err(reply_error(kind)))
+                .expect("stale descendant metadata must not propagate")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn query_tree_drawable_error_is_not_reclassified_as_metadata_stale() {
+        let drawable = reply_error(ErrorKind::Drawable);
+        assert!(stale_root_child_binding(42, drawable.as_ref()).is_none());
+    }
+
+    #[test]
+    fn successful_initial_root_child_metadata_is_preserved() {
+        assert_eq!(
+            initial_root_child_metadata(Ok("metadata")).unwrap(),
+            Some("metadata")
+        );
+    }
 
     #[test]
     fn no_semantic_client_is_explicit() {

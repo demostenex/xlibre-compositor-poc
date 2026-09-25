@@ -3272,6 +3272,11 @@ impl SceneSnapshot {
                 );
                 continue;
             }
+            if binding.stale {
+                return Err(Box::new(CandidateBuildError::Stale(
+                    SceneInvalidation::Hierarchy,
+                )));
+            }
             let metadata = match binding.surface_candidate.as_ref() {
                 Some(metadata) => metadata,
                 None => {
@@ -9997,6 +10002,7 @@ mod tests {
         DamageState, shadow_eligible_for_entry, shadow_params_from_plan, resolved_surface_opacity,
         read_net_wm_state, VisualAtoms,
         NamedSurfacePixmapAcquireError, RawPixmapOwnership, named_pixmap_dimensions_match,
+        stale_pixmap_reply,
         validate_named_pixmap_dimensions, translate_named_pixmap_acquire_error,
         DamageLeaseAcquireError, stale_damage_create_reply, translate_damage_lease_acquire_error,
         is_hierarchy_stale_candidate_error,
@@ -10076,7 +10082,7 @@ mod tests {
         workspace_state_after_capture, WorkspaceDesktopObservation, WorkspaceSnapshot,
     };
     use crate::config::{AnimationConfig, OpenAnimationConfig, OpenAnimationEffect};
-    use crate::x11::capture::WindowGeometry;
+    use crate::x11::capture::{is_stale_hierarchy_metadata_error, WindowGeometry};
     use super::super::tree::{BindingStatus, HierarchyBinding, HierarchySnapshot};
     use x11rb::errors::ReplyError;
     use x11rb::protocol::damage::ReportLevel;
@@ -11454,6 +11460,81 @@ mod tests {
         assert!(matches!(
             error.downcast_ref::<CandidateBuildError>(),
             Some(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
+        ));
+    }
+
+    #[test]
+    fn stale_descendant_binding_rejects_candidate_even_with_surface_metadata() {
+        let binding = HierarchyBinding {
+            root_child_xid: 10,
+            semantic_client_xids: Vec::new(),
+            semantic_client: BindingStatus::NoClient,
+            lifecycle_candidate_xid: 10,
+            surface_candidate: Some(metadata()),
+            descendants: Vec::new(),
+            stale: true,
+        };
+        let error = SceneSnapshot::from_hierarchy(
+            HierarchySnapshot {
+                root: 1,
+                children: vec![binding],
+            },
+            root(),
+            99,
+            100,
+        )
+        .expect_err("a stale descendant observation must not publish");
+        assert!(matches!(
+            error.downcast_ref::<CandidateBuildError>(),
+            Some(CandidateBuildError::Stale(SceneInvalidation::Hierarchy))
+        ));
+    }
+
+    #[test]
+    fn valid_hierarchy_metadata_keeps_normal_snapshot_path() {
+        let binding = HierarchyBinding {
+            root_child_xid: 10,
+            semantic_client_xids: Vec::new(),
+            semantic_client: BindingStatus::NoClient,
+            lifecycle_candidate_xid: 10,
+            surface_candidate: Some(metadata()),
+            descendants: Vec::new(),
+            stale: false,
+        };
+        assert!(
+            SceneSnapshot::from_hierarchy(
+                HierarchySnapshot {
+                    root: 1,
+                    children: vec![binding],
+                },
+                root(),
+                99,
+                100,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn hierarchy_metadata_bad_drawable_and_bad_window_are_stale_but_other_errors_are_not() {
+        assert!(is_stale_hierarchy_metadata_error(
+            &damage_create_x11_error(ErrorKind::Drawable)
+        ));
+        assert!(is_stale_hierarchy_metadata_error(
+            &damage_create_x11_error(ErrorKind::Window)
+        ));
+        assert!(!is_stale_hierarchy_metadata_error(
+            &damage_create_x11_error(ErrorKind::Match)
+        ));
+        assert!(!is_stale_hierarchy_metadata_error(
+            &std::io::Error::other("connection/backend failure")
+        ));
+    }
+
+    #[test]
+    fn named_pixmap_bad_drawable_keeps_its_independent_stale_classifier() {
+        assert!(stale_pixmap_reply(
+            &damage_create_x11_error(ErrorKind::Drawable)
         ));
     }
 

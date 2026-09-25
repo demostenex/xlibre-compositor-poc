@@ -535,6 +535,19 @@ pub(crate) fn is_bad_window_error(error: &(dyn Error + 'static)) -> bool {
     )
 }
 
+pub(crate) fn is_stale_hierarchy_metadata_error(error: &(dyn Error + 'static)) -> bool {
+    match error.downcast_ref::<ReplyError>() {
+        Some(ReplyError::X11Error(error)) => {
+            stale_hierarchy_metadata_error_kind(error.error_kind)
+        }
+        _ => false,
+    }
+}
+
+fn stale_hierarchy_metadata_error_kind(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::Window | ErrorKind::Drawable)
+}
+
 fn is_bad_match(error: &ReplyError) -> bool {
     matches!(error, ReplyError::X11Error(error) if error.error_kind == ErrorKind::Match)
 }
@@ -596,7 +609,21 @@ pub(crate) fn print_metadata(label: &str, metadata: &WindowMetadata) {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_window_role, WindowRole, WindowRoleFacts};
+    use super::{
+        classify_window_role, stale_hierarchy_metadata_error_kind, WindowRole, WindowRoleFacts,
+    };
+    use x11rb::protocol::ErrorKind;
+
+    #[test]
+    fn hierarchy_metadata_treats_disappeared_window_and_drawable_as_stale_only() {
+        assert!(stale_hierarchy_metadata_error_kind(ErrorKind::Window));
+        assert!(stale_hierarchy_metadata_error_kind(ErrorKind::Drawable));
+        assert!(!stale_hierarchy_metadata_error_kind(ErrorKind::Match));
+        assert!(!stale_hierarchy_metadata_error_kind(ErrorKind::Pixmap));
+        assert!(!stale_hierarchy_metadata_error_kind(ErrorKind::Access));
+        assert!(!stale_hierarchy_metadata_error_kind(ErrorKind::Value));
+    }
+
     fn facts(
         is_root: bool,
         is_top_level: bool,
