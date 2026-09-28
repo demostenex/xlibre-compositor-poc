@@ -2216,6 +2216,7 @@ fn sample_bubble(t: f32) -> AnimationVisual {
 /// section 4/7) — color tuning is deferred until after human validation.
 pub(crate) const TELEPORT_FLASHY_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
 const WORKSPACE_TRANSITION_DURATION: Duration = Duration::from_millis(240);
+const TILING_LAYOUT_TRANSITION_DURATION: Duration = Duration::from_millis(240);
 const WORKSPACE_SLIDE_BEZIER_X1: f32 = 0.22;
 const WORKSPACE_SLIDE_BEZIER_Y1: f32 = 1.0;
 const WORKSPACE_SLIDE_BEZIER_X2: f32 = 0.36;
@@ -2237,6 +2238,13 @@ fn workspace_slide_progress(started_at: Instant, now: Instant) -> f32 {
         WORKSPACE_SLIDE_BEZIER_Y1,
         WORKSPACE_SLIDE_BEZIER_X2,
         WORKSPACE_SLIDE_BEZIER_Y2,
+    )
+}
+
+fn tiling_layout_progress(started_at: Instant, now: Instant) -> f32 {
+    ease_out_cubic(
+        now.saturating_duration_since(started_at).as_secs_f32()
+            / TILING_LAYOUT_TRANSITION_DURATION.as_secs_f32(),
     )
 }
 
@@ -2332,6 +2340,22 @@ fn translate_render_quad_plan(plan: RenderQuadPlan, dx: i32, dy: i32) -> RenderQ
         outer_x: plan.outer_x.saturating_add(dx),
         outer_y: plan.outer_y.saturating_add(dy),
         ..plan
+    }
+}
+
+fn lerp_render_quad_plan(from: RenderQuadPlan, to: RenderQuadPlan, progress: f32) -> RenderQuadPlan {
+    let progress = if progress.is_finite() { progress.clamp(0.0, 1.0) } else { 1.0 };
+    let mix = |a: i32, b: i32| (a as f32 + (b - a) as f32 * progress).round() as i32;
+    RenderQuadPlan {
+        dst_x: mix(from.dst_x, to.dst_x),
+        dst_y: mix(from.dst_y, to.dst_y),
+        width: mix(from.width, to.width).max(1),
+        height: mix(from.height, to.height).max(1),
+        outer_x: mix(from.outer_x, to.outer_x),
+        outer_y: mix(from.outer_y, to.outer_y),
+        outer_width: mix(from.outer_width, to.outer_width).max(1),
+        outer_height: mix(from.outer_height, to.outer_height).max(1),
+        ..to
     }
 }
 
@@ -4962,6 +4986,65 @@ struct WorkspaceSlideFrame {
     direction: i32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TilingLayoutTransition {
+    from: WindowGeometry,
+    to: WindowGeometry,
+    started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TilingLayoutFrame {
+    from: WindowGeometry,
+    to: WindowGeometry,
+    progress: f32,
+}
+
+fn provisional_tiling_layout_transitions(
+    old: Option<&SceneSnapshot>,
+    new: &SceneSnapshot,
+    enabled: bool,
+    present_available: bool,
+    started_at: Instant,
+) -> HashMap<Window, TilingLayoutTransition> {
+    if !enabled || !present_available {
+        return HashMap::new();
+    }
+    let Some(old) = old else { return HashMap::new(); };
+    let old_entries: HashMap<Window, &SurfaceEntry> = old.entries.iter()
+        .map(|entry| (entry.surface_xid, entry))
+        .collect();
+    new.entries.iter().filter_map(|entry| {
+        let previous = old_entries.get(&entry.surface_xid)?;
+        (previous.geometry != entry.geometry).then_some((entry.surface_xid, TilingLayoutTransition {
+            from: previous.geometry,
+            to: entry.geometry,
+            started_at,
+        }))
+    }).collect()
+}
+
+fn tiling_layout_frames(
+    active: &HashMap<Window, TilingLayoutTransition>,
+    provisional: &HashMap<Window, TilingLayoutTransition>,
+    now: Instant,
+) -> HashMap<Window, TilingLayoutFrame> {
+    let mut frames: HashMap<Window, TilingLayoutFrame> = active.iter().filter_map(|(xid, transition)| {
+        let progress = tiling_layout_progress(transition.started_at, now);
+        (progress < 1.0).then_some((*xid, TilingLayoutFrame {
+            from: transition.from,
+            to: transition.to,
+            progress,
+        }))
+    }).collect();
+    frames.extend(provisional.iter().map(|(xid, transition)| (*xid, TilingLayoutFrame {
+        from: transition.from,
+        to: transition.to,
+        progress: 0.0,
+    })));
+    frames
+}
+
 impl WorkspaceSlideFrame {
     fn offsets(self, progress: f32, root: RootGeometry) -> ((i32, i32), (i32, i32)) {
         let span = match self.axis {
@@ -5981,6 +6064,11 @@ struct SceneSession<'a> {
     // Populated only by a successful commit (see `commit_candidate_inner`),
     // never speculatively.
     window_animations: HashMap<Window, WindowAnimation>,
+    // Structural-reflow geometry transitions, keyed by stable surface XID.
+    // Candidate-local proposals are promoted only after the candidate frame
+    // has swapped successfully; interactive MoveOnly/ResizeOnly candidates
+    // never create proposals.
+    tiling_layout_transitions: HashMap<Window, TilingLayoutTransition>,
     // 3a3fa2b5 — persistent close-animation state. `render_order` is the
     // single authoritative composite ordering (Live projection always ==
     // `snapshot.entries` order, see `reconcile_render_order`);
@@ -6018,6 +6106,7 @@ struct SceneCandidate<'a> {
     // it into SceneSession::window_animations. A rejected/retried candidate
     // is simply dropped, taking this with it — see provisional_open_animations.
     provisional_animations: HashMap<Window, WindowAnimation>,
+    provisional_tiling_layout_transitions: HashMap<Window, TilingLayoutTransition>,
     // 3a3fa2b5 — candidate-local close-animation state, mirroring
     // `provisional_animations`'s exact precedent: pure and disposable
     // until a successful commit promotes it. `provisional_render_order`
@@ -6306,6 +6395,7 @@ impl<'a> SceneSession<'a> {
             ignored_configure_windows: HashSet::new(),
             diagnostics: Diagnostics3a3f8b3a::from_environment(),
             window_animations: HashMap::new(),
+            tiling_layout_transitions: HashMap::new(),
             render_order: Vec::new(),
             closing_visuals: HashMap::new(),
             next_close_id: 0,
@@ -6386,6 +6476,8 @@ impl<'a> SceneSession<'a> {
             .map(|(xid, animation)| (*xid, animation.clone()))
             .collect::<HashMap<_, _>>();
         let provisional = HashMap::new();
+        let capture_now = Instant::now();
+        let layout_frames = tiling_layout_frames(&self.tiling_layout_transitions, &HashMap::new(), capture_now);
         let (width, height) = (snapshot.root_geometry.width, snapshot.root_geometry.height);
         let texture = self.egl.as_ref().ok_or("EGL scene renderer is unavailable")?
             .allocate_workspace_snapshot(width, height)?;
@@ -6408,6 +6500,7 @@ impl<'a> SceneSession<'a> {
                 &provisional,
                 &self.egl_surfaces,
                 None,
+                &layout_frames,
             );
             drop(target);
             result.map(|_| ())
@@ -6779,6 +6872,13 @@ impl<'a> SceneSession<'a> {
             self._config.animation,
             Instant::now(),
         );
+        let provisional_tiling_layout_transitions = provisional_tiling_layout_transitions(
+            self.snapshot.as_ref(),
+            &snapshot,
+            self._config.animation.tiling_layout.enabled,
+            self.present.is_some(),
+            Instant::now(),
+        );
         // 3a3fa2b5: candidate-local close-trigger/ordering state, computed
         // from the OLD live snapshot/resources (still valid, unmutated at
         // this point) and this candidate's own fresh snapshot. See
@@ -6946,6 +7046,12 @@ impl<'a> SceneSession<'a> {
         // persistent — so a newly eligible surface can never be swapped
         // visible at full opacity/scale before its animation exists.
         let render_animations = merge_window_animations(&self.window_animations, &provisional_animations);
+        let layout_render_now = Instant::now();
+        let layout_frames = tiling_layout_frames(
+            &self.tiling_layout_transitions,
+            &provisional_tiling_layout_transitions,
+            layout_render_now,
+        );
         let render_outcome = self.render_egl_scene_with_workspace(
             &snapshot,
             &egl_surfaces,
@@ -6954,6 +7060,7 @@ impl<'a> SceneSession<'a> {
             &provisional_render_order,
             &provisional_closing_frames,
             workspace_render_frame.as_ref(),
+            &layout_frames,
         )?;
         self.diagnostics.last_candidate_resize = replaced_existing_resource;
         if replaced_existing_resource { self.diagnostics.resize_candidate_started += 1; }
@@ -6972,6 +7079,7 @@ impl<'a> SceneSession<'a> {
             watch_additions,
             ignored_configure_windows,
             provisional_animations,
+            provisional_tiling_layout_transitions,
             provisional_render_order,
             provisional_closing_frames,
             next_close_id_after,
@@ -7361,6 +7469,15 @@ impl<'a> SceneSession<'a> {
         let previous_client_root = candidate_entry.client_root_geometry;
         rebase_candidate_geometry_fields(&mut candidate.snapshot.entries[candidate_index], update);
         let render_animations = merge_window_animations(&self.window_animations, &candidate.provisional_animations);
+        let mut layout_frames = tiling_layout_frames(
+            &HashMap::new(),
+            &candidate.provisional_tiling_layout_transitions,
+            Instant::now(),
+        );
+        // The update being rebased is an interactive geometry operation,
+        // not a structural reflow target; preserve other candidate-local
+        // p=0 layout frames but never animate this surface's move/resize.
+        layout_frames.remove(&update.surface_xid);
         let workspace_render_frame = self.workspace_transition.as_ref().and_then(|transition| {
             candidate_workspace_render_frame(
                 transition,
@@ -7377,6 +7494,7 @@ impl<'a> SceneSession<'a> {
             &candidate.provisional_render_order,
             &candidate.provisional_closing_frames,
             workspace_render_frame.as_ref(),
+            &layout_frames,
         );
         match render_result {
             Ok(outcome) => candidate.render_outcome = outcome,
@@ -7411,6 +7529,7 @@ impl<'a> SceneSession<'a> {
     ) -> Result<(), Box<dyn Error>> {
         debug_assert!(!candidate.suppress_workspace_switch_opens || candidate.provisional_animations.is_empty());
         self.timed_swap(render_outcome)?;
+        let candidate_published_at = Instant::now();
         self.state = SceneState::ScenePresented;
         let candidate_transition_epoch = candidate.workspace_transition_epoch;
         let candidate_transition_plan = candidate.workspace_transition_plan.clone();
@@ -7461,6 +7580,11 @@ impl<'a> SceneSession<'a> {
         // delay or interact with removed_surfaces' resource teardown below.
         retire_removed_surface_animations(&mut self.window_animations, &removed_surfaces);
         promote_provisional_animations(&mut self.window_animations, candidate.provisional_animations);
+        self.tiling_layout_transitions.retain(|surface_xid, _| new_surfaces.contains(surface_xid));
+        self.tiling_layout_transitions.extend(candidate.provisional_tiling_layout_transitions.into_iter().map(|(xid, mut transition)| {
+            transition.started_at = candidate_published_at;
+            (xid, transition)
+        }));
         // 3a3fa2b5-r2 — retire destroy intents. Corrected from R1's
         // narrower `for surface_xid in &removed_surfaces { remove(..) }`:
         // that loop only ever retired intents for XIDs that were part of
@@ -7645,6 +7769,12 @@ impl<'a> SceneSession<'a> {
                 self.window_animations.len(),
             );
         }
+    }
+
+    fn retire_completed_tiling_layout_transitions(&mut self) {
+        let now = Instant::now();
+        self.tiling_layout_transitions
+            .retain(|_, transition| tiling_layout_progress(transition.started_at, now) < 1.0);
     }
 
     /// TEMPORARY FORENSIC INSTRUMENTATION — behaviorally identical to
@@ -7936,6 +8066,7 @@ impl<'a> SceneSession<'a> {
                 SceneInvalidation::Ignore => {
                     if !self.window_animations.is_empty()
                         || !self.closing_visuals.is_empty()
+                        || !self.tiling_layout_transitions.is_empty()
                         || self.workspace_transition.as_ref().is_some_and(|transition| transition.started_at.is_some())
                     {
                         // TEMPORARY FORENSIC INSTRUMENTATION — only while
@@ -8055,6 +8186,7 @@ impl<'a> SceneSession<'a> {
             // also guarantees no extra perpetual redraw: once empty, the
             // Ignore arm's guard above is false again on the next tick.
             self.retire_completed_animations();
+            self.retire_completed_tiling_layout_transitions();
             self.retire_completed_closing_visuals();
             // TEMPORARY FORENSIC INSTRUMENTATION — once-per-~1s aggregate
             // stdout line only. Remove before release.
@@ -8281,6 +8413,7 @@ impl<'a> SceneSession<'a> {
             // Resize-only never changes the surface_xid set (same surface,
             // rebased geometry only) — no new surface can appear here.
             provisional_animations: HashMap::new(),
+            provisional_tiling_layout_transitions: HashMap::new(),
             // 3a3fa2b5: same reasoning — resize-only never adds/removes a
             // surface, so the composite ordering and close-id counter are
             // carried forward completely unchanged; no close is ever
@@ -8313,6 +8446,7 @@ impl<'a> SceneSession<'a> {
             &candidate.provisional_render_order,
             &candidate.provisional_closing_frames,
             workspace_render_frame.as_ref(),
+            &HashMap::new(),
         )?;
         if let Some(start) = target_build_start {
             self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::TargetBuildRender, start.elapsed());
@@ -8495,6 +8629,11 @@ impl<'a> SceneSession<'a> {
         let full_recompose_start = Instant::now();
         self.diagnostics.recompositions += 1;
         let workspace_frame = self.active_workspace_render_frame(Instant::now());
+        let layout_frames = tiling_layout_frames(
+            &self.tiling_layout_transitions,
+            &HashMap::new(),
+            Instant::now(),
+        );
         let render_start = Instant::now();
         let render_once = |this: &mut Self, frame: Option<&WorkspaceRenderFrame>| {
             let empty_closing_provisional: HashMap<u64, ProvisionalClosingFrame> = HashMap::new();
@@ -8505,6 +8644,7 @@ impl<'a> SceneSession<'a> {
                 egl, this.background.as_ref(), false, this.shadow_style, &this._config.visuals,
                 snapshot, surfaces, &this.pixmaps, &this.window_animations, &this.render_order,
                 &this.closing_visuals, &empty_closing_provisional, surfaces, frame,
+                &layout_frames,
             )
         };
         let outcome = match render_once(self, workspace_frame.as_ref()) {
@@ -8835,6 +8975,7 @@ impl<'a> SceneSession<'a> {
         render_order: &[RenderLayer],
         closing_provisional: &HashMap<u64, ProvisionalClosingFrame>,
         workspace_frame: Option<&WorkspaceRenderFrame>,
+        layout_frames: &HashMap<Window, TilingLayoutFrame>,
     ) -> Result<RenderOutcome, Box<dyn Error>> {
         // TEMPORARY FORENSIC INSTRUMENTATION (timing only, no functional
         // change) — remove before release.
@@ -8859,6 +9000,7 @@ impl<'a> SceneSession<'a> {
             // Never a stored/cloned reference — read fresh on every call.
             &self.egl_surfaces,
             workspace_frame,
+            layout_frames,
         );
         if workspace_transition_render_needs_fallback(workspace_frame.is_some(), result.is_ok()) {
             eprintln!("WORKSPACE_TRANSITION_RENDER_FAILED; retrying once without transition composition");
@@ -8892,6 +9034,7 @@ impl<'a> SceneSession<'a> {
             self.background.as_ref(), false, self.shadow_style, &self._config.visuals,
             snapshot, surfaces, pixmaps, animations, render_order, &self.closing_visuals,
             closing_provisional, &self.egl_surfaces, None,
+            &HashMap::new(),
         );
         self.perf.renders += 1;
         self.perf.render.record(start.elapsed());
@@ -9352,6 +9495,7 @@ fn render_egl_scene_parts<'a>(
     closing_provisional: &HashMap<u64, ProvisionalClosingFrame>,
     closing_source_surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
     workspace_frame: Option<&WorkspaceRenderFrame>,
+    layout_frames: &HashMap<Window, TilingLayoutFrame>,
 ) -> Result<RenderOutcome, Box<dyn Error>> {
     if let Some(frame) = workspace_frame
         && (frame.stack.layers != render_order
@@ -9438,6 +9582,19 @@ fn render_egl_scene_parts<'a>(
             .ok_or_else(|| format!("missing pixmap for EGL surface 0x{:08x}", entry.surface_xid))?;
         let mut plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
             .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
+        if let Some(frame) = layout_frames.get(&entry.surface_xid).filter(|frame| frame.to == entry.geometry) {
+            let old_pixmap_geometry = PixmapGeometry {
+                x: frame.from.x,
+                y: frame.from.y,
+                width: frame.from.width,
+                height: frame.from.height,
+                border_width: frame.from.border_width,
+                ..pixmap.geometry
+            };
+            if let Some(from_plan) = build_render_quad_plan(frame.from, old_pixmap_geometry, snapshot.root_geometry) {
+                plan = lerp_render_quad_plan(from_plan, plan, frame.progress);
+            }
+        }
         let (slide_offset_x, slide_offset_y) = workspace_frame
             .filter(|frame| frame.stack.layer_is_workspace.get(layer_index) == Some(&true))
             .and_then(|frame| frame.slide.map(|slide| slide.offsets(frame.slide_progress, snapshot.root_geometry).0))
@@ -10967,6 +11124,8 @@ mod tests {
         render_version_compatible, gate_decision_after_batch, guards_allow_retry, GateDecision,
         pending_work_requires_iteration, pixel_gate_allows_presentation,
         retry_allowed, subtract_plan, watch_plan, build_render_quad_plan,
+        provisional_tiling_layout_transitions, tiling_layout_frames, lerp_render_quad_plan,
+        TilingLayoutTransition, TILING_LAYOUT_TRANSITION_DURATION,
         GeometryPresentHistory, ResizeOnlyDirection,
         HierarchyEventSource, HierarchyEventRelation,
         egl_scene_is_renderable, merge_deferred_damage_for_registry, EglPixelSemantics,
@@ -13682,6 +13841,62 @@ mod tests {
         WindowGeometry { x, y, width, height, border_width: 0 }
     }
 
+    #[test]
+    fn tiling_reflow_proposals_match_only_surviving_xids_with_changed_geometry() {
+        let started_at = Instant::now();
+        let old = SceneSnapshot {
+            root: 1,
+            root_geometry: full_hd_root(),
+            entries: vec![
+                { let mut entry = visibility_test_entry(geo(10, 10, 400, 300), false); entry.surface_xid = 11; entry },
+                { let mut entry = visibility_test_entry(geo(20, 20, 200, 100), false); entry.surface_xid = 12; entry },
+            ],
+        };
+        let new = SceneSnapshot {
+            root: 1,
+            root_geometry: full_hd_root(),
+            entries: vec![
+                { let mut entry = visibility_test_entry(geo(410, 10, 500, 300), false); entry.surface_xid = 11; entry },
+                { let mut entry = visibility_test_entry(geo(20, 20, 200, 100), false); entry.surface_xid = 12; entry },
+                { let mut entry = visibility_test_entry(geo(30, 30, 100, 100), false); entry.surface_xid = 13; entry },
+            ],
+        };
+        let proposed = provisional_tiling_layout_transitions(Some(&old), &new, true, true, started_at);
+        assert_eq!(proposed.len(), 1);
+        assert_eq!(proposed[&11].from, geo(10, 10, 400, 300));
+        assert_eq!(proposed[&11].to, geo(410, 10, 500, 300));
+        assert!(!proposed.contains_key(&12), "unchanged surviving geometry must stay untouched");
+        assert!(!proposed.contains_key(&13), "new windows are not layout-reflow candidates");
+
+        assert!(provisional_tiling_layout_transitions(Some(&old), &new, false, true, started_at).is_empty());
+        assert!(provisional_tiling_layout_transitions(Some(&old), &new, true, false, started_at).is_empty());
+        assert!(provisional_tiling_layout_transitions(None, &new, true, true, started_at).is_empty());
+    }
+
+    #[test]
+    fn tiling_layout_frames_keep_candidate_at_zero_then_advance_from_persistent_clock() {
+        let start = Instant::now();
+        let transition = TilingLayoutTransition { from: geo(0, 0, 100, 100), to: geo(100, 50, 300, 200), started_at: start };
+        let candidate = HashMap::from([(7, transition)]);
+        let pending = tiling_layout_frames(&HashMap::new(), &candidate, start + Duration::from_millis(500));
+        assert_eq!(pending[&7].progress, 0.0);
+
+        let active = tiling_layout_frames(&candidate, &HashMap::new(), start + TILING_LAYOUT_TRANSITION_DURATION / 2);
+        assert!((active[&7].progress - 0.875).abs() < 0.001);
+        assert!(tiling_layout_frames(&candidate, &HashMap::new(), start + TILING_LAYOUT_TRANSITION_DURATION).is_empty());
+    }
+
+    #[test]
+    fn lerp_render_quad_plan_interpolates_position_and_dimensions_but_uses_target_sampling() {
+        let from = animation_test_plan(10, 20, 100, 80);
+        let to = animation_test_plan(110, 60, 300, 160);
+        let half = lerp_render_quad_plan(from, to, 0.5);
+        assert_eq!((half.dst_x, half.dst_y, half.width, half.height), (60, 40, 200, 120));
+        assert_eq!((half.outer_x, half.outer_y, half.outer_width, half.outer_height), (58, 38, 204, 124));
+        assert_eq!((half.u0, half.v0, half.u1, half.v1), (to.u0, to.v0, to.u1, to.v1));
+        assert_eq!(lerp_render_quad_plan(from, to, 1.0), to);
+    }
+
     fn shadow_style(enabled: bool, extent: f32, offset_x: f32, offset_y: f32) -> crate::config::ShadowConfig {
         crate::config::ShadowConfig {
             enabled,
@@ -13797,6 +14012,7 @@ mod tests {
             open: OpenAnimationConfig { effect: OpenAnimationEffect::Scale, duration: Duration::from_millis(180) },
             close: crate::config::CloseAnimationConfig { enabled: false, effect: crate::config::CloseAnimationEffect::Scale, duration: Duration::from_millis(180) },
             workspace_slide: crate::config::WorkspaceSlideConfig { enabled: false, axis: crate::config::WorkspaceSlideAxis::Horizontal },
+            tiling_layout: crate::config::TilingLayoutConfig { enabled: false },
         }
     }
 
@@ -13810,6 +14026,7 @@ mod tests {
             open: OpenAnimationConfig { effect, duration: Duration::from_millis(180) },
             close: crate::config::CloseAnimationConfig { enabled: false, effect: crate::config::CloseAnimationEffect::Scale, duration: Duration::from_millis(180) },
             workspace_slide: crate::config::WorkspaceSlideConfig { enabled: false, axis: crate::config::WorkspaceSlideAxis::Horizontal },
+            tiling_layout: crate::config::TilingLayoutConfig { enabled: false },
         }
     }
 

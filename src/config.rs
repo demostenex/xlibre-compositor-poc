@@ -67,12 +67,18 @@ pub(crate) struct WorkspaceSlideConfig {
     pub(crate) axis: WorkspaceSlideAxis,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TilingLayoutConfig {
+    pub(crate) enabled: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct AnimationConfig {
     pub(crate) enabled: bool,
     pub(crate) open: OpenAnimationConfig,
     pub(crate) close: CloseAnimationConfig,
     pub(crate) workspace_slide: WorkspaceSlideConfig,
+    pub(crate) tiling_layout: TilingLayoutConfig,
 }
 
 impl Default for AnimationConfig {
@@ -92,6 +98,7 @@ impl Default for AnimationConfig {
                 enabled: false,
                 axis: WorkspaceSlideAxis::Horizontal,
             },
+            tiling_layout: TilingLayoutConfig { enabled: false },
         }
     }
 }
@@ -252,6 +259,7 @@ pub(crate) struct ParsedGlobalConfig {
     pub(crate) animation_close_duration: Option<f32>,
     pub(crate) animation_workspace_slide_enabled: Option<bool>,
     pub(crate) animation_workspace_slide_direction: Option<String>,
+    pub(crate) animation_tiling_layout_enabled: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -478,6 +486,7 @@ fn parse_global(global: &mut ParsedGlobalConfig, key: &str, value: &str, line: u
         "animation.close.duration" => assign!(animation_close_duration, number),
         "animation.workspace_slide.enabled" => assign!(animation_workspace_slide_enabled, bool_value),
         "animation.workspace_slide.direction" => assign!(animation_workspace_slide_direction, token_value),
+        "animation.tiling_layout.enabled" => assign!(animation_tiling_layout_enabled, bool_value),
         _ => return Err(error(line, section, "unknown key")),
     }
     Ok(())
@@ -519,6 +528,9 @@ fn resolve_animation(global: &ParsedGlobalConfig) -> Result<AnimationConfig, Par
         workspace_slide: WorkspaceSlideConfig {
             enabled: global.animation_workspace_slide_enabled.unwrap_or(false),
             axis: workspace_slide_axis,
+        },
+        tiling_layout: TilingLayoutConfig {
+            enabled: global.animation_tiling_layout_enabled.unwrap_or(false),
         },
     })
 }
@@ -848,7 +860,8 @@ mod tests {
         WindowMetadataForRule, WindowType, load_startup_config, resolve_blur,
         resolve_config_path, resolve_rule_actions,
         AnimationConfig, OpenAnimationConfig, OpenAnimationEffect,
-        CloseAnimationConfig, CloseAnimationEffect, WorkspaceSlideAxis, WorkspaceSlideConfig};
+        CloseAnimationConfig, CloseAnimationEffect, WorkspaceSlideAxis, WorkspaceSlideConfig,
+        TilingLayoutConfig};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -1054,6 +1067,7 @@ mod tests {
                 open: OpenAnimationConfig { effect: OpenAnimationEffect::Scale, duration: Duration::from_millis(180) },
                 close: CloseAnimationConfig { enabled: false, effect: CloseAnimationEffect::Scale, duration: Duration::from_millis(180) },
                 workspace_slide: WorkspaceSlideConfig { enabled: false, axis: WorkspaceSlideAxis::Horizontal },
+                tiling_layout: TilingLayoutConfig { enabled: false },
             },
         );
     }
@@ -1062,6 +1076,16 @@ mod tests {
     fn empty_config_also_yields_the_same_animation_defaults() {
         let config = ParsedConfig::parse("[global]").unwrap().validate().unwrap();
         assert_eq!(config.animation, AnimationConfig::default());
+    }
+
+    #[test]
+    fn tiling_layout_animation_is_opt_in() {
+        let default = ParsedConfig::parse("[global]").unwrap().validate().unwrap();
+        assert!(!default.animation.tiling_layout.enabled);
+        let enabled = ParsedConfig::parse("[global]\nanimation.tiling_layout.enabled = true")
+            .unwrap().validate().unwrap();
+        assert!(enabled.animation.tiling_layout.enabled);
+        assert!(ParsedConfig::parse("[global]\nanimation.tiling_layout.enabled = perhaps").is_err());
     }
 
     // --- B: animation.enabled = true ---

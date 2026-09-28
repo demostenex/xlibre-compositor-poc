@@ -129,6 +129,7 @@ border.urgent_color = FF3030
 blur.enabled = true
 animation.workspace_slide.enabled = true
 animation.workspace_slide.direction = horizontal
+animation.tiling_layout.enabled = true
 ```
 
 The current parser also accepts global `shadow.*`, `opacity.*`, and `animation.*` settings.
@@ -138,6 +139,10 @@ and is disabled by default. `animation.workspace_slide.direction` accepts `horiz
 a switch to a lower index enters from the left or top. The index is a logical EWMH ordering and
 does not describe physical monitor placement. Window rules are parsed and validated but are not
 yet applied to live windows.
+
+Structural tiling reflows can optionally animate surviving windows between their previous and
+new rectangles with `animation.tiling_layout.enabled = true`; it is disabled by default and does
+not affect interactive move/resize fast paths.
 
 ## Blur request semantics
 
