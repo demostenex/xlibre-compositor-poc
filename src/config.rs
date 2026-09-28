@@ -55,11 +55,24 @@ pub(crate) struct CloseAnimationConfig {
     pub(crate) duration: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceSlideAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceSlideConfig {
+    pub(crate) enabled: bool,
+    pub(crate) axis: WorkspaceSlideAxis,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct AnimationConfig {
     pub(crate) enabled: bool,
     pub(crate) open: OpenAnimationConfig,
     pub(crate) close: CloseAnimationConfig,
+    pub(crate) workspace_slide: WorkspaceSlideConfig,
 }
 
 impl Default for AnimationConfig {
@@ -74,6 +87,10 @@ impl Default for AnimationConfig {
                 enabled: false,
                 effect: CloseAnimationEffect::Scale,
                 duration: Duration::from_millis(180),
+            },
+            workspace_slide: WorkspaceSlideConfig {
+                enabled: false,
+                axis: WorkspaceSlideAxis::Horizontal,
             },
         }
     }
@@ -233,6 +250,8 @@ pub(crate) struct ParsedGlobalConfig {
     pub(crate) animation_close_enabled: Option<bool>,
     pub(crate) animation_close_effect: Option<String>,
     pub(crate) animation_close_duration: Option<f32>,
+    pub(crate) animation_workspace_slide_enabled: Option<bool>,
+    pub(crate) animation_workspace_slide_direction: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -457,6 +476,8 @@ fn parse_global(global: &mut ParsedGlobalConfig, key: &str, value: &str, line: u
         "animation.close.enabled" => assign!(animation_close_enabled, bool_value),
         "animation.close.effect" => assign!(animation_close_effect, token_value),
         "animation.close.duration" => assign!(animation_close_duration, number),
+        "animation.workspace_slide.enabled" => assign!(animation_workspace_slide_enabled, bool_value),
+        "animation.workspace_slide.direction" => assign!(animation_workspace_slide_direction, token_value),
         _ => return Err(error(line, section, "unknown key")),
     }
     Ok(())
@@ -483,6 +504,11 @@ fn resolve_animation(global: &ParsedGlobalConfig) -> Result<AnimationConfig, Par
         return Err(error(0, section, "animation.open.duration must be between 50 and 3000 milliseconds"));
     }
     let close = resolve_close_animation(global)?;
+    let workspace_slide_axis = match global.animation_workspace_slide_direction.as_deref() {
+        None | Some("horizontal") => WorkspaceSlideAxis::Horizontal,
+        Some("vertical") => WorkspaceSlideAxis::Vertical,
+        Some(_) => return Err(error(0, section, "animation.workspace_slide.direction must be horizontal or vertical")),
+    };
     Ok(AnimationConfig {
         enabled: global.animation_enabled.unwrap_or(false),
         open: OpenAnimationConfig {
@@ -490,6 +516,10 @@ fn resolve_animation(global: &ParsedGlobalConfig) -> Result<AnimationConfig, Par
             duration: Duration::from_millis(duration_ms.round() as u64),
         },
         close,
+        workspace_slide: WorkspaceSlideConfig {
+            enabled: global.animation_workspace_slide_enabled.unwrap_or(false),
+            axis: workspace_slide_axis,
+        },
     })
 }
 
@@ -818,7 +848,7 @@ mod tests {
         WindowMetadataForRule, WindowType, load_startup_config, resolve_blur,
         resolve_config_path, resolve_rule_actions,
         AnimationConfig, OpenAnimationConfig, OpenAnimationEffect,
-        CloseAnimationConfig, CloseAnimationEffect};
+        CloseAnimationConfig, CloseAnimationEffect, WorkspaceSlideAxis, WorkspaceSlideConfig};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -1023,6 +1053,7 @@ mod tests {
                 enabled: false,
                 open: OpenAnimationConfig { effect: OpenAnimationEffect::Scale, duration: Duration::from_millis(180) },
                 close: CloseAnimationConfig { enabled: false, effect: CloseAnimationEffect::Scale, duration: Duration::from_millis(180) },
+                workspace_slide: WorkspaceSlideConfig { enabled: false, axis: WorkspaceSlideAxis::Horizontal },
             },
         );
     }

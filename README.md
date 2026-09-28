@@ -28,6 +28,7 @@ X11 server, application, or visual configuration.
 - XDamage-driven scene updates with EGL/OpenGL rendering.
 - Rounded corners, configurable borders, shadows, and opacity configuration.
 - Background blur for application blur requests.
+- Property-driven workspace transitions with a GPU-captured outgoing composition and live incoming workspace.
 - Sparse startup configuration at `~/.config/xomposite/xomposite.conf`.
 - Startup through i3 using a normal `exec` entry.
 - Transactional scene-candidate publication with bounded stale-candidate handling.
@@ -126,10 +127,17 @@ border.inactive_color = 555555
 border.focused_color = 4C7899
 border.urgent_color = FF3030
 blur.enabled = true
+animation.workspace_slide.enabled = true
+animation.workspace_slide.direction = horizontal
 ```
 
-The current parser also accepts global `shadow.*` and `opacity.*` settings. Window rules are
-parsed and validated but are not yet applied to live windows.
+The current parser also accepts global `shadow.*`, `opacity.*`, and `animation.*` settings.
+Workspace transitions keep their 240 ms opacity dissolve; the optional slide runs alongside it
+and is disabled by default. `animation.workspace_slide.direction` accepts `horizontal` or
+`vertical`. A switch to a higher `_NET_CURRENT_DESKTOP` index enters from the right or bottom;
+a switch to a lower index enters from the left or top. The index is a logical EWMH ordering and
+does not describe physical monitor placement. Window rules are parsed and validated but are not
+yet applied to live windows.
 
 ## Blur request semantics
 
@@ -193,7 +201,7 @@ Starting a second compositor while another owns the compositor selection should 
 - Multi-monitor and dual-monitor behavior still needs dedicated validation and support work.
 - Configuration is loaded at startup; live reload is not implemented.
 - Window rules are parsed and stored, but runtime rule application is deferred.
-- Transitions and animations are not implemented.
+- Additional transition and animation effects remain under development.
 - The current workflow uses a development binary; stable installation and packaging are future
   work.
 - Logging is functional but does not yet provide a polished structured-level interface.

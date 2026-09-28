@@ -2216,11 +2216,96 @@ fn sample_bubble(t: f32) -> AnimationVisual {
 /// section 4/7) — color tuning is deferred until after human validation.
 pub(crate) const TELEPORT_FLASHY_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
 const WORKSPACE_TRANSITION_DURATION: Duration = Duration::from_millis(240);
+const WORKSPACE_SLIDE_BEZIER_X1: f32 = 0.22;
+const WORKSPACE_SLIDE_BEZIER_Y1: f32 = 1.0;
+const WORKSPACE_SLIDE_BEZIER_X2: f32 = 0.36;
+const WORKSPACE_SLIDE_BEZIER_Y2: f32 = 1.0;
+
+fn workspace_transition_linear_progress(started_at: Instant, now: Instant) -> f32 {
+    (now.saturating_duration_since(started_at).as_secs_f32()
+        / WORKSPACE_TRANSITION_DURATION.as_secs_f32()).clamp(0.0, 1.0)
+}
 
 fn workspace_transition_progress(started_at: Instant, now: Instant) -> f32 {
-    (now.saturating_duration_since(started_at).as_secs_f32()
-        / WORKSPACE_TRANSITION_DURATION.as_secs_f32())
-        .clamp(0.0, 1.0)
+    ease_out_cubic(workspace_transition_linear_progress(started_at, now))
+}
+
+fn workspace_slide_progress(started_at: Instant, now: Instant) -> f32 {
+    cubic_bezier_ease(
+        workspace_transition_linear_progress(started_at, now),
+        WORKSPACE_SLIDE_BEZIER_X1,
+        WORKSPACE_SLIDE_BEZIER_Y1,
+        WORKSPACE_SLIDE_BEZIER_X2,
+        WORKSPACE_SLIDE_BEZIER_Y2,
+    )
+}
+
+fn cubic_bezier_coordinate(t: f32, p1: f32, p2: f32) -> f32 {
+    let inverse = 1.0 - t;
+    3.0 * inverse * inverse * t * p1 + 3.0 * inverse * t * t * p2 + t * t * t
+}
+
+fn cubic_bezier_derivative(t: f32, p1: f32, p2: f32) -> f32 {
+    let inverse = 1.0 - t;
+    3.0 * inverse * inverse * p1
+        + 6.0 * inverse * t * (p2 - p1)
+        + 3.0 * t * t * (1.0 - p2)
+}
+
+/// Evaluates a cubic Bézier timing curve by solving x(u)=progress and
+/// returning y(u). Newton-Raphson handles the usual case; bisection keeps
+/// the result bounded when the derivative becomes too small or Newton
+/// leaves the current bracket. The x control points are restricted to the
+/// monotonic [0, 1] interval, as required for a timing function.
+fn cubic_bezier_ease(progress: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    if !progress.is_finite() || !x1.is_finite() || !y1.is_finite() || !x2.is_finite() || !y2.is_finite()
+        || !(0.0..=1.0).contains(&x1) || !(0.0..=1.0).contains(&x2)
+    {
+        return 0.0;
+    }
+    let progress = progress.clamp(0.0, 1.0);
+    if progress == 0.0 || progress == 1.0 {
+        return progress;
+    }
+
+    const TOLERANCE: f32 = 1.0e-6;
+    let mut lower = 0.0;
+    let mut upper = 1.0;
+    let mut parameter = progress;
+    for _ in 0..8 {
+        let error = cubic_bezier_coordinate(parameter, x1, x2) - progress;
+        if error.abs() <= TOLERANCE {
+            return cubic_bezier_coordinate(parameter, y1, y2);
+        }
+        if error < 0.0 {
+            lower = parameter;
+        } else {
+            upper = parameter;
+        }
+        let derivative = cubic_bezier_derivative(parameter, x1, x2);
+        if derivative.abs() <= TOLERANCE {
+            break;
+        }
+        let next = parameter - error / derivative;
+        if !next.is_finite() || next <= lower || next >= upper {
+            break;
+        }
+        parameter = next;
+    }
+
+    for _ in 0..24 {
+        parameter = (lower + upper) * 0.5;
+        let error = cubic_bezier_coordinate(parameter, x1, x2) - progress;
+        if error.abs() <= TOLERANCE {
+            break;
+        }
+        if error < 0.0 {
+            lower = parameter;
+        } else {
+            upper = parameter;
+        }
+    }
+    cubic_bezier_coordinate(parameter, y1, y2)
 }
 
 fn workspace_transition_should_activate(
@@ -2238,6 +2323,16 @@ fn workspace_transition_render_needs_fallback(has_transition_frame: bool, render
 
 fn apply_workspace_factor_to_border_alpha(plan: &mut RenderQuadPlan, factor: f32) {
     plan.border_color[3] *= factor;
+}
+
+fn translate_render_quad_plan(plan: RenderQuadPlan, dx: i32, dy: i32) -> RenderQuadPlan {
+    RenderQuadPlan {
+        dst_x: plan.dst_x.saturating_add(dx),
+        dst_y: plan.dst_y.saturating_add(dy),
+        outer_x: plan.outer_x.saturating_add(dx),
+        outer_y: plan.outer_y.saturating_add(dy),
+        ..plan
+    }
 }
 
 fn release_workspace_texture_once(released: &mut bool, release: impl FnOnce()) {
@@ -3230,18 +3325,19 @@ fn candidate_workspace_render_frame(
     render_now: Instant,
 ) -> Option<WorkspaceRenderFrame> {
     let stack = candidate_plan?;
-    let (animation_now, progress) = match transition.started_at {
+    let (animation_now, progress, slide_progress) = match transition.started_at {
         // A pending activation owns a candidate-local T0.  Every render
         // before publication deliberately remains its first frame.
         None => {
             let pending_started_at = candidate_pending_started_at?;
-            (pending_started_at, 0.0)
+            (pending_started_at, 0.0, 0.0)
         }
         // Once active, candidates use a fresh render clock and never reset
         // the persistent transition back to its starting instant.
         Some(started_at) => (
             render_now,
             workspace_transition_progress(started_at, render_now),
+            workspace_slide_progress(started_at, render_now),
         ),
     };
     Some(WorkspaceRenderFrame {
@@ -3249,7 +3345,9 @@ fn candidate_workspace_render_frame(
         stack: Rc::new(stack.clone()),
         old_closing_ids: Rc::clone(&transition.old_closing_ids),
         progress,
+        slide_progress,
         animation_now,
+        slide: transition.slide,
     })
 }
 
@@ -4853,7 +4951,30 @@ struct WorkspaceRenderFrame {
     stack: Rc<WorkspaceTransitionStackPlan>,
     old_closing_ids: Rc<HashSet<u64>>,
     progress: f32,
+    slide_progress: f32,
     animation_now: Instant,
+    slide: Option<WorkspaceSlideFrame>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkspaceSlideFrame {
+    axis: crate::config::WorkspaceSlideAxis,
+    direction: i32,
+}
+
+impl WorkspaceSlideFrame {
+    fn offsets(self, progress: f32, root: RootGeometry) -> ((i32, i32), (i32, i32)) {
+        let span = match self.axis {
+            crate::config::WorkspaceSlideAxis::Horizontal => i32::from(root.width),
+            crate::config::WorkspaceSlideAxis::Vertical => i32::from(root.height),
+        };
+        let incoming = ((span as f32 * (1.0 - progress)).round() as i32) * self.direction;
+        let outgoing = (span as f32 * progress).round() as i32 * -self.direction;
+        match self.axis {
+            crate::config::WorkspaceSlideAxis::Horizontal => ((incoming, 0), (outgoing, 0)),
+            crate::config::WorkspaceSlideAxis::Vertical => ((0, incoming), (0, outgoing)),
+        }
+    }
 }
 
 struct WorkspaceTransitionState {
@@ -4865,6 +4986,7 @@ struct WorkspaceTransitionState {
     old_closing_ids: Rc<HashSet<u64>>,
     had_workspace_content: bool,
     started_at: Option<Instant>,
+    slide: Option<WorkspaceSlideFrame>,
 }
 
 #[derive(Clone, Debug)]
@@ -6365,6 +6487,13 @@ impl<'a> SceneSession<'a> {
                             had_workspace_content: old_stack.start < old_stack.end,
                             old_stack,
                             started_at: None,
+                            slide: self._config.animation.workspace_slide.enabled.then_some(WorkspaceSlideFrame {
+                                axis: self._config.animation.workspace_slide.axis,
+                                // EWMH's from/to indices give this switch a
+                                // logical direction, but encode neither a
+                                // stable workspace identity nor output placement.
+                                direction: if to > from { 1 } else { -1 },
+                            }),
                         });
                     }
                     (Err(error), _) => {
@@ -8691,7 +8820,9 @@ impl<'a> SceneSession<'a> {
             stack: Rc::clone(&transition.stack_plan),
             old_closing_ids: Rc::clone(&transition.old_closing_ids),
             progress: workspace_transition_progress(started_at, animation_now),
+            slide_progress: workspace_slide_progress(started_at, animation_now),
             animation_now,
+            slide: transition.slide,
         })
     }
 
@@ -9251,7 +9382,10 @@ fn render_egl_scene_parts<'a>(
         if let Some(frame) = workspace_frame
             && layer_index == frame.stack.start
         {
-            render_workspace_snapshot(egl, frame.texture, snapshot.root_geometry, 1.0 - frame.progress)?;
+            let (_, (offset_x, offset_y)) = frame.slide
+                .map(|slide| slide.offsets(frame.slide_progress, snapshot.root_geometry))
+                .unwrap_or(((0, 0), (0, 0)));
+            render_workspace_snapshot(egl, frame.texture, snapshot.root_geometry, 1.0 - frame.progress, offset_x, offset_y)?;
         }
         // 3a3fa2b5: `render_order` (never `snapshot.entries` directly) now
         // drives composite depth, so committed close visuals splice into
@@ -9283,7 +9417,11 @@ fn render_egl_scene_parts<'a>(
                 let workspace_factor = workspace_frame
                     .filter(|frame| frame.stack.layer_is_workspace.get(layer_index) == Some(&true))
                     .map_or(1.0, |frame| frame.progress);
-                render_closing_layer(egl, shadow_style, closing_committed, closing_provisional, closing_source_surfaces, close_id, animation_now, workspace_factor)?;
+                let (offset_x, offset_y) = workspace_frame
+                    .filter(|frame| frame.stack.layer_is_workspace.get(layer_index) == Some(&true))
+                    .and_then(|frame| frame.slide.map(|slide| slide.offsets(frame.slide_progress, snapshot.root_geometry).1))
+                    .unwrap_or((0, 0));
+                render_closing_layer(egl, shadow_style, closing_committed, closing_provisional, closing_source_surfaces, close_id, animation_now, workspace_factor, offset_x, offset_y)?;
                 continue;
             }
         };
@@ -9300,17 +9438,24 @@ fn render_egl_scene_parts<'a>(
             .ok_or_else(|| format!("missing pixmap for EGL surface 0x{:08x}", entry.surface_xid))?;
         let mut plan = build_render_quad_plan(entry.geometry, pixmap.geometry, snapshot.root_geometry)
             .ok_or_else(|| format!("surface 0x{:08x} has no visible render quad", entry.surface_xid))?;
+        let (slide_offset_x, slide_offset_y) = workspace_frame
+            .filter(|frame| frame.stack.layer_is_workspace.get(layer_index) == Some(&true))
+            .and_then(|frame| frame.slide.map(|slide| slide.offsets(frame.slide_progress, snapshot.root_geometry).0))
+            .unwrap_or((0, 0));
+        plan = translate_render_quad_plan(plan, slide_offset_x, slide_offset_y);
         apply_surface_visual_policy(&mut plan, visuals, entry.visual_class);
         resolve_surface_frame_policy(&mut plan, entry);
         plan.border_color = entry.resolved_border_color.map(f32::from_bits);
 
         // 3a3fa2b1-s1: resolve the animated surface plan/opacity ONCE,
-        // right after the real `plan` is finalized and before any
+        // right after the real (including workspace-slide-translated)
+        // `plan` is finalized and before any
         // geometry-consuming draw work below — shadow and the final
         // surface draw both reuse this SAME sampled AnimationVisual,
         // never resampled a second time. `plan` itself (Copy) is left
-        // untouched here and remains the real, un-animated footprint —
-        // BLUR CONTRACT: blur below intentionally keeps using it, unchanged.
+        // untouched here and remains the real, un-scaled footprint.
+        // BLUR CONTRACT: blur follows the workspace slide position while
+        // remaining independent of the per-window open-animation scale.
         let base_opacity = f32::from_bits(entry.resolved_opacity_bits);
         let (mut draw_plan, draw_opacity, shadow_opacity_multiplier, energy_tear_layout, open_flash_alpha, open_reveal_radius, open_kamui_state) = match animations.get(&entry.surface_xid) {
             Some(animation) => {
@@ -9522,7 +9667,10 @@ fn render_egl_scene_parts<'a>(
     if let Some(frame) = workspace_frame
         && frame.stack.start == render_order.len()
     {
-        render_workspace_snapshot(egl, frame.texture, snapshot.root_geometry, 1.0 - frame.progress)?;
+        let (_, (offset_x, offset_y)) = frame.slide
+            .map(|slide| slide.offsets(frame.slide_progress, snapshot.root_geometry))
+            .unwrap_or(((0, 0), (0, 0)));
+        render_workspace_snapshot(egl, frame.texture, snapshot.root_geometry, 1.0 - frame.progress, offset_x, offset_y)?;
     }
     Ok(render_outcome_for_frame(
         workspace_frame.map(|frame| frame.progress),
@@ -9576,6 +9724,8 @@ fn render_closing_layer(
     close_id: u64,
     animation_now: Instant,
     workspace_factor: f32,
+    slide_offset_x: i32,
+    slide_offset_y: i32,
 ) -> Result<(), Box<dyn Error>> {
     let (source, texture) = match closing_committed.get(&close_id) {
         Some(visual) => (ClosingDrawSource::Committed(visual), visual.texture.texture),
@@ -9590,7 +9740,11 @@ fn render_closing_layer(
     let animation = source.animation();
     let t = animation.progress(animation_now);
     let visual = sample_close_effect(animation.effect, t);
-    let mut closing_draw_plan = scale_render_quad_plan(source.plan(), visual.scale_x, visual.scale_y);
+    let mut closing_draw_plan = translate_render_quad_plan(
+        scale_render_quad_plan(source.plan(), visual.scale_x, visual.scale_y),
+        slide_offset_x,
+        slide_offset_y,
+    );
     apply_workspace_factor_to_border_alpha(&mut closing_draw_plan, workspace_factor);
     // 3a3fa2b7 (Kamui): shadow ENVELOPE multiplied into the existing
     // closing_opacity_multiplier — `None` (no change) for every non-Kamui
@@ -9652,16 +9806,18 @@ fn render_workspace_snapshot(
     texture: u32,
     root: RootGeometry,
     opacity: f32,
+    slide_offset_x: i32,
+    slide_offset_y: i32,
 ) -> Result<(), Box<dyn Error>> {
     let width = i32::from(root.width);
     let height = i32::from(root.height);
-    let plan = RenderQuadPlan {
+    let plan = translate_render_quad_plan(RenderQuadPlan {
         dst_x: 0, dst_y: 0, width, height,
         outer_x: 0, outer_y: 0, outer_width: width, outer_height: height,
         src_x: 0, src_y: 0, src_width: width, src_height: height,
         u0: 0.0, v0: workspace_snapshot_uvs().0, u1: 1.0, v1: workspace_snapshot_uvs().1,
         corner_radius: 0.0, border_width: 0.0, border_color: [0.0; 4],
-    };
+    }, slide_offset_x, slide_offset_y);
     let opacity = crate::graphics::renderer::SurfaceOpacity::new(opacity)
         .ok_or("invalid workspace snapshot opacity")?;
     egl.render_surface_with_opacity(texture, plan, EglPixelSemantics::PremultipliedAlpha, opacity)
@@ -10916,7 +11072,10 @@ mod tests {
         effective_override_redirect, workspace_snapshot_eligible,
         workspace_content_eligible, contiguous_workspace_interval,
         workspace_transition_stack_plan, workspace_candidate_matches_boundary,
-        workspace_transition_progress, WorkspaceTransitionStackPlan, WorkspaceTransitionState,
+        cubic_bezier_ease, workspace_transition_progress,
+        workspace_slide_progress, WORKSPACE_SLIDE_BEZIER_X1, WORKSPACE_SLIDE_BEZIER_Y1,
+        WORKSPACE_SLIDE_BEZIER_X2, WORKSPACE_SLIDE_BEZIER_Y2,
+        WorkspaceTransitionStackPlan, WorkspaceTransitionState,
         WORKSPACE_TRANSITION_DURATION, workspace_transition_should_activate,
         candidate_workspace_render_frame, execute_pure_move_precommit_action,
         pure_move_precommit_decision, resizeonly_workspace_transition_action,
@@ -11145,6 +11304,7 @@ mod tests {
             had_workspace_content: true,
             old_stack,
             started_at,
+            slide: None,
         }
     }
 
@@ -11181,7 +11341,8 @@ mod tests {
         let frame = candidate_workspace_render_frame(
             &transition, Some(&plan), None, start + WORKSPACE_TRANSITION_DURATION / 2,
         ).unwrap();
-        assert!((frame.progress - 0.5).abs() < 0.001);
+        assert!((frame.progress - 0.875).abs() < 0.001);
+        assert!((frame.slide_progress - 0.961_383).abs() < 0.001);
         assert_ne!(frame.progress, 0.0);
     }
 
@@ -11297,7 +11458,8 @@ mod tests {
         let half = candidate_workspace_render_frame(
             &transition, Some(&destination), None, start + WORKSPACE_TRANSITION_DURATION / 2,
         ).expect("active transition has a candidate frame");
-        assert!((half.progress - 0.5).abs() < 0.001, "half-duration candidate must not reset to zero");
+        assert!((half.progress - 0.875).abs() < 0.001, "half-duration ease-out progress must not reset to zero");
+        assert!((half.slide_progress - 0.961_383).abs() < 0.001, "slide must use its own Bézier clock");
         let complete = candidate_workspace_render_frame(
             &transition, Some(&destination), None, start + WORKSPACE_TRANSITION_DURATION,
         ).expect("active transition has a candidate frame");
@@ -11502,6 +11664,33 @@ mod tests {
             RenderOutcome { workspace_progress: Some(1.0) },
             true,
         ));
+    }
+
+    #[test]
+    fn workspace_slide_bezier_has_exact_endpoints_and_aro_flat_midpoint() {
+        let bezier = |t| cubic_bezier_ease(
+            t,
+            WORKSPACE_SLIDE_BEZIER_X1,
+            WORKSPACE_SLIDE_BEZIER_Y1,
+            WORKSPACE_SLIDE_BEZIER_X2,
+            WORKSPACE_SLIDE_BEZIER_Y2,
+        );
+        assert_eq!(bezier(0.0), 0.0);
+        assert!((bezier(0.5) - 0.961_383).abs() < 0.001);
+        assert_eq!(bezier(1.0), 1.0);
+        assert_eq!(bezier(2.0), 1.0);
+    }
+
+    #[test]
+    fn workspace_slide_bezier_is_monotonic_and_keeps_fade_easing_independent() {
+        let start = Instant::now();
+        let samples = (0..=100).map(|step| {
+            workspace_slide_progress(start, start + WORKSPACE_TRANSITION_DURATION * step / 100)
+        }).collect::<Vec<_>>();
+        assert!(samples.windows(2).all(|pair| pair[0] <= pair[1]));
+        let half = start + WORKSPACE_TRANSITION_DURATION / 2;
+        assert!((workspace_transition_progress(start, half) - 0.875).abs() < 0.001);
+        assert!((workspace_slide_progress(start, half) - 0.961_383).abs() < 0.001);
     }
 
     #[test]
@@ -13607,6 +13796,7 @@ mod tests {
             enabled,
             open: OpenAnimationConfig { effect: OpenAnimationEffect::Scale, duration: Duration::from_millis(180) },
             close: crate::config::CloseAnimationConfig { enabled: false, effect: crate::config::CloseAnimationEffect::Scale, duration: Duration::from_millis(180) },
+            workspace_slide: crate::config::WorkspaceSlideConfig { enabled: false, axis: crate::config::WorkspaceSlideAxis::Horizontal },
         }
     }
 
@@ -13619,6 +13809,7 @@ mod tests {
             enabled,
             open: OpenAnimationConfig { effect, duration: Duration::from_millis(180) },
             close: crate::config::CloseAnimationConfig { enabled: false, effect: crate::config::CloseAnimationEffect::Scale, duration: Duration::from_millis(180) },
+            workspace_slide: crate::config::WorkspaceSlideConfig { enabled: false, axis: crate::config::WorkspaceSlideAxis::Horizontal },
         }
     }
 
