@@ -2215,6 +2215,37 @@ fn sample_bubble(t: f32) -> AnimationVisual {
 /// `animation.flash.color` config key (see the architecture audit,
 /// section 4/7) — color tuning is deferred until after human validation.
 pub(crate) const TELEPORT_FLASHY_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
+const WORKSPACE_TRANSITION_DURATION: Duration = Duration::from_millis(240);
+
+fn workspace_transition_progress(started_at: Instant, now: Instant) -> f32 {
+    (now.saturating_duration_since(started_at).as_secs_f32()
+        / WORKSPACE_TRANSITION_DURATION.as_secs_f32())
+        .clamp(0.0, 1.0)
+}
+
+fn workspace_transition_should_activate(
+    has_old_workspace: bool,
+    has_new_workspace: bool,
+    stack_safe: bool,
+    present_available: bool,
+) -> bool {
+    (has_old_workspace || has_new_workspace) && stack_safe && present_available
+}
+
+fn workspace_transition_render_needs_fallback(has_transition_frame: bool, render_succeeded: bool) -> bool {
+    has_transition_frame && !render_succeeded
+}
+
+fn apply_workspace_factor_to_border_alpha(plan: &mut RenderQuadPlan, factor: f32) {
+    plan.border_color[3] *= factor;
+}
+
+fn release_workspace_texture_once(released: &mut bool, release: impl FnOnce()) {
+    if !*released {
+        *released = true;
+        release();
+    }
+}
 
 /// 3a3fa2b6-r1 — "teleport_flashy" OPEN geometry: near-identity, reaches
 /// exact final state very early (by `TELEPORT_FLASHY_OPEN_GEOMETRY_END`)
@@ -2814,12 +2845,18 @@ fn eligible_for_open_animation(entry: &SurfaceEntry) -> bool {
 
 fn workspace_snapshot_eligible(entry: &SurfaceEntry) -> bool {
     matches!(entry.visual_class, SurfaceVisualClass::Normal)
-        && !entry.override_redirect
         && !entry.effective_override_redirect
-        && entry.backend == BackendCompatibility::Renderable
         && entry.map_state == xproto::MapState::VIEWABLE
         && entry.geometry.width > 0
         && entry.geometry.height > 0
+}
+
+fn workspace_content_eligible(
+    entry: &SurfaceEntry,
+    shadow_style: crate::config::ShadowConfig,
+    root: RootGeometry,
+) -> bool {
+    workspace_snapshot_eligible(entry) && entry_has_visible_contribution(entry, shadow_style, root)
 }
 
 /// Candidate-local, pure, and temporary: never touches persistent
@@ -2865,6 +2902,24 @@ fn provisional_open_animations(
         })
         .map(|entry| (entry.surface_xid, WindowAnimation::open(started_at, animation.open.effect, animation.open.duration)))
         .collect()
+}
+
+fn candidate_provisional_open_animations(
+    suppress_workspace_switch_opens: bool,
+    old_surfaces: &HashSet<Window>,
+    snapshot: &SceneSnapshot,
+    is_first_publish: bool,
+    present_available: bool,
+    animation: crate::config::AnimationConfig,
+    started_at: Instant,
+) -> HashMap<Window, WindowAnimation> {
+    if suppress_workspace_switch_opens {
+        HashMap::new()
+    } else {
+        provisional_open_animations(
+            old_surfaces, snapshot, is_first_publish, present_available, animation, started_at,
+        )
+    }
 }
 
 /// TEMPORARY FORENSIC INSTRUMENTATION — see provisional_open_animations.
@@ -3032,6 +3087,316 @@ fn reconcile_render_order(
         }
     }
     output
+}
+
+fn contiguous_workspace_interval(layers: &[bool]) -> Option<(usize, usize)> {
+    let Some(start) = layers.iter().position(|workspace| *workspace) else {
+        return Some((layers.len(), layers.len()));
+    };
+    let end = layers.iter().rposition(|workspace| *workspace)? + 1;
+    layers[start..end].iter().all(|workspace| *workspace).then_some((start, end))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceTransitionRejectReason {
+    CandidateStackInvalid,
+    GlobalProjectionMismatch,
+    InsertionBoundaryMismatch,
+    EmptyToEmpty,
+}
+
+fn workspace_global_projection(plan: &WorkspaceTransitionStackPlan) -> Vec<RenderLayer> {
+    plan.layers.iter().zip(&plan.layer_is_workspace)
+        .filter_map(|(layer, is_workspace)| (!*is_workspace).then_some(*layer))
+        .collect()
+}
+
+fn workspace_insertion_boundary_checked(
+    old: &WorkspaceTransitionStackPlan,
+    new: &WorkspaceTransitionStackPlan,
+) -> Result<usize, WorkspaceTransitionRejectReason> {
+    if workspace_global_projection(old) != workspace_global_projection(new) {
+        return Err(WorkspaceTransitionRejectReason::GlobalProjectionMismatch);
+    }
+    let old_has_workspace = old.start < old.end;
+    let new_has_workspace = new.start < new.end;
+    if !old_has_workspace && !new_has_workspace {
+        return Err(WorkspaceTransitionRejectReason::EmptyToEmpty);
+    }
+    let insertion_slot = if old_has_workspace {
+        old.layer_is_workspace[..old.start].iter().filter(|flag| !**flag).count()
+    } else {
+        // An empty old scene has no workspace insertion position. Its
+        // [len,len) placeholder must not constrain the destination.
+        new.layer_is_workspace[..new.start].iter().filter(|flag| !**flag).count()
+    };
+    let mut seen_globals = 0;
+    let mut boundary = None;
+    for (index, is_workspace) in new.layer_is_workspace.iter().enumerate() {
+        if seen_globals == insertion_slot { boundary = Some(index); break; }
+        if !*is_workspace { seen_globals += 1; }
+    }
+    if boundary.is_none() && seen_globals == insertion_slot {
+        boundary = Some(new.layer_is_workspace.len());
+    }
+    let boundary = boundary.ok_or(WorkspaceTransitionRejectReason::InsertionBoundaryMismatch)?;
+    // Any workspace layer before the old scene's global boundary means the
+    // two scenes do not share a compositing slot, even if global identities match.
+    if new.layer_is_workspace[..boundary].iter().any(|flag| *flag) { return Err(WorkspaceTransitionRejectReason::InsertionBoundaryMismatch); }
+    if new_has_workspace && new.start != boundary { return Err(WorkspaceTransitionRejectReason::InsertionBoundaryMismatch); }
+    if old_has_workspace && !new_has_workspace && new.start != boundary { return Err(WorkspaceTransitionRejectReason::InsertionBoundaryMismatch); }
+    if !old_has_workspace && new_has_workspace && new.start != boundary { return Err(WorkspaceTransitionRejectReason::InsertionBoundaryMismatch); }
+    Ok(boundary)
+}
+
+#[cfg(test)]
+fn workspace_insertion_boundary(
+    old: &WorkspaceTransitionStackPlan,
+    new: &WorkspaceTransitionStackPlan,
+) -> Option<usize> {
+    workspace_insertion_boundary_checked(old, new).ok()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RenderOutcome {
+    workspace_progress: Option<f32>,
+}
+
+fn render_outcome_for_frame(
+    workspace_progress: Option<f32>,
+    transition_render_succeeded: bool,
+) -> RenderOutcome {
+    RenderOutcome {
+        workspace_progress: transition_render_succeeded.then_some(workspace_progress).flatten(),
+    }
+}
+
+fn candidate_render_outcome_for_gate(
+    outcome: RenderOutcome,
+    accepted: bool,
+) -> Option<RenderOutcome> {
+    accepted.then_some(outcome)
+}
+
+fn workspace_frame_should_retire_after_swap(outcome: RenderOutcome, swap_succeeded: bool) -> bool {
+    swap_succeeded && outcome.workspace_progress.is_some_and(|progress| progress >= 1.0)
+}
+
+fn workspace_candidate_matches_boundary(
+    candidate_epoch: u64,
+    current_epoch: u64,
+    candidate_generation: u64,
+    boundary_generation: u64,
+) -> bool {
+    candidate_epoch == current_epoch && candidate_generation >= boundary_generation
+}
+
+fn pure_move_precommit_decision(
+    workspace_property_seen: bool,
+    workspace_correlation_matches: bool,
+) -> PureMovePrecommitAction {
+    if workspace_property_seen || !workspace_correlation_matches {
+        PureMovePrecommitAction::Retry(SceneInvalidation::Hierarchy)
+    } else {
+        PureMovePrecommitAction::Rebase
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PureMovePrecommitAction {
+    Retry(SceneInvalidation),
+    Rebase,
+}
+
+// This is the sole policy/action seam through which the pure-move rebase
+// operation is allowed to run.  Keeping the action executable makes the
+// correlation rule testable at the same seam that guards the production call.
+fn execute_pure_move_precommit_action<T>(
+    action: PureMovePrecommitAction,
+    rebase: impl FnOnce() -> T,
+) -> Result<T, GateDecision> {
+    match action {
+        PureMovePrecommitAction::Retry(invalidation) => {
+            Err(GateDecision::Retry(invalidation))
+        }
+        PureMovePrecommitAction::Rebase => Ok(rebase()),
+    }
+}
+
+fn candidate_workspace_render_frame(
+    transition: &WorkspaceTransitionState,
+    candidate_plan: Option<&WorkspaceTransitionStackPlan>,
+    candidate_pending_started_at: Option<Instant>,
+    render_now: Instant,
+) -> Option<WorkspaceRenderFrame> {
+    let stack = candidate_plan?;
+    let (animation_now, progress) = match transition.started_at {
+        // A pending activation owns a candidate-local T0.  Every render
+        // before publication deliberately remains its first frame.
+        None => {
+            let pending_started_at = candidate_pending_started_at?;
+            (pending_started_at, 0.0)
+        }
+        // Once active, candidates use a fresh render clock and never reset
+        // the persistent transition back to its starting instant.
+        Some(started_at) => (
+            render_now,
+            workspace_transition_progress(started_at, render_now),
+        ),
+    };
+    Some(WorkspaceRenderFrame {
+        texture: transition.snapshot.texture,
+        stack: Rc::new(stack.clone()),
+        old_closing_ids: Rc::clone(&transition.old_closing_ids),
+        progress,
+        animation_now,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizeOnlyWorkspaceTransitionAction {
+    Fallback,
+    NoTransition,
+    PreserveActive,
+}
+
+// Resize-only is not allowed to cross a workspace-publication boundary.  A
+// pending capture also has candidate-local activation semantics that this
+// specialized path cannot publish, so it falls back to the structural path.
+fn resizeonly_workspace_transition_action(
+    workspace_publication_pending: bool,
+    workspace_rebuild_pending: bool,
+    transition_started_at: Option<Option<Instant>>,
+    transition_epoch_matches: bool,
+) -> ResizeOnlyWorkspaceTransitionAction {
+    if workspace_publication_pending || workspace_rebuild_pending || !transition_epoch_matches {
+        ResizeOnlyWorkspaceTransitionAction::Fallback
+    } else {
+        match transition_started_at {
+            None => ResizeOnlyWorkspaceTransitionAction::NoTransition,
+            Some(None) => ResizeOnlyWorkspaceTransitionAction::Fallback,
+            Some(Some(_)) => ResizeOnlyWorkspaceTransitionAction::PreserveActive,
+        }
+    }
+}
+
+fn resizeonly_active_transition_plan(
+    transition: &WorkspaceTransitionState,
+    snapshot: &SceneSnapshot,
+    render_order: &[RenderLayer],
+    closing_visuals: &HashMap<u64, ClosingVisual>,
+    shadow_style: crate::config::ShadowConfig,
+) -> Option<WorkspaceTransitionStackPlan> {
+    let plan = workspace_transition_stack_plan(
+        snapshot,
+        render_order,
+        closing_visuals,
+        &HashMap::new(),
+        shadow_style,
+        Some(transition.old_stack.start),
+    )?;
+    workspace_insertion_boundary_checked(&transition.old_stack, &plan).ok()?;
+    Some(plan)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceTransitionCommitAction {
+    Activate,
+    PreserveActive,
+    Cancel,
+}
+
+fn workspace_transition_commit_action(
+    candidate_plan: Option<&WorkspaceTransitionStackPlan>,
+    candidate_pending_started_at: Option<Instant>,
+    transition_started_at: Option<Instant>,
+    transition_had_workspace_content: bool,
+) -> WorkspaceTransitionCommitAction {
+    match (candidate_plan, candidate_pending_started_at, transition_started_at) {
+        (Some(plan), Some(_), _) if transition_had_workspace_content || plan.start < plan.end => {
+            WorkspaceTransitionCommitAction::Activate
+        }
+        (Some(_), None, Some(_)) => WorkspaceTransitionCommitAction::PreserveActive,
+        _ => WorkspaceTransitionCommitAction::Cancel,
+    }
+}
+
+fn schedule_workspace_publication(generation: u64) -> (u64, Option<u64>) {
+    match generation.checked_add(1) {
+        Some(next) => (next, Some(next)),
+        None => (generation, None),
+    }
+}
+
+fn next_workspace_epoch(epoch: u64) -> Option<u64> {
+    epoch.checked_add(1)
+}
+
+fn workspace_publication_candidate_matches(
+    publication: &WorkspacePublicationState,
+    candidate_identity: Option<&Rc<()>>,
+    generation: u64,
+) -> bool {
+    candidate_identity.is_some_and(|identity| Rc::ptr_eq(identity, &publication.identity))
+        && publication.boundary_generation.is_none_or(|boundary| generation >= boundary)
+}
+
+fn workspace_publication_consumed_on_commit(
+    publication: &WorkspacePublicationState,
+    candidate_identity: Option<&Rc<()>>,
+    generation: u64,
+) -> bool {
+    workspace_publication_candidate_matches(publication, candidate_identity, generation)
+}
+
+fn captured_workspace_closing_ids(rendered_layers: &[RenderLayer]) -> HashSet<u64> {
+    rendered_layers.iter().filter_map(|layer| match *layer {
+        RenderLayer::Closing(id) => Some(id),
+        RenderLayer::Live(_) => None,
+    }).collect()
+}
+
+fn workspace_transition_stack_plan(
+    snapshot: &SceneSnapshot,
+    render_order: &[RenderLayer],
+    closing_committed: &HashMap<u64, ClosingVisual>,
+    closing_provisional: &HashMap<u64, ProvisionalClosingFrame>,
+    shadow_style: crate::config::ShadowConfig,
+    empty_insertion_hint: Option<usize>,
+) -> Option<WorkspaceTransitionStackPlan> {
+    let mut entries = snapshot.entries.iter();
+    let mut flags = Vec::with_capacity(render_order.len());
+    for layer in render_order {
+        match *layer {
+            RenderLayer::Live(xid) => {
+                let entry = entries.next()?;
+                if entry.surface_xid != xid {
+                    return None;
+                }
+                flags.push(workspace_content_eligible(entry, shadow_style, snapshot.root_geometry));
+            }
+            RenderLayer::Closing(id) => {
+                let workspace_content = closing_committed.get(&id).map(|visual| visual.workspace_content)
+                    .or_else(|| closing_provisional.get(&id).map(|frame| frame.workspace_content))?;
+                flags.push(workspace_content);
+            }
+        }
+    }
+    if entries.next().is_some() {
+        return None;
+    }
+    let (mut start, mut end) = contiguous_workspace_interval(&flags)?;
+    if start == end {
+        let insertion = empty_insertion_hint.unwrap_or(render_order.len()).min(render_order.len());
+        start = insertion;
+        end = insertion;
+    }
+    Some(WorkspaceTransitionStackPlan {
+        start,
+        end,
+        layer_is_workspace: flags,
+        layers: render_order.to_vec(),
+    })
 }
 
 /// 3a3fa2b5 — transactional `close_id` allocation, factored out as a pure
@@ -4441,7 +4806,6 @@ struct SurfaceResourceBundle<'a> {
     egl: Option<Rc<std::cell::RefCell<EglImportedSurface>>>,
 }
 
-#[allow(dead_code)]
 struct WorkspaceSnapshot {
     texture: u32,
     width: u16,
@@ -4455,10 +4819,9 @@ impl WorkspaceSnapshot {
     }
 
     fn destroy(&mut self) {
-        if !self.released {
-            self.released = true;
+        release_workspace_texture_once(&mut self.released, || {
             crate::graphics::renderer::delete_texture(self.texture);
-        }
+        });
     }
 
     fn disarm(&mut self) {
@@ -4476,11 +4839,39 @@ impl Drop for WorkspaceSnapshot {
     }
 }
 
-#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceTransitionStackPlan {
+    start: usize,
+    end: usize,
+    layer_is_workspace: Vec<bool>,
+    layers: Vec<RenderLayer>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceRenderFrame {
+    texture: u32,
+    stack: Rc<WorkspaceTransitionStackPlan>,
+    old_closing_ids: Rc<HashSet<u64>>,
+    progress: f32,
+    animation_now: Instant,
+}
+
 struct WorkspaceTransitionState {
-    from_desktop: u32,
-    to_desktop: u32,
+    epoch: u64,
+    boundary_generation: u64,
     snapshot: WorkspaceSnapshot,
+    old_stack: WorkspaceTransitionStackPlan,
+    stack_plan: Rc<WorkspaceTransitionStackPlan>,
+    old_closing_ids: Rc<HashSet<u64>>,
+    had_workspace_content: bool,
+    started_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspacePublicationState {
+    epoch: u64,
+    boundary_generation: Option<u64>,
+    identity: Rc<()>,
 }
 
 /// 3a3fa2b5 — single-owner RAII for one compositor-owned GPU texture (see
@@ -5444,6 +5835,9 @@ struct SceneSession<'a> {
     visual_atoms: VisualAtoms,
     last_current_desktop: Option<u32>,
     workspace_transition: Option<WorkspaceTransitionState>,
+    workspace_transition_epoch: u64,
+    workspace_publication: Option<WorkspacePublicationState>,
+    workspace_rebuild_pending: bool,
     active_window: Option<Window>,
     active_window_initialized: bool,
     urgency: HashMap<Window, CachedClientVisualState>,
@@ -5515,6 +5909,12 @@ struct SceneCandidate<'a> {
     provisional_render_order: Vec<RenderLayer>,
     provisional_closing_frames: HashMap<u64, ProvisionalClosingFrame>,
     next_close_id_after: u64,
+    workspace_transition_epoch: Option<u64>,
+    workspace_publication_identity: Option<Rc<()>>,
+    workspace_transition_plan: Option<WorkspaceTransitionStackPlan>,
+    workspace_transition_started_at: Option<Instant>,
+    suppress_workspace_switch_opens: bool,
+    render_outcome: RenderOutcome,
 }
 
 struct SceneStructureWatches<'a> {
@@ -5764,6 +6164,9 @@ impl<'a> SceneSession<'a> {
             visual_atoms,
             last_current_desktop: read_current_desktop(connection, root, workspace_atoms.current_desktop),
             workspace_transition: None,
+            workspace_transition_epoch: 0,
+            workspace_publication: None,
+            workspace_rebuild_pending: false,
             active_window: None,
             active_window_initialized: false,
             urgency: HashMap::new(),
@@ -5838,12 +6241,11 @@ impl<'a> SceneSession<'a> {
         Ok(())
     }
 
-    fn capture_workspace_snapshot(&mut self) -> Result<WorkspaceSnapshot, Box<dyn Error>> {
+    fn capture_workspace_snapshot(&mut self) -> Result<(WorkspaceSnapshot, HashSet<u64>), Box<dyn Error>> {
         let mut snapshot = self.current_snapshot().clone();
         let root_geometry = snapshot.root_geometry;
         snapshot.entries.retain(|entry| {
-            workspace_snapshot_eligible(entry)
-                && entry_has_visible_contribution(entry, self.shadow_style, root_geometry)
+            workspace_content_eligible(entry, self.shadow_style, root_geometry)
         });
         let live_order: HashSet<Window> = snapshot.entries.iter().map(|entry| entry.surface_xid).collect();
         let render_order = self
@@ -5883,15 +6285,23 @@ impl<'a> SceneSession<'a> {
                 &self.closing_visuals,
                 &provisional,
                 &self.egl_surfaces,
+                None,
             );
             drop(target);
-            result
+            result.map(|_| ())
         };
         if let Err(error) = result {
             return Err(error);
         }
+        // This set is derived from the exact closing layers submitted to the
+        // successful capture render, not from a broader later stack estimate.
+        let captured_closing_ids = captured_workspace_closing_ids(&render_order);
         debug_assert_eq!(resource.dimensions(), (width, height));
-        Ok(resource)
+        Ok((resource, captured_closing_ids))
+    }
+
+    fn cancel_workspace_transition(&mut self) {
+        self.workspace_transition.take();
     }
 
     fn observe_current_desktop(&mut self, event: &Event) {
@@ -5906,29 +6316,62 @@ impl<'a> SceneSession<'a> {
             WorkspaceDesktopObservation::Initialize(current) => self.last_current_desktop = Some(current),
             WorkspaceDesktopObservation::Unchanged => {}
             WorkspaceDesktopObservation::Changed { from, to } => {
-                let capture = self.capture_workspace_snapshot();
-                let (last, transition_active) = workspace_state_after_capture(
-                    self.last_current_desktop,
-                    to,
-                    capture.is_ok(),
-                    self.workspace_transition.is_some(),
+                let next_epoch = next_workspace_epoch(self.workspace_transition_epoch);
+                if let Some(epoch) = next_epoch {
+                    self.workspace_transition_epoch = epoch;
+                } else {
+                    // Keep the saturated identity; publication candidates are
+                    // still locally scoped by their captured pending marker.
+                    self.cancel_workspace_transition();
+                }
+                let epoch = self.workspace_transition_epoch;
+                self.last_current_desktop = Some(to);
+                let (generation, boundary_generation) = schedule_workspace_publication(self.structural_generation);
+                self.structural_generation = generation;
+                self.scheduler.mark_structural_dirty(generation);
+                self.workspace_rebuild_pending = true;
+                self.workspace_publication = Some(WorkspacePublicationState {
+                    epoch,
+                    boundary_generation,
+                    identity: Rc::new(()),
+                });
+                // PropertyNotify is itself structural work, even when i3
+                // produces no useful Map/Unmap event (notably empty -> empty).
+                if next_epoch.is_none() || boundary_generation.is_none() {
+                    self.workspace_transition = None;
+                    return;
+                }
+                let old_stack = workspace_transition_stack_plan(
+                    self.current_snapshot(),
+                    &self.render_order,
+                    &self.closing_visuals,
+                    &HashMap::new(),
+                    self.shadow_style,
+                    None,
                 );
-                self.last_current_desktop = last;
-                match capture {
-                    Ok(snapshot) if transition_active => {
+                let capture = if old_stack.is_some() {
+                    self.capture_workspace_snapshot()
+                } else {
+                    Err("published render stack has no safe workspace mapping".into())
+                };
+                match (capture, old_stack) {
+                    (Ok((snapshot, captured_closing_ids)), Some(old_stack)) => {
                         self.workspace_transition = Some(WorkspaceTransitionState {
-                            from_desktop: from,
-                            to_desktop: to,
+                            epoch,
+                            boundary_generation: boundary_generation.expect("checked above"),
                             snapshot,
+                            stack_plan: Rc::new(old_stack.clone()),
+                            old_closing_ids: Rc::new(captured_closing_ids),
+                            had_workspace_content: old_stack.start < old_stack.end,
+                            old_stack,
+                            started_at: None,
                         });
                     }
-                    Ok(_) => {
-                        self.workspace_transition = None;
-                    }
-                    Err(error) => {
+                    (Err(error), _) => {
                         eprintln!("WORKSPACE_SNAPSHOT_FAILED from={from} to={to}: {error}");
                         self.workspace_transition = None;
                     }
+                    _ => unreachable!("workspace capture requires a safe source stack"),
                 }
             }
         }
@@ -6045,7 +6488,7 @@ impl<'a> SceneSession<'a> {
                         .snapshot
                         .as_ref()
                         .and_then(|live| live.entries.iter().find(|entry| entry.surface_xid == source_xid))
-                        .is_some_and(workspace_snapshot_eligible),
+                        .is_some_and(|entry| workspace_content_eligible(entry, self.shadow_style, snapshot.root_geometry)),
                 },
             );
         }
@@ -6186,7 +6629,20 @@ impl<'a> SceneSession<'a> {
             .as_ref()
             .map(|live| live.entries.iter().map(|entry| entry.surface_xid).collect())
             .unwrap_or_default();
-        let provisional_animations = provisional_open_animations(
+        let workspace_transition = self.workspace_transition.as_ref().filter(|transition| {
+            workspace_candidate_matches_boundary(
+                transition.epoch, self.workspace_transition_epoch, generation,
+                transition.boundary_generation,
+            )
+        });
+        let workspace_publication = self.workspace_publication.as_ref()
+            .filter(|publication| publication.epoch == self.workspace_transition_epoch)
+            .filter(|publication| publication.boundary_generation.is_none_or(|boundary| generation >= boundary))
+            .cloned();
+        let workspace_publication_identity = workspace_publication.map(|publication| publication.identity);
+        let suppress_workspace_switch_opens = workspace_publication_identity.is_some();
+        let provisional_animations = candidate_provisional_open_animations(
+            suppress_workspace_switch_opens,
             &old_surfaces,
             &snapshot,
             is_first_publish,
@@ -6202,6 +6658,49 @@ impl<'a> SceneSession<'a> {
         let removed_surfaces: HashSet<Window> = old_surfaces.difference(&new_surface_ids).copied().collect();
         let (provisional_render_order, provisional_closing_frames, next_close_id_after) =
             self.build_provisional_closing_state(&snapshot, &removed_surfaces);
+        let (workspace_transition_plan, workspace_reject_reason) =
+            if let Some(transition) = workspace_transition {
+            match workspace_transition_stack_plan(
+                &snapshot,
+                &provisional_render_order,
+                &self.closing_visuals,
+                &provisional_closing_frames,
+                self.shadow_style,
+                Some(transition.old_stack.start),
+            ) {
+                None => (None, Some(WorkspaceTransitionRejectReason::CandidateStackInvalid)),
+                Some(plan) => match workspace_insertion_boundary_checked(&transition.old_stack, &plan) {
+                    Ok(_) => (Some(plan), None),
+                    Err(reason) => (None, Some(reason)),
+                },
+            }
+        } else {
+            (None, None)
+        };
+        let transition_empty_to_empty = workspace_transition.is_some_and(|transition| {
+            !transition.had_workspace_content
+                && workspace_transition_plan.as_ref().is_some_and(|plan| plan.start == plan.end)
+        }) || workspace_reject_reason == Some(WorkspaceTransitionRejectReason::EmptyToEmpty);
+        let workspace_activation = workspace_transition.is_some_and(|transition| {
+            workspace_transition_should_activate(
+                transition.had_workspace_content,
+                workspace_transition_plan.as_ref().is_some_and(|plan| plan.start < plan.end),
+                workspace_transition_plan.is_some() && !transition_empty_to_empty,
+                self.present.is_some(),
+            )
+        });
+        let workspace_transition_started_at = workspace_transition
+            .filter(|transition| transition.started_at.is_none())
+            .filter(|_| workspace_activation)
+            .map(|_| Instant::now());
+        let workspace_render_frame = workspace_transition
+            .filter(|_| !transition_empty_to_empty)
+            .and_then(|transition| candidate_workspace_render_frame(
+                transition,
+                workspace_transition_plan.as_ref(),
+                workspace_transition_started_at,
+                Instant::now(),
+            ));
         let mut pixmaps = Vec::new();
         let mut damage_leases = Vec::new();
         let mut damage_registry = HashMap::new();
@@ -6318,13 +6817,14 @@ impl<'a> SceneSession<'a> {
         // persistent — so a newly eligible surface can never be swapped
         // visible at full opacity/scale before its animation exists.
         let render_animations = merge_window_animations(&self.window_animations, &provisional_animations);
-        self.render_egl_scene(
+        let render_outcome = self.render_egl_scene_with_workspace(
             &snapshot,
             &egl_surfaces,
             &pixmaps,
             &render_animations,
             &provisional_render_order,
             &provisional_closing_frames,
+            workspace_render_frame.as_ref(),
         )?;
         self.diagnostics.last_candidate_resize = replaced_existing_resource;
         if replaced_existing_resource { self.diagnostics.resize_candidate_started += 1; }
@@ -6346,6 +6846,12 @@ impl<'a> SceneSession<'a> {
             provisional_render_order,
             provisional_closing_frames,
             next_close_id_after,
+            workspace_transition_epoch: Some(self.workspace_transition_epoch),
+            workspace_publication_identity,
+            workspace_transition_plan,
+            workspace_transition_started_at,
+            suppress_workspace_switch_opens,
+            render_outcome,
         })
     }
 
@@ -6357,6 +6863,12 @@ impl<'a> SceneSession<'a> {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
             };
+            let workspace_property = matches!(&event, Event::PropertyNotify(property)
+                if property.window == self.root && property.atom == self.workspace_atoms.current_desktop);
+            self.observe_current_desktop(&event);
+            if workspace_property {
+                return Ok(Some(SceneInvalidation::Hierarchy));
+            }
             self.note_destroy_intent(&event);
             self.diagnostics.record_configure(&event, candidate);
             let geometry_source = geometry_event_source(&event, candidate);
@@ -6460,11 +6972,17 @@ impl<'a> SceneSession<'a> {
                     return Err(error);
                 }
             };
+            let candidate_swap_outcome = candidate_render_outcome_for_gate(
+                candidate.render_outcome,
+                matches!(&gate, GateDecision::Accept),
+            );
             match gate {
                 GateDecision::Accept => {
                     self.diagnostics.structural_candidates_published += 1;
                     if self.diagnostics.last_candidate_resize { self.diagnostics.resize_candidate_published += 1; }
-                    if let Err(error) = self.commit_candidate(candidate) {
+                    let swap_outcome = candidate_swap_outcome
+                        .expect("accepted candidate must own its rendered frame outcome");
+                    if let Err(error) = self.commit_candidate(candidate, swap_outcome) {
                         self.diagnostics.record_structural_terminal(false, false, false);
                         return Err(error);
                     }
@@ -6518,6 +7036,7 @@ impl<'a> SceneSession<'a> {
         self.connection.inner.get_input_focus()?.reply()?;
         let mut batch = InvalidationBatch::default();
         let mut drained = 0;
+        let mut workspace_property_seen = false;
         for _ in 0..MAX_EVENTS_PER_BATCH {
             let Some(event) = self.connection.inner.poll_for_event()? else {
                 break;
@@ -6536,6 +7055,10 @@ impl<'a> SceneSession<'a> {
             } else {
                 None
             };
+            let workspace_property = matches!(&event, Event::PropertyNotify(property)
+                if property.window == self.root && property.atom == self.workspace_atoms.current_desktop);
+            workspace_property_seen |= workspace_property;
+            self.observe_current_desktop(&event);
             let invalidation = if is_background_property_notify(&event, self.root, self.background_atoms) {
                 SceneInvalidation::Background
             } else if let Some(invalidation) = visual_invalidation {
@@ -6561,31 +7084,84 @@ impl<'a> SceneSession<'a> {
         let deferred_damage = batch.pixel_damage().clone();
         let ownership_verified = self.verify_ownership().is_ok();
         if !ownership_verified {
-            return Ok((gate_decision_after_batch(
+            let decision = gate_decision_after_batch(
                 batch_decision,
                 bounded_batch_requires_retry(drained),
                 false,
                 false,
-            ), deferred_damage));
+            );
+            return Ok((decision, deferred_damage));
         }
         let signal_pending = self.signal.poll_shutdown_pending()?;
-        if !signal_pending
+        let pure_move_candidate = !signal_pending
             && !batch.hierarchy
             && !batch.background
             && !batch.visual_state
             && !bounded_batch_requires_retry(drained)
-            && batch.geometry.is_some()
-            && self.rebase_candidate_pure_move(candidate, batch.move_geometry())?
-        {
-            self.attempted_structural_generation = self.structural_generation;
-            return Ok((GateDecision::Accept, deferred_damage));
+            && batch.geometry.is_some();
+        if pure_move_candidate {
+            let publication_matches = self.workspace_publication.as_ref().is_none_or(|publication| {
+                workspace_publication_candidate_matches(
+                    publication,
+                    candidate.workspace_publication_identity.as_ref(),
+                    candidate.generation,
+                )
+            });
+            let transition_matches = self.workspace_transition.as_ref().is_none_or(|transition| {
+                workspace_candidate_matches_boundary(
+                    transition.epoch,
+                    self.workspace_transition_epoch,
+                    candidate.generation,
+                    transition.boundary_generation,
+                )
+            });
+            let correlated = candidate.workspace_transition_epoch == Some(self.workspace_transition_epoch)
+                && publication_matches
+                && transition_matches;
+            match execute_pure_move_precommit_action(
+                pure_move_precommit_decision(workspace_property_seen, correlated),
+                || self.rebase_candidate_pure_move(candidate, batch.move_geometry()),
+            ) {
+                Err(GateDecision::Retry(invalidation)) => {
+                    return Ok((GateDecision::Retry(invalidation), deferred_damage));
+                }
+                Ok(Ok(rebased)) => {
+                    if rebased {
+                        self.attempted_structural_generation = self.structural_generation;
+                        return Ok((GateDecision::Accept, deferred_damage));
+                    }
+                }
+                Err(GateDecision::Shutdown(_)) => unreachable!("pure-move workspace policy has no shutdown decision"),
+                Err(GateDecision::Accept) => unreachable!("pure-move rebase action cannot reject as Accept"),
+                Ok(Err(error)) => return Err(error),
+            }
         }
-        let decision = candidate_gate_decision(
+        let mut decision = candidate_gate_decision(
             batch_decision,
             bounded_batch_requires_retry(drained),
             true,
             signal_pending,
         );
+        let stale_epoch = candidate.workspace_transition_epoch != Some(self.workspace_transition_epoch);
+        if !matches!(decision, GateDecision::Shutdown(_))
+            && (stale_epoch
+            || self.workspace_publication.as_ref().is_some_and(|publication| {
+                !workspace_publication_candidate_matches(publication, candidate.workspace_publication_identity.as_ref(), candidate.generation)
+            })
+            || self.workspace_transition.as_ref().is_some_and(|transition| {
+                !workspace_candidate_matches_boundary(
+                    transition.epoch,
+                    self.workspace_transition_epoch,
+                    candidate.generation,
+                    transition.boundary_generation,
+                )
+            }))
+        {
+            decision = GateDecision::Retry(SceneInvalidation::Hierarchy);
+        }
+        if workspace_property_seen {
+            decision = GateDecision::Retry(SceneInvalidation::Hierarchy);
+        }
         Ok((decision, deferred_damage))
     }
 
@@ -6656,25 +7232,41 @@ impl<'a> SceneSession<'a> {
         let previous_client_root = candidate_entry.client_root_geometry;
         rebase_candidate_geometry_fields(&mut candidate.snapshot.entries[candidate_index], update);
         let render_animations = merge_window_animations(&self.window_animations, &candidate.provisional_animations);
-        let render_result = self.render_egl_scene(
+        let workspace_render_frame = self.workspace_transition.as_ref().and_then(|transition| {
+            candidate_workspace_render_frame(
+                transition,
+                candidate.workspace_transition_plan.as_ref(),
+                candidate.workspace_transition_started_at,
+                Instant::now(),
+            )
+        });
+        let render_result = self.render_egl_scene_with_workspace(
             &candidate.snapshot,
             &candidate.egl_surfaces,
             &candidate.pixmaps,
             &render_animations,
             &candidate.provisional_render_order,
             &candidate.provisional_closing_frames,
+            workspace_render_frame.as_ref(),
         );
-        if let Err(error) = render_result {
-            candidate.snapshot.entries[candidate_index].geometry = previous_geometry;
-            candidate.snapshot.entries[candidate_index].client_root_geometry = previous_client_root;
-            return Err(error);
+        match render_result {
+            Ok(outcome) => candidate.render_outcome = outcome,
+            Err(error) => {
+                candidate.snapshot.entries[candidate_index].geometry = previous_geometry;
+                candidate.snapshot.entries[candidate_index].client_root_geometry = previous_client_root;
+                return Err(error);
+            }
         }
         Ok(true)
     }
 
-    fn commit_candidate(&mut self, candidate: SceneCandidate<'a>) -> Result<(), Box<dyn Error>> {
+    fn commit_candidate(
+        &mut self,
+        candidate: SceneCandidate<'a>,
+        render_outcome: RenderOutcome,
+    ) -> Result<(), Box<dyn Error>> {
         let additions = candidate.watch_additions.clone();
-        let result = self.commit_candidate_inner(candidate);
+        let result = self.commit_candidate_inner(candidate, render_outcome);
         if result.is_err() {
             if let Err(error) = self.structure_watches.rollback(&additions) {
                 eprintln!("candidate watch rollback failed: {error}");
@@ -6686,9 +7278,14 @@ impl<'a> SceneSession<'a> {
     fn commit_candidate_inner(
         &mut self,
         candidate: SceneCandidate<'a>,
+        render_outcome: RenderOutcome,
     ) -> Result<(), Box<dyn Error>> {
-        self.timed_swap()?;
+        debug_assert!(!candidate.suppress_workspace_switch_opens || candidate.provisional_animations.is_empty());
+        self.timed_swap(render_outcome)?;
         self.state = SceneState::ScenePresented;
+        let candidate_transition_epoch = candidate.workspace_transition_epoch;
+        let candidate_transition_plan = candidate.workspace_transition_plan.clone();
+        let candidate_transition_started_at = candidate.workspace_transition_started_at;
         let old_surfaces = self
             .snapshot
             .as_ref()
@@ -6840,6 +7437,46 @@ impl<'a> SceneSession<'a> {
             .into_iter()
             .filter(|layer| !matches!(layer, RenderLayer::Closing(id) if failed_close_ids.contains(id)))
             .collect();
+        let consumed_publication_epoch = self.workspace_publication.as_ref().and_then(|publication| {
+            workspace_publication_consumed_on_commit(
+                publication,
+                candidate.workspace_publication_identity.as_ref(),
+                candidate.generation,
+            ).then_some(publication.epoch)
+        });
+        if consumed_publication_epoch.is_some() {
+            self.workspace_publication = None;
+            self.workspace_rebuild_pending = false;
+        }
+        let mut cancel_transition_after_commit = false;
+        if candidate_transition_epoch == Some(self.workspace_transition_epoch) {
+            if let Some(transition) = self.workspace_transition.as_mut() {
+                match workspace_transition_commit_action(
+                    candidate_transition_plan.as_ref(),
+                    candidate_transition_started_at,
+                    transition.started_at,
+                    transition.had_workspace_content,
+                ) {
+                    WorkspaceTransitionCommitAction::Activate => {
+                        let plan = candidate_transition_plan
+                            .expect("activate action requires a candidate transition plan");
+                        let started_at = candidate_transition_started_at
+                            .expect("activate action requires a candidate activation time");
+                        transition.stack_plan = Rc::new(plan);
+                        transition.started_at = Some(started_at);
+                    }
+                    WorkspaceTransitionCommitAction::PreserveActive => {
+                        let plan = candidate_transition_plan
+                            .expect("preserve-active action requires a candidate transition plan");
+                        transition.stack_plan = Rc::new(plan);
+                    }
+                    WorkspaceTransitionCommitAction::Cancel => cancel_transition_after_commit = true,
+                }
+            }
+        }
+        if cancel_transition_after_commit {
+            self.cancel_workspace_transition();
+        }
         self.next_close_id = candidate.next_close_id_after;
         drop(removed_surfaces);
         drop(old_resources);
@@ -6884,7 +7521,7 @@ impl<'a> SceneSession<'a> {
     /// TEMPORARY FORENSIC INSTRUMENTATION — behaviorally identical to
     /// calling `self.egl...swap()` directly; only adds a count+timing
     /// sample. Remove before release.
-    fn timed_swap(&mut self) -> Result<(), Box<dyn Error>> {
+    fn timed_swap(&mut self, outcome: RenderOutcome) -> Result<(), Box<dyn Error>> {
         let start = Instant::now();
         let result = self
             .egl
@@ -6893,6 +7530,10 @@ impl<'a> SceneSession<'a> {
             .swap();
         self.perf.egl_swaps += 1;
         self.perf.swap.record(start.elapsed());
+        let completed_workspace_frame = workspace_frame_should_retire_after_swap(outcome, result.is_ok());
+        if completed_workspace_frame {
+            self.cancel_workspace_transition();
+        }
         result
     }
 
@@ -7012,7 +7653,12 @@ impl<'a> SceneSession<'a> {
             }
             let had_pending_work = pending_work_requires_iteration(&pending)
                 || self.pending_background
-                || self.pending_visual_state;
+                || self.pending_visual_state
+                || self.workspace_rebuild_pending;
+            if self.workspace_rebuild_pending {
+                batch.note_hierarchy_source(HierarchyEventSource::ExistingHierarchyMerge);
+                batch.push(SceneInvalidation::Hierarchy);
+            }
             if matches!(
                 structural_generation_state(
                     self.structural_generation,
@@ -7159,13 +7805,16 @@ impl<'a> SceneSession<'a> {
                 // exactly the "Present completion + animation exists +
                 // decision == Ignore" tick, and it never touches Damage.
                 SceneInvalidation::Ignore => {
-                    if !self.window_animations.is_empty() || !self.closing_visuals.is_empty() {
+                    if !self.window_animations.is_empty()
+                        || !self.closing_visuals.is_empty()
+                        || self.workspace_transition.as_ref().is_some_and(|transition| transition.started_at.is_some())
+                    {
                         // TEMPORARY FORENSIC INSTRUMENTATION — only while
                         // animations are active, remove before release.
                         println!("OPEN_ANIM_TICK active={}", self.window_animations.len());
                         self.perf.animation_only_recomposes += 1;
-                        self.full_recompose_current()?;
-                        self.timed_swap()?;
+                        let outcome = self.full_recompose_current()?;
+                        self.timed_swap(outcome)?;
                     }
                 }
                 SceneInvalidation::Shutdown(reason) => {
@@ -7218,11 +7867,11 @@ impl<'a> SceneSession<'a> {
                     if resizeonly_succeeded {
                         self.diagnostics.record_final_resize_selection(batch.present_history, false);
                         self.diagnostics.resizeonly_present_deferred = None;
-                    } else if self.try_move_only(window, batch.move_geometry(), &batch_pixel_damage)? {
+                    } else if let Some(render_outcome) = self.try_move_only(window, batch.move_geometry(), &batch_pixel_damage)? {
                         self.pending_damage.clear();
                         self.pending_background = false;
                         self.pending_visual_state = false;
-                        self.timed_swap()?;
+                        self.timed_swap(render_outcome)?;
                     } else {
                         self.observe_invalidation(SceneInvalidation::Geometry(window));
                         self.pending_background = false;
@@ -7254,13 +7903,13 @@ impl<'a> SceneSession<'a> {
                 SceneInvalidation::Background => {
                     self.pending_background = false;
                     self.refresh_background()?;
-                    self.full_recompose_current()?;
-                    self.timed_swap()?;
+                    let outcome = self.full_recompose_current()?;
+                    self.timed_swap(outcome)?;
                 }
                 SceneInvalidation::VisualState => {
                     self.pending_visual_state = false;
-                    self.full_recompose_current()?;
-                    self.timed_swap()?;
+                    let outcome = self.full_recompose_current()?;
+                    self.timed_swap(outcome)?;
                 }
                 SceneInvalidation::PixelDamage(_) => {
                     self.recompose_current_scene(batch.pixel_damage().clone())?;
@@ -7355,6 +8004,17 @@ impl<'a> SceneSession<'a> {
                 return Ok(false);
             }};
         }
+        let workspace_action = resizeonly_workspace_transition_action(
+            self.workspace_publication.is_some(),
+            self.workspace_rebuild_pending,
+            self.workspace_transition.as_ref().map(|transition| transition.started_at),
+            self.workspace_transition.as_ref().is_none_or(|transition| {
+                transition.epoch == self.workspace_transition_epoch
+            }),
+        );
+        if workspace_action == ResizeOnlyWorkspaceTransitionAction::Fallback {
+            resizeonly_fallback!(ResizeOnlyFallbackReason::UnavailableState);
+        }
         if previous.override_redirect != update.override_redirect {
             resizeonly_fallback!(ResizeOnlyFallbackReason::IdentityMismatch);
         }
@@ -7387,6 +8047,24 @@ impl<'a> SceneSession<'a> {
         if let Some(start) = pre_acquire_start {
             self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::PreAcquire, start.elapsed());
         }
+        let workspace_transition_plan = match workspace_action {
+            ResizeOnlyWorkspaceTransitionAction::PreserveActive => {
+                let transition = self.workspace_transition.as_ref()
+                    .expect("active resize-only action requires a workspace transition");
+                let Some(plan) = resizeonly_active_transition_plan(
+                    transition,
+                    &snapshot,
+                    &self.render_order,
+                    &self.closing_visuals,
+                    self.shadow_style,
+                ) else {
+                    resizeonly_fallback!(ResizeOnlyFallbackReason::Hierarchy);
+                };
+                Some(plan)
+            }
+            ResizeOnlyWorkspaceTransitionAction::NoTransition => None,
+            ResizeOnlyWorkspaceTransitionAction::Fallback => unreachable!("fallback returned above"),
+        };
 
         let semantics = self.visual_formats.semantics(previous.visual, previous.depth);
         if semantics == EglPixelSemantics::Unsupported {
@@ -7481,10 +8159,32 @@ impl<'a> SceneSession<'a> {
             provisional_render_order: self.render_order.clone(),
             provisional_closing_frames: HashMap::new(),
             next_close_id_after: self.next_close_id,
+            workspace_transition_epoch: Some(self.workspace_transition_epoch),
+            workspace_publication_identity: None,
+            workspace_transition_plan,
+            workspace_transition_started_at: None,
+            suppress_workspace_switch_opens: false,
+            render_outcome: RenderOutcome::default(),
         };
         let target_build_start = self.diagnostics.enabled.then(Instant::now);
         let render_animations = self.window_animations.clone();
-        self.render_egl_scene(&candidate.snapshot, &candidate.egl_surfaces, &candidate.pixmaps, &render_animations, &candidate.provisional_render_order, &candidate.provisional_closing_frames)?;
+        let workspace_render_frame = self.workspace_transition.as_ref().and_then(|transition| {
+            candidate_workspace_render_frame(
+                transition,
+                candidate.workspace_transition_plan.as_ref(),
+                candidate.workspace_transition_started_at,
+                Instant::now(),
+            )
+        });
+        candidate.render_outcome = self.render_egl_scene_with_workspace(
+            &candidate.snapshot,
+            &candidate.egl_surfaces,
+            &candidate.pixmaps,
+            &render_animations,
+            &candidate.provisional_render_order,
+            &candidate.provisional_closing_frames,
+            workspace_render_frame.as_ref(),
+        )?;
         if let Some(start) = target_build_start {
             self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::TargetBuildRender, start.elapsed());
         }
@@ -7504,7 +8204,9 @@ impl<'a> SceneSession<'a> {
             self.diagnostics.resizeonly_publish_with_damage_pending += 1;
         }
         let publish_start = self.diagnostics.enabled.then(Instant::now);
-        self.commit_candidate(candidate)?;
+        let swap_outcome = candidate_render_outcome_for_gate(candidate.render_outcome, true)
+            .expect("accepted resize candidate must own its rendered frame outcome");
+        self.commit_candidate(candidate, swap_outcome)?;
         if let Some(start) = publish_start {
             self.diagnostics.record_resizeonly_stage(direction, ResizeOnlyStage::Publish, start.elapsed());
         }
@@ -7547,17 +8249,17 @@ impl<'a> SceneSession<'a> {
             SceneInvalidation::Background => {
                 self.pending_background = false;
                 self.refresh_background()?;
-                self.full_recompose_current()?;
-                return self.timed_swap();
+                let outcome = self.full_recompose_current()?;
+                return self.timed_swap(outcome);
             }
             SceneInvalidation::VisualState => {
                 self.pending_visual_state = false;
-                self.full_recompose_current()?;
-                return self.timed_swap();
+                let outcome = self.full_recompose_current()?;
+                return self.timed_swap(outcome);
             }
             SceneInvalidation::Ignore | SceneInvalidation::PixelDamage(_) => {}
         }
-        self.full_recompose_current()?;
+        let render_outcome = self.full_recompose_current()?;
         self.connection.inner.get_input_focus()?.reply()?;
         let final_gate = self.drain_current_events()?;
         self.pending_damage.extend(final_gate.pixel_damage().iter().copied());
@@ -7571,7 +8273,7 @@ impl<'a> SceneSession<'a> {
             return Ok(());
         }
         if pixel_gate_allows_presentation(final_gate.decision(), ownership_ok, false) {
-            return self.timed_swap();
+            return self.timed_swap(render_outcome);
         }
         match final_gate.decision() {
             SceneInvalidation::Shutdown(reason) => {
@@ -7658,40 +8360,42 @@ impl<'a> SceneSession<'a> {
         Ok(())
     }
 
-    fn full_recompose_current(&mut self) -> Result<(), Box<dyn Error>> {
+    fn full_recompose_current(&mut self) -> Result<RenderOutcome, Box<dyn Error>> {
         // TEMPORARY FORENSIC INSTRUMENTATION (timing only, no functional
         // change) — remove before release.
         let full_recompose_start = Instant::now();
         self.diagnostics.recompositions += 1;
-        let snapshot = self
-            .snapshot
-            .as_ref()
-            .expect("published scene snapshot must exist while live");
-        let surfaces = &self.egl_surfaces;
-        let pixmaps = &self.pixmaps;
-        let background = self.background.as_ref();
-        let shadow_style = self.shadow_style;
-        let visuals = &self._config.visuals;
-        let animations = &self.window_animations;
-        let render_order = &self.render_order;
-        let closing_committed = &self.closing_visuals;
-        let empty_closing_provisional: HashMap<u64, ProvisionalClosingFrame> = HashMap::new();
-        let egl = self.egl.as_mut().ok_or("EGL scene renderer is unavailable")?;
+        let workspace_frame = self.active_workspace_render_frame(Instant::now());
         let render_start = Instant::now();
-        let result = render_egl_scene_parts(
-            egl, background, false, shadow_style, visuals, snapshot, surfaces, pixmaps, animations,
-            render_order, closing_committed, &empty_closing_provisional,
-            // 3a3fa2b5-r2: no in-flight candidate here (ordinary committed
-            // redraw) — `surfaces` already IS `&self.egl_surfaces`, and
-            // `empty_closing_provisional` above means this map is never
-            // actually consulted anyway.
-            surfaces,
-        );
+        let render_once = |this: &mut Self, frame: Option<&WorkspaceRenderFrame>| {
+            let empty_closing_provisional: HashMap<u64, ProvisionalClosingFrame> = HashMap::new();
+            let snapshot = this.snapshot.as_ref().expect("published scene snapshot must exist while live");
+            let surfaces = &this.egl_surfaces;
+            let egl = this.egl.as_mut().ok_or("EGL scene renderer is unavailable")?;
+            render_egl_scene_parts(
+                egl, this.background.as_ref(), false, this.shadow_style, &this._config.visuals,
+                snapshot, surfaces, &this.pixmaps, &this.window_animations, &this.render_order,
+                &this.closing_visuals, &empty_closing_provisional, surfaces, frame,
+            )
+        };
+        let outcome = match render_once(self, workspace_frame.as_ref()) {
+            Ok(outcome) => outcome,
+            Err(error) if workspace_frame.is_some() => {
+                eprintln!("WORKSPACE_TRANSITION_RENDER_FAILED; retrying once without transition composition: {error}");
+                self.cancel_workspace_transition();
+                render_once(self, None)?;
+                render_outcome_for_frame(
+                    workspace_frame.map(|frame| frame.progress),
+                    false,
+                )
+            }
+            Err(error) => return Err(error),
+        };
         self.perf.renders += 1;
         self.perf.render.record(render_start.elapsed());
         self.perf.full_recomposes += 1;
         self.perf.full_recompose.record(full_recompose_start.elapsed());
-        result
+        Ok(outcome)
     }
 
     fn classify_session_event(
@@ -7979,7 +8683,19 @@ impl<'a> SceneSession<'a> {
         }
     }
 
-    fn render_egl_scene(
+    fn active_workspace_render_frame(&self, animation_now: Instant) -> Option<WorkspaceRenderFrame> {
+        let transition = self.workspace_transition.as_ref()?;
+        let started_at = transition.started_at?;
+        Some(WorkspaceRenderFrame {
+            texture: transition.snapshot.texture,
+            stack: Rc::clone(&transition.stack_plan),
+            old_closing_ids: Rc::clone(&transition.old_closing_ids),
+            progress: workspace_transition_progress(started_at, animation_now),
+            animation_now,
+        })
+    }
+
+    fn render_egl_scene_with_workspace(
         &mut self,
         snapshot: &SceneSnapshot,
         surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
@@ -7987,7 +8703,8 @@ impl<'a> SceneSession<'a> {
         animations: &HashMap<Window, WindowAnimation>,
         render_order: &[RenderLayer],
         closing_provisional: &HashMap<u64, ProvisionalClosingFrame>,
-    ) -> Result<(), Box<dyn Error>> {
+        workspace_frame: Option<&WorkspaceRenderFrame>,
+    ) -> Result<RenderOutcome, Box<dyn Error>> {
         // TEMPORARY FORENSIC INSTRUMENTATION (timing only, no functional
         // change) — remove before release.
         let render_start = Instant::now();
@@ -8010,9 +8727,43 @@ impl<'a> SceneSession<'a> {
             // path both run strictly before commit_candidate_inner's swap).
             // Never a stored/cloned reference — read fresh on every call.
             &self.egl_surfaces,
+            workspace_frame,
         );
+        if workspace_transition_render_needs_fallback(workspace_frame.is_some(), result.is_ok()) {
+            eprintln!("WORKSPACE_TRANSITION_RENDER_FAILED; retrying once without transition composition");
+            self.cancel_workspace_transition();
+            return self.render_egl_scene_parts_without_workspace(
+                snapshot, surfaces, pixmaps, animations, render_order, closing_provisional,
+            ).map(|_| {
+                render_outcome_for_frame(
+                    workspace_frame.map(|frame| frame.progress),
+                    false,
+                )
+            });
+        }
         self.perf.renders += 1;
         self.perf.render.record(render_start.elapsed());
+        result
+    }
+
+    fn render_egl_scene_parts_without_workspace(
+        &mut self,
+        snapshot: &SceneSnapshot,
+        surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
+        pixmaps: &[Rc<NamedSurfacePixmap<'a>>],
+        animations: &HashMap<Window, WindowAnimation>,
+        render_order: &[RenderLayer],
+        closing_provisional: &HashMap<u64, ProvisionalClosingFrame>,
+    ) -> Result<RenderOutcome, Box<dyn Error>> {
+        let start = Instant::now();
+        let result = render_egl_scene_parts(
+            self.egl.as_mut().ok_or("EGL scene renderer is unavailable")?,
+            self.background.as_ref(), false, self.shadow_style, &self._config.visuals,
+            snapshot, surfaces, pixmaps, animations, render_order, &self.closing_visuals,
+            closing_provisional, &self.egl_surfaces, None,
+        );
+        self.perf.renders += 1;
+        self.perf.render.record(start.elapsed());
         result
     }
 
@@ -8021,10 +8772,10 @@ impl<'a> SceneSession<'a> {
         surface: Window,
         geometry: Option<PendingGeometry>,
         initial_damage: &HashSet<damage::Damage>,
-    ) -> Result<bool, Box<dyn Error>> {
+    ) -> Result<Option<RenderOutcome>, Box<dyn Error>> {
         self.diagnostics.moveonly_attempted += 1;
         if self.pending_background {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(entry_index) = self
             .current_snapshot()
@@ -8032,11 +8783,11 @@ impl<'a> SceneSession<'a> {
             .iter()
             .position(|entry| entry.surface_xid == surface)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let previous = self.current_snapshot().entries[entry_index].clone();
         let Some(geometry) = geometry.filter(|geometry| geometry.surface_xid == surface) else {
-            return Ok(false);
+            return Ok(None);
         };
         let next_geometry = WindowGeometry {
             x: geometry.x,
@@ -8052,7 +8803,7 @@ impl<'a> SceneSession<'a> {
             geometry.override_redirect,
             previous.semantic_client_xid,
         ) {
-            return Ok(false);
+            return Ok(None);
         }
 
         let mut next_client_root = previous.client_root_geometry;
@@ -8108,9 +8859,9 @@ impl<'a> SceneSession<'a> {
             self.current_snapshot_mut().entries[entry_index].geometry = previous.geometry;
             self.current_snapshot_mut().entries[entry_index].client_root_geometry = previous.client_root_geometry;
             self.diagnostics.moveonly_fallback += 1;
-            return Ok(false);
+            return Ok(None);
         }
-        self.full_recompose_current()?;
+        let render_outcome = self.full_recompose_current()?;
         for damage_id in damage_to_subtract {
             if self.damage_registry.contains_key(&damage_id) {
                 self.subtract_damage_for_diagnostics(damage_id)?;
@@ -8125,7 +8876,7 @@ impl<'a> SceneSession<'a> {
             previous.semantic_client_xid,
             damage_id,
         );
-        Ok(true)
+        Ok(Some(render_outcome))
     }
 
     fn current_snapshot(&self) -> &SceneSnapshot {
@@ -8469,11 +9220,20 @@ fn render_egl_scene_parts<'a>(
     closing_committed: &HashMap<u64, ClosingVisual>,
     closing_provisional: &HashMap<u64, ProvisionalClosingFrame>,
     closing_source_surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
-) -> Result<(), Box<dyn Error>> {
+    workspace_frame: Option<&WorkspaceRenderFrame>,
+) -> Result<RenderOutcome, Box<dyn Error>> {
+    if let Some(frame) = workspace_frame
+        && (frame.stack.layers != render_order
+            || frame.stack.layer_is_workspace.len() != render_order.len()
+            || frame.stack.start > frame.stack.end
+            || frame.stack.end > render_order.len())
+    {
+        return Err("workspace transition stack plan no longer matches render order".into());
+    }
     if transparent_background { egl.clear_transparent()?; } else { egl.clear()?; }
     // 3a3fa2a: one clock reading for every entry in this render, so all
     // simultaneously animating surfaces advance in lockstep within a frame.
-    let animation_now = Instant::now();
+    let animation_now = workspace_frame.map_or_else(Instant::now, |frame| frame.animation_now);
     if let Some(background) = background {
         if let Some(plan) = build_background_render_quad_plan(background.source.geometry, snapshot.root_geometry) {
             egl.render_surface(background.surface.texture, plan, background.surface.pixel_semantics)?;
@@ -8487,7 +9247,12 @@ fn render_egl_scene_parts<'a>(
     // total, replacing R1's O(render_order.len() * snapshot.entries.len())
     // per-entry `.find()`.
     let mut live_entries = snapshot.entries.iter();
-    for layer in render_order {
+    for (layer_index, layer) in render_order.iter().enumerate() {
+        if let Some(frame) = workspace_frame
+            && layer_index == frame.stack.start
+        {
+            render_workspace_snapshot(egl, frame.texture, snapshot.root_geometry, 1.0 - frame.progress)?;
+        }
         // 3a3fa2b5: `render_order` (never `snapshot.entries` directly) now
         // drives composite depth, so committed close visuals splice into
         // the correct gap relative to Live entries — see
@@ -8512,10 +9277,19 @@ fn render_egl_scene_parts<'a>(
                 entry
             }
             RenderLayer::Closing(close_id) => {
-                render_closing_layer(egl, shadow_style, closing_committed, closing_provisional, closing_source_surfaces, close_id, animation_now)?;
+                if workspace_frame.is_some_and(|frame| frame.old_closing_ids.contains(&close_id)) {
+                    continue;
+                }
+                let workspace_factor = workspace_frame
+                    .filter(|frame| frame.stack.layer_is_workspace.get(layer_index) == Some(&true))
+                    .map_or(1.0, |frame| frame.progress);
+                render_closing_layer(egl, shadow_style, closing_committed, closing_provisional, closing_source_surfaces, close_id, animation_now, workspace_factor)?;
                 continue;
             }
         };
+        let workspace_factor = workspace_frame
+            .filter(|frame| frame.stack.layer_is_workspace.get(layer_index) == Some(&true))
+            .map_or(1.0, |frame| frame.progress);
         let Some(surface) = surfaces.get(&entry.surface_xid) else {
             continue;
         };
@@ -8538,7 +9312,7 @@ fn render_egl_scene_parts<'a>(
         // untouched here and remains the real, un-animated footprint —
         // BLUR CONTRACT: blur below intentionally keeps using it, unchanged.
         let base_opacity = f32::from_bits(entry.resolved_opacity_bits);
-        let (draw_plan, draw_opacity, shadow_opacity_multiplier, energy_tear_layout, open_flash_alpha, open_reveal_radius, open_kamui_state) = match animations.get(&entry.surface_xid) {
+        let (mut draw_plan, draw_opacity, shadow_opacity_multiplier, energy_tear_layout, open_flash_alpha, open_reveal_radius, open_kamui_state) = match animations.get(&entry.surface_xid) {
             Some(animation) => {
                 let t = animation.progress(animation_now);
                 let visual = animation.sample(animation_now);
@@ -8585,6 +9359,12 @@ fn render_egl_scene_parts<'a>(
             }
             None => (plan, base_opacity, 1.0, None, None, None, None),
         };
+        // The shader multiplies content by surface_opacity but composes the
+        // premultiplied border independently; scale border alpha once here.
+        apply_workspace_factor_to_border_alpha(&mut draw_plan, workspace_factor);
+        let draw_opacity = draw_opacity * workspace_factor;
+        let shadow_opacity_multiplier = shadow_opacity_multiplier * workspace_factor;
+        let open_flash_alpha = open_flash_alpha.map(|alpha| alpha * workspace_factor);
 
         let region_plan = match &entry.resolved_blur_request {
             BlurRequest::Regions(regions) => entry.client_root_geometry.and_then(|client| {
@@ -8648,7 +9428,11 @@ fn render_egl_scene_parts<'a>(
                         i32::from(snapshot.root_geometry.width),
                         i32::from(snapshot.root_geometry.height),
                     ).ok_or("invalid Regions backdrop geometry")?;
-                    egl.draw_blurred_backdrop(blurred_texture, backdrop_params, plan.corner_radius)?;
+                    if workspace_factor == 1.0 {
+                        egl.draw_blurred_backdrop(blurred_texture, backdrop_params, plan.corner_radius)?;
+                    } else {
+                        egl.draw_blurred_backdrop_with_opacity(blurred_texture, backdrop_params, plan.corner_radius, workspace_factor)?;
+                    }
                 }
             } else {
             let backdrop_params = crate::graphics::renderer::BackdropParams::new(
@@ -8659,7 +9443,11 @@ fn render_egl_scene_parts<'a>(
                 i32::from(snapshot.root_geometry.width),
                 i32::from(snapshot.root_geometry.height),
             ).ok_or("invalid FullWindow backdrop geometry")?;
-            egl.draw_blurred_backdrop(blurred_texture, backdrop_params, plan.corner_radius)?;
+            if workspace_factor == 1.0 {
+                egl.draw_blurred_backdrop(blurred_texture, backdrop_params, plan.corner_radius)?;
+            } else {
+                egl.draw_blurred_backdrop_with_opacity(blurred_texture, backdrop_params, plan.corner_radius, workspace_factor)?;
+            }
             }
         }
         let opacity = crate::graphics::renderer::SurfaceOpacity::new(draw_opacity)
@@ -8731,7 +9519,15 @@ fn render_egl_scene_parts<'a>(
             egl.render_solid_overlay(draw_plan, TELEPORT_FLASHY_COLOR, alpha)?;
         }
     }
-    Ok(())
+    if let Some(frame) = workspace_frame
+        && frame.stack.start == render_order.len()
+    {
+        render_workspace_snapshot(egl, frame.texture, snapshot.root_geometry, 1.0 - frame.progress)?;
+    }
+    Ok(render_outcome_for_frame(
+        workspace_frame.map(|frame| frame.progress),
+        true,
+    ))
 }
 
 fn egl_scene_is_renderable(entry_count: usize, egl_surface_count: usize) -> bool {
@@ -8779,6 +9575,7 @@ fn render_closing_layer(
     closing_source_surfaces: &HashMap<Window, Rc<std::cell::RefCell<EglImportedSurface>>>,
     close_id: u64,
     animation_now: Instant,
+    workspace_factor: f32,
 ) -> Result<(), Box<dyn Error>> {
     let (source, texture) = match closing_committed.get(&close_id) {
         Some(visual) => (ClosingDrawSource::Committed(visual), visual.texture.texture),
@@ -8793,7 +9590,8 @@ fn render_closing_layer(
     let animation = source.animation();
     let t = animation.progress(animation_now);
     let visual = sample_close_effect(animation.effect, t);
-    let closing_draw_plan = scale_render_quad_plan(source.plan(), visual.scale_x, visual.scale_y);
+    let mut closing_draw_plan = scale_render_quad_plan(source.plan(), visual.scale_x, visual.scale_y);
+    apply_workspace_factor_to_border_alpha(&mut closing_draw_plan, workspace_factor);
     // 3a3fa2b7 (Kamui): shadow ENVELOPE multiplied into the existing
     // closing_opacity_multiplier — `None` (no change) for every non-Kamui
     // close effect. Shadow never receives twist/warp state, same
@@ -8803,11 +9601,11 @@ fn render_closing_layer(
         None => visual.opacity,
     };
     if source.shadow_eligible() {
-        if let Some(shadow) = shadow_params_from_plan(shadow_style, &closing_draw_plan, closing_opacity_multiplier) {
+        if let Some(shadow) = shadow_params_from_plan(shadow_style, &closing_draw_plan, closing_opacity_multiplier * workspace_factor) {
             egl.render_shadow(shadow)?;
         }
     }
-    let opacity = crate::graphics::renderer::SurfaceOpacity::new(source.base_opacity() * visual.opacity)
+    let opacity = crate::graphics::renderer::SurfaceOpacity::new(source.base_opacity() * visual.opacity * workspace_factor)
         .expect("resolved closing opacity must be valid");
     // 3a3fa2b7 (Kamui): mutually exclusive with the ordinary path by
     // construction (kamui_close_state_for is gated exclusively on
@@ -8841,10 +9639,38 @@ fn render_closing_layer(
     // flash is actually visible, identical gating shape to the OPEN path.
     // Uses `closing_draw_plan` — the SAME currently-animated geometry the
     // surface/shadow above already used.
-    if let Some(alpha) = teleport_flashy_close_flash_for(animation.effect, t) {
+    let close_flash_alpha = teleport_flashy_close_flash_for(animation.effect, t)
+        .map(|alpha| alpha * workspace_factor);
+    if let Some(alpha) = close_flash_alpha {
         egl.render_solid_overlay(closing_draw_plan, TELEPORT_FLASHY_COLOR, alpha)?;
     }
     Ok(())
+}
+
+fn render_workspace_snapshot(
+    egl: &EglSceneRenderer,
+    texture: u32,
+    root: RootGeometry,
+    opacity: f32,
+) -> Result<(), Box<dyn Error>> {
+    let width = i32::from(root.width);
+    let height = i32::from(root.height);
+    let plan = RenderQuadPlan {
+        dst_x: 0, dst_y: 0, width, height,
+        outer_x: 0, outer_y: 0, outer_width: width, outer_height: height,
+        src_x: 0, src_y: 0, src_width: width, src_height: height,
+        u0: 0.0, v0: workspace_snapshot_uvs().0, u1: 1.0, v1: workspace_snapshot_uvs().1,
+        corner_radius: 0.0, border_width: 0.0, border_color: [0.0; 4],
+    };
+    let opacity = crate::graphics::renderer::SurfaceOpacity::new(opacity)
+        .ok_or("invalid workspace snapshot opacity")?;
+    egl.render_surface_with_opacity(texture, plan, EglPixelSemantics::PremultipliedAlpha, opacity)
+}
+
+fn workspace_snapshot_uvs() -> (f32, f32) {
+    // FBO row zero is the bottom row in GL texture coordinates. Scene NDC
+    // top is rasterized at framebuffer y=height, hence screen-top samples v=1.
+    (1.0, 0.0)
 }
 
 fn retain_pending_for_registry(
@@ -9099,6 +9925,7 @@ fn observe_workspace_desktop(last: Option<u32>, current: u32) -> WorkspaceDeskto
     }
 }
 
+#[cfg(test)]
 fn workspace_state_after_capture(
     last: Option<u32>,
     current: u32,
@@ -9814,7 +10641,7 @@ fn damage_identity_compatible(previous: &SurfaceEntry, candidate: &SurfaceEntry)
 
 fn observe_structural_generation(generation: &mut u64, invalidation: SceneInvalidation) {
     if matches!(invalidation, SceneInvalidation::Geometry(_) | SceneInvalidation::Hierarchy) {
-        *generation = generation.wrapping_add(1);
+        *generation = generation.saturating_add(1);
     }
 }
 
@@ -9964,6 +10791,7 @@ pub(crate) fn run_with_root(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     use super::{
@@ -10019,6 +10847,14 @@ mod tests {
         parse_frame_policy_property, resolve_surface_frame_policy,
         initialize_surface_config_rules,
         is_visual_property_notify, resolved_blur_request_with_auxiliary,
+        workspace_transition_render_needs_fallback, release_workspace_texture_once,
+        apply_workspace_factor_to_border_alpha,
+        render_outcome_for_frame, candidate_render_outcome_for_gate,
+        workspace_frame_should_retire_after_swap, RenderOutcome,
+        workspace_snapshot_uvs, schedule_workspace_publication, next_workspace_epoch,
+        workspace_publication_candidate_matches, workspace_publication_consumed_on_commit,
+        workspace_insertion_boundary, captured_workspace_closing_ids,
+        WorkspacePublicationState,
         permitted_blur_request, resolved_blur_request, resolve_snapshot_fullscreen,
         ClientRootGeometry, client_root_geometry_from_translation,
         region_request_requires_client_origin, translate_coordinates_reply_error,
@@ -10074,10 +10910,18 @@ mod tests {
         KAMUI_CLOSE_GRAB_RADIUS, KAMUI_CLOSE_FLOW_RADIUS, KAMUI_CLOSE_SUCTION_RADIUS,
         KAMUI_CLOSE_TWIST_AFTER_GRAB, KAMUI_CLOSE_TWIST_AFTER_FLOW, KAMUI_CLOSE_MAX_TWIST,
         KAMUI_CLOSE_RADIAL_POWER_END,
-        eligible_for_open_animation, provisional_open_animations,
+        eligible_for_open_animation, provisional_open_animations, candidate_provisional_open_animations,
         merge_window_animations, scale_render_quad_plan,
         promote_provisional_animations, retire_removed_surface_animations,
         effective_override_redirect, workspace_snapshot_eligible,
+        workspace_content_eligible, contiguous_workspace_interval,
+        workspace_transition_stack_plan, workspace_candidate_matches_boundary,
+        workspace_transition_progress, WorkspaceTransitionStackPlan, WorkspaceTransitionState,
+        WORKSPACE_TRANSITION_DURATION, workspace_transition_should_activate,
+        candidate_workspace_render_frame, execute_pure_move_precommit_action,
+        pure_move_precommit_decision, resizeonly_workspace_transition_action,
+        resizeonly_active_transition_plan, workspace_transition_commit_action,
+        ResizeOnlyWorkspaceTransitionAction, WorkspaceTransitionCommitAction,
         parse_current_desktop_property, observe_workspace_desktop,
         workspace_state_after_capture, WorkspaceDesktopObservation, WorkspaceSnapshot,
     };
@@ -10135,19 +10979,25 @@ mod tests {
         assert!(!workspace_snapshot_eligible(&managed));
         managed.visual_class = SurfaceVisualClass::Normal;
         managed.override_redirect = true;
-        assert!(!workspace_snapshot_eligible(&managed));
-        managed.override_redirect = false;
+        managed.effective_override_redirect = false;
+        assert!(workspace_snapshot_eligible(&managed));
+        assert!(workspace_content_eligible(&managed, crate::config::ShadowConfig::default(), root()));
         managed.effective_override_redirect = true;
         assert!(!workspace_snapshot_eligible(&managed));
+        assert!(!workspace_content_eligible(&managed, crate::config::ShadowConfig::default(), root()));
+        managed.effective_override_redirect = false;
+        managed.override_redirect = false;
         managed.effective_override_redirect = false;
         managed.map_state = MapState::UNMAPPED;
         assert!(!workspace_snapshot_eligible(&managed));
         managed.map_state = MapState::VIEWABLE;
         managed.backend = BackendCompatibility::BackendUnsupported;
-        assert!(!workspace_snapshot_eligible(&managed));
+        assert!(workspace_snapshot_eligible(&managed));
+        assert!(workspace_content_eligible(&managed, crate::config::ShadowConfig::default(), root()));
         managed.backend = BackendCompatibility::Renderable;
         managed.geometry.x = 1000;
         assert!(!entry_has_visible_contribution(&managed, crate::config::ShadowConfig::default(), root()));
+        assert!(!workspace_content_eligible(&managed, crate::config::ShadowConfig::default(), root()));
     }
 
     #[test]
@@ -10158,6 +11008,522 @@ mod tests {
         assert!(workspace_snapshot_eligible(&managed));
         managed.frame_policy = FramePolicy::Suppress;
         assert!(workspace_snapshot_eligible(&managed));
+    }
+
+    #[test]
+    fn unsupported_copyarea_backend_does_not_veto_visible_normal_workspace_content() {
+        let mut managed = eligible_surface(&metadata(), None, root(), 41, 0).unwrap();
+        managed.visual_class = SurfaceVisualClass::Normal;
+        managed.effective_override_redirect = false;
+        managed.map_state = MapState::VIEWABLE;
+        managed.geometry.x = 0;
+        managed.geometry.y = 0;
+        managed.geometry.width = 80;
+        managed.geometry.height = 60;
+        managed.backend = BackendCompatibility::BackendUnsupported;
+        assert!(workspace_content_eligible(&managed, crate::config::ShadowConfig::default(), root()));
+    }
+
+    #[test]
+    fn raw_override_redirect_true_with_effective_false_is_workspace_content() {
+        let mut managed = eligible_surface(&metadata(), None, root(), 42, 0).unwrap();
+        managed.visual_class = SurfaceVisualClass::Normal;
+        managed.override_redirect = true;
+        managed.effective_override_redirect = false;
+        managed.backend = BackendCompatibility::BackendUnsupported;
+        assert!(workspace_content_eligible(&managed, crate::config::ShadowConfig::default(), root()));
+    }
+
+    #[test]
+    fn dock_and_effective_override_redirect_remain_global_without_copyarea_compatibility() {
+        let mut entry = eligible_surface(&metadata(), None, root(), 43, 0).unwrap();
+        entry.backend = BackendCompatibility::BackendUnsupported;
+        entry.visual_class = SurfaceVisualClass::Dock;
+        assert!(!workspace_snapshot_eligible(&entry));
+        entry.visual_class = SurfaceVisualClass::Normal;
+        entry.effective_override_redirect = true;
+        assert!(!workspace_snapshot_eligible(&entry));
+    }
+
+    fn workspace_plan_for_test(flags: &[bool]) -> Option<WorkspaceTransitionStackPlan> {
+        let entries = flags.iter().enumerate().map(|(index, workspace)| {
+            let mut entry = eligible_surface(&metadata(), None, root(), index as Window + 1, index).unwrap();
+            if !workspace { entry.visual_class = SurfaceVisualClass::Dock; }
+            entry
+        }).collect::<Vec<_>>();
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries };
+        let order = (1..=flags.len() as Window).map(RenderLayer::Live).collect::<Vec<_>>();
+        workspace_transition_stack_plan(
+            &snapshot, &order, &HashMap::new(), &HashMap::new(),
+            crate::config::ShadowConfig::default(), None,
+        )
+    }
+
+    #[test]
+    fn workspace_stack_accepts_leading_trailing_and_surrounding_globals() {
+        for (flags, expected) in [
+            (&[true, true, false, false][..], Some((0, 2))),
+            (&[false, false, true, true][..], Some((2, 4))),
+            (&[false, false, true, true, false, false][..], Some((2, 4))),
+        ] {
+            let plan = workspace_plan_for_test(flags).expect("contiguous workspace block is safe");
+            assert_eq!((plan.start, plan.end), expected.unwrap());
+            assert_eq!(plan.layers.len(), flags.len());
+        }
+    }
+
+    #[test]
+    fn workspace_stack_rejects_interleaving_and_bad_render_layer_mapping() {
+        assert_eq!(workspace_plan_for_test(&[true, false, true]), None);
+        assert_eq!(workspace_plan_for_test(&[false, true, false, true]), None);
+
+        let mut entry = eligible_surface(&metadata(), None, root(), 1, 0).unwrap();
+        entry.visual_class = SurfaceVisualClass::Dock;
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries: vec![entry] };
+        assert_eq!(workspace_transition_stack_plan(
+            &snapshot, &[RenderLayer::Live(99)], &HashMap::new(), &HashMap::new(),
+            crate::config::ShadowConfig::default(), None,
+        ), None);
+        assert_eq!(workspace_transition_stack_plan(
+            &snapshot, &[], &HashMap::new(), &HashMap::new(),
+            crate::config::ShadowConfig::default(), None,
+        ), None);
+    }
+
+    #[test]
+    fn workspace_empty_destination_uses_a_deterministic_old_interval_hint() {
+        let plan = workspace_plan_for_test(&[]).expect("empty render order has a valid empty interval");
+        assert_eq!((plan.start, plan.end), (0, 0));
+        assert_eq!(contiguous_workspace_interval(&[false, false]), Some((2, 2)));
+        assert_eq!(contiguous_workspace_interval(&[false, false, true, true, false]), Some((2, 4)));
+    }
+
+    #[test]
+    fn all_global_stack_keeps_empty_interval_at_interior_hint() {
+        let entries = (1..=5).map(|xid| {
+            let mut entry = eligible_surface(&metadata(), None, root(), xid, xid as usize).unwrap();
+            entry.visual_class = SurfaceVisualClass::Dock;
+            entry
+        }).collect::<Vec<_>>();
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries };
+        let order = (1..=5).map(RenderLayer::Live).collect::<Vec<_>>();
+        let plan = workspace_transition_stack_plan(
+            &snapshot, &order, &HashMap::new(), &HashMap::new(),
+            crate::config::ShadowConfig::default(), Some(2),
+        ).unwrap();
+        assert_eq!((plan.start, plan.end), (2, 2));
+        assert!(!plan.layer_is_workspace.iter().any(|flag| *flag));
+    }
+
+    fn stack_plan_for_id_flags(items: &[(Window, bool)], empty_hint: Option<usize>) -> WorkspaceTransitionStackPlan {
+        let entries = items.iter().map(|(xid, workspace)| {
+            let mut entry = eligible_surface(&metadata(), None, root(), *xid, *xid as usize).unwrap();
+            if !workspace {
+                entry.visual_class = SurfaceVisualClass::Dock;
+            } else {
+                entry.backend = BackendCompatibility::BackendUnsupported;
+            }
+            entry
+        }).collect::<Vec<_>>();
+        let snapshot = SceneSnapshot { root: 1, root_geometry: root(), entries };
+        let order = items.iter().map(|(xid, _)| RenderLayer::Live(*xid)).collect::<Vec<_>>();
+        workspace_transition_stack_plan(
+            &snapshot, &order, &HashMap::new(), &HashMap::new(),
+            crate::config::ShadowConfig::default(), empty_hint,
+        ).unwrap()
+    }
+
+    fn transition_state_for_candidate_frame_test(started_at: Option<Instant>) -> WorkspaceTransitionState {
+        let old_stack = stack_plan_for_id_flags(&[(1, false), (2, true), (3, false)], None);
+        WorkspaceTransitionState {
+            epoch: 1,
+            boundary_generation: 1,
+            // `released` avoids any GL cleanup in this pure semantic test.
+            snapshot: WorkspaceSnapshot { texture: 77, width: 100, height: 80, released: true },
+            stack_plan: Rc::new(old_stack.clone()),
+            old_closing_ids: Rc::new(HashSet::new()),
+            had_workspace_content: true,
+            old_stack,
+            started_at,
+        }
+    }
+
+    fn resizeonly_snapshot_for_test(items: &[(Window, bool)]) -> (SceneSnapshot, Vec<RenderLayer>) {
+        let entries = items.iter().map(|(xid, workspace)| {
+            let mut entry = eligible_surface(&metadata(), None, root(), *xid, *xid as usize).unwrap();
+            if !workspace {
+                entry.visual_class = SurfaceVisualClass::Dock;
+            }
+            entry
+        }).collect();
+        let order = items.iter().map(|(xid, _)| RenderLayer::Live(*xid)).collect();
+        (SceneSnapshot { root: 1, root_geometry: root(), entries }, order)
+    }
+
+    #[test]
+    fn resizeonly_active_transition_candidate_carries_a_recomputed_plan() {
+        let transition = transition_state_for_candidate_frame_test(Some(Instant::now()));
+        let (snapshot, order) = resizeonly_snapshot_for_test(&[(1, false), (2, true), (3, false)]);
+        let plan = resizeonly_active_transition_plan(
+            &transition, &snapshot, &order, &HashMap::new(), crate::config::ShadowConfig::default(),
+        );
+        assert!(plan.is_some(), "active ResizeOnly candidate must carry a valid transition plan");
+    }
+
+    #[test]
+    fn resizeonly_active_transition_uses_the_persistent_clock_at_fresh_render_time() {
+        let start = Instant::now();
+        let transition = transition_state_for_candidate_frame_test(Some(start));
+        let (snapshot, order) = resizeonly_snapshot_for_test(&[(1, false), (2, true), (3, false)]);
+        let plan = resizeonly_active_transition_plan(
+            &transition, &snapshot, &order, &HashMap::new(), crate::config::ShadowConfig::default(),
+        ).unwrap();
+        let frame = candidate_workspace_render_frame(
+            &transition, Some(&plan), None, start + WORKSPACE_TRANSITION_DURATION / 2,
+        ).unwrap();
+        assert!((frame.progress - 0.5).abs() < 0.001);
+        assert_ne!(frame.progress, 0.0);
+    }
+
+    #[test]
+    fn resizeonly_active_transition_metadata_selects_the_preserve_commit_branch() {
+        let start = Instant::now();
+        let plan = stack_plan_for_id_flags(&[(1, false), (2, true), (3, false)], None);
+        assert_eq!(
+            workspace_transition_commit_action(Some(&plan), None, Some(start), true),
+            WorkspaceTransitionCommitAction::PreserveActive,
+        );
+    }
+
+    #[test]
+    fn resizeonly_active_transition_before_final_frame_is_retained_after_swap() {
+        let outcome = render_outcome_for_frame(Some(0.35), true);
+        assert!(!workspace_frame_should_retire_after_swap(outcome, true));
+    }
+
+    #[test]
+    fn resizeonly_active_transition_final_frame_retires_through_its_render_outcome() {
+        let outcome = render_outcome_for_frame(Some(1.0), true);
+        assert!(workspace_frame_should_retire_after_swap(outcome, true));
+        assert!(!workspace_frame_should_retire_after_swap(outcome, false));
+    }
+
+    #[test]
+    fn resizeonly_rejects_a_pending_workspace_publication() {
+        assert_eq!(
+            resizeonly_workspace_transition_action(true, false, Some(Some(Instant::now())), true),
+            ResizeOnlyWorkspaceTransitionAction::Fallback,
+        );
+    }
+
+    #[test]
+    fn resizeonly_rejects_a_pending_workspace_transition() {
+        assert_eq!(
+            resizeonly_workspace_transition_action(false, false, Some(None), true),
+            ResizeOnlyWorkspaceTransitionAction::Fallback,
+        );
+    }
+
+    #[test]
+    fn resizeonly_rejects_an_epoch_mismatched_workspace_transition() {
+        assert_eq!(
+            resizeonly_workspace_transition_action(false, false, Some(Some(Instant::now())), false),
+            ResizeOnlyWorkspaceTransitionAction::Fallback,
+        );
+    }
+
+    #[test]
+    fn resizeonly_rejects_while_workspace_rebuild_is_pending() {
+        assert_eq!(
+            resizeonly_workspace_transition_action(false, true, Some(Some(Instant::now())), true),
+            ResizeOnlyWorkspaceTransitionAction::Fallback,
+        );
+    }
+
+    #[test]
+    fn resizeonly_without_workspace_work_keeps_its_normal_fast_path() {
+        assert_eq!(
+            resizeonly_workspace_transition_action(false, false, None, true),
+            ResizeOnlyWorkspaceTransitionAction::NoTransition,
+        );
+    }
+
+    #[test]
+    fn pending_candidate_initial_frame_uses_candidate_transition_at_zero() {
+        let pending_start = Instant::now();
+        let transition = transition_state_for_candidate_frame_test(None);
+        let destination = stack_plan_for_id_flags(&[(1, false), (9, true), (3, false)], None);
+        let frame = candidate_workspace_render_frame(
+            &transition, Some(&destination), Some(pending_start),
+            pending_start + WORKSPACE_TRANSITION_DURATION,
+        ).expect("pending candidate has its local frame");
+        assert_eq!(frame.progress, 0.0);
+        assert_eq!(frame.animation_now, pending_start);
+        assert_eq!(&*frame.stack, &destination);
+        assert_eq!(render_outcome_for_frame(Some(frame.progress), true).workspace_progress, Some(0.0));
+    }
+
+    #[test]
+    fn pending_candidate_pure_move_rerender_keeps_transition_composition_at_zero() {
+        let pending_start = Instant::now();
+        let transition = transition_state_for_candidate_frame_test(None);
+        let destination = stack_plan_for_id_flags(&[(1, false), (9, true), (3, false)], None);
+        let rerender = candidate_workspace_render_frame(
+            &transition, Some(&destination), Some(pending_start),
+            pending_start + WORKSPACE_TRANSITION_DURATION * 2,
+        ).expect("pure-move rerender retains the pending candidate frame");
+        assert_eq!(rerender.progress, 0.0);
+        assert_eq!(&*rerender.stack, &destination);
+        assert_eq!(render_outcome_for_frame(Some(rerender.progress), true).workspace_progress, Some(0.0));
+    }
+
+    #[test]
+    fn pending_candidate_frame_does_not_require_a_session_active_start_time() {
+        let pending_start = Instant::now();
+        let transition = transition_state_for_candidate_frame_test(None);
+        let destination = stack_plan_for_id_flags(&[(1, false), (9, true), (3, false)], None);
+        assert!(transition.started_at.is_none());
+        let frame = candidate_workspace_render_frame(
+            &transition, Some(&destination), Some(pending_start), pending_start,
+        );
+        assert!(frame.is_some(), "candidate-local pending T0 must not fall back to the session-only frame");
+    }
+
+    #[test]
+    fn active_candidate_frame_uses_fresh_render_clock_without_resetting_progress() {
+        let start = Instant::now();
+        let transition = transition_state_for_candidate_frame_test(Some(start));
+        let destination = stack_plan_for_id_flags(&[(1, false), (9, true), (3, false)], None);
+        let half = candidate_workspace_render_frame(
+            &transition, Some(&destination), None, start + WORKSPACE_TRANSITION_DURATION / 2,
+        ).expect("active transition has a candidate frame");
+        assert!((half.progress - 0.5).abs() < 0.001, "half-duration candidate must not reset to zero");
+        let complete = candidate_workspace_render_frame(
+            &transition, Some(&destination), None, start + WORKSPACE_TRANSITION_DURATION,
+        ).expect("active transition has a candidate frame");
+        assert_eq!(complete.progress, 1.0);
+    }
+
+    #[test]
+    fn old_new_stable_global_projection_has_common_boundary() {
+        let old = stack_plan_for_id_flags(&[(1,false),(2,false),(3,true),(4,true),(5,true),(6,false),(7,false)], None);
+        let new = stack_plan_for_id_flags(&[(1,false),(2,false),(3,true),(4,true),(6,false),(7,false)], None);
+        assert_eq!(workspace_insertion_boundary(&old, &new), Some(2));
+    }
+
+    #[test]
+    fn copyarea_unsupported_application_xid_replacement_preserves_global_projection() {
+        let old = stack_plan_for_id_flags(&[(1,false),(2,false),(10,true),(11,true),(3,false)], None);
+        let new = stack_plan_for_id_flags(&[(1,false),(2,false),(20,true),(21,true),(3,false)], None);
+        let globals = |plan: &WorkspaceTransitionStackPlan| plan.layers.iter()
+            .zip(&plan.layer_is_workspace)
+            .filter_map(|(layer, workspace)| (!*workspace).then_some(*layer))
+            .collect::<Vec<_>>();
+        assert_eq!(old.layer_is_workspace, [false, false, true, true, false]);
+        assert_eq!(new.layer_is_workspace, [false, false, true, true, false]);
+        assert_eq!(globals(&old), globals(&new));
+        assert_eq!(workspace_insertion_boundary(&old, &new), Some(2));
+    }
+
+    #[test]
+    fn workspace_property_prevents_the_production_pure_move_rebase_action() {
+        let action = pure_move_precommit_decision(true, false);
+        let mut rebase_invoked = false;
+        let result = execute_pure_move_precommit_action(action, || {
+            rebase_invoked = true;
+        });
+        assert_eq!(result, Err(GateDecision::Retry(SceneInvalidation::Hierarchy)));
+        assert!(!rebase_invoked);
+    }
+
+    #[test]
+    fn correlated_pure_move_reaches_the_production_rebase_action() {
+        let action = pure_move_precommit_decision(false, true);
+        let mut rebase_invoked = false;
+        let result = execute_pure_move_precommit_action(action, || {
+            rebase_invoked = true;
+            7_u8
+        });
+        assert_eq!(result, Ok(7));
+        assert!(rebase_invoked);
+    }
+
+    #[test]
+    fn empty_to_nonempty_uses_destination_boundary_between_matching_globals() {
+        let old = stack_plan_for_id_flags(&[(1,false),(2,false),(5,false)], None);
+        let new = stack_plan_for_id_flags(&[(1,false),(2,false),(3,true),(4,true),(5,false)], None);
+        assert_eq!(workspace_insertion_boundary(&old, &new), Some(2));
+        assert!(workspace_transition_should_activate(
+            false,
+            true,
+            workspace_insertion_boundary(&old, &new).is_some(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn empty_to_nonempty_accepts_destination_boundary_zero_with_same_globals() {
+        let old = stack_plan_for_id_flags(&[(1,false),(2,false),(5,false)], None);
+        let new = stack_plan_for_id_flags(&[(3,true),(4,true),(1,false),(2,false),(5,false)], None);
+        assert_eq!(workspace_insertion_boundary(&old, &new), Some(0));
+    }
+
+    #[test]
+    fn changed_global_topology_disables_visual_transition() {
+        let old = stack_plan_for_id_flags(&[(1,false),(2,false),(3,true),(4,true),(5,false)], None);
+        let missing_anchor = stack_plan_for_id_flags(&[(1,false),(5,false)], Some(1));
+        assert_eq!(workspace_insertion_boundary(&old, &missing_anchor), None);
+        let changed_side = stack_plan_for_id_flags(&[(3,true),(1,false),(2,false),(5,false)], None);
+        assert_eq!(workspace_insertion_boundary(&old, &changed_side), None);
+        let reordered_globals = stack_plan_for_id_flags(&[(2,false),(1,false),(3,true),(4,true),(5,false)], None);
+        assert_eq!(workspace_insertion_boundary(&old, &reordered_globals), None);
+    }
+
+    #[test]
+    fn nonempty_to_empty_uses_stable_global_insertion_boundary() {
+        let old = stack_plan_for_id_flags(&[(1,false),(2,false),(3,true),(4,true),(5,false)], None);
+        let new = stack_plan_for_id_flags(&[(1,false),(2,false),(5,false)], Some(2));
+        assert_eq!((new.start, new.end), (2, 2));
+        assert_eq!(workspace_insertion_boundary(&old, &new), Some(2));
+    }
+
+    #[test]
+    fn publication_suppression_survives_visual_failure_and_is_candidate_local() {
+        let publication = WorkspacePublicationState { epoch: 9, boundary_generation: Some(12), identity: Rc::new(()) };
+        let destination_candidate = Rc::clone(&publication.identity);
+        // Absence of a visual transition (capture failure, unsafe stack, or
+        // no Present) does not participate in publication identity matching.
+        assert!(workspace_publication_candidate_matches(&publication, Some(&destination_candidate), 12));
+        assert!(workspace_publication_consumed_on_commit(&publication, Some(&destination_candidate), 12));
+        assert!(!workspace_publication_candidate_matches(&publication, None, 12));
+        assert!(!workspace_publication_candidate_matches(&publication, Some(&Rc::new(())), 12));
+        assert!(!workspace_publication_candidate_matches(&publication, Some(&destination_candidate), 11));
+    }
+
+    #[test]
+    fn property_change_schedules_rebuild_and_empty_to_empty_can_retire_publication() {
+        let (generation, boundary) = schedule_workspace_publication(41);
+        assert_eq!((generation, boundary), (42, Some(42)));
+        let publication = WorkspacePublicationState { epoch: 2, boundary_generation: boundary, identity: Rc::new(()) };
+        let candidate = Rc::clone(&publication.identity);
+        // Empty -> empty still has an accepted matching publication candidate;
+        // commit consumes it even though no dissolve should activate.
+        assert!(workspace_publication_consumed_on_commit(&publication, Some(&candidate), generation));
+    }
+
+    #[test]
+    fn generation_and_epoch_overflow_never_wrap_causal_identity() {
+        assert_eq!(schedule_workspace_publication(u64::MAX), (u64::MAX, None));
+        assert_eq!(next_workspace_epoch(u64::MAX), None);
+        assert_eq!(schedule_workspace_publication(u64::MAX - 1), (u64::MAX, Some(u64::MAX)));
+    }
+
+    #[test]
+    fn successful_transition_render_outcome_drives_its_own_swap_retirement() {
+        let final_frame = render_outcome_for_frame(Some(1.0), true);
+        assert_eq!(final_frame.workspace_progress, Some(1.0));
+        assert!(workspace_frame_should_retire_after_swap(final_frame, true));
+        assert!(!workspace_frame_should_retire_after_swap(final_frame, false));
+
+        let active_frame = render_outcome_for_frame(Some(0.99), true);
+        assert!(!workspace_frame_should_retire_after_swap(active_frame, true));
+    }
+
+    #[test]
+    fn successful_normal_fallback_has_no_transition_progress() {
+        let fallback = render_outcome_for_frame(Some(1.0), false);
+        assert_eq!(fallback.workspace_progress, None);
+        assert!(!workspace_frame_should_retire_after_swap(fallback, true));
+    }
+
+    #[test]
+    fn rejected_candidate_outcome_cannot_leak_into_later_swap() {
+        let speculative = render_outcome_for_frame(Some(1.0), true);
+        assert!(candidate_render_outcome_for_gate(speculative, false).is_none());
+        let unrelated_live_frame = RenderOutcome::default();
+        assert!(!workspace_frame_should_retire_after_swap(unrelated_live_frame, true));
+    }
+
+    #[test]
+    fn accepted_candidate_swap_uses_that_candidates_rendered_progress() {
+        let candidate = render_outcome_for_frame(Some(1.0), true);
+        let swap_outcome = candidate_render_outcome_for_gate(candidate, true).unwrap();
+        assert_eq!(swap_outcome, candidate);
+        assert!(workspace_frame_should_retire_after_swap(swap_outcome, true));
+    }
+
+    #[test]
+    fn workspace_factor_scales_border_alpha_once() {
+        let mut plan = build_render_quad_plan(
+            WindowGeometry { x: 0, y: 0, width: 20, height: 20, border_width: 0 },
+            PixmapGeometry { root: 1, x: 0, y: 0, width: 20, height: 20, border_width: 0, depth: 24 }, root(),
+        ).unwrap();
+        plan.border_color = [0.4, 0.3, 0.2, 0.8];
+        apply_workspace_factor_to_border_alpha(&mut plan, 0.25);
+        assert_eq!(plan.border_color, [0.4, 0.3, 0.2, 0.2]);
+    }
+
+    #[test]
+    fn only_closing_layers_submitted_to_old_capture_are_suppressed_live() {
+        let submitted = [RenderLayer::Live(1), RenderLayer::Closing(21), RenderLayer::Closing(22)];
+        let captured = captured_workspace_closing_ids(&submitted);
+        assert_eq!(captured, HashSet::from([21, 22]));
+        assert!(!captured.contains(&23));
+    }
+
+    #[test]
+    fn workspace_snapshot_fbo_blit_maps_screen_top_to_texture_top() {
+        assert_eq!(workspace_snapshot_uvs(), (1.0, 0.0));
+    }
+
+    #[test]
+    fn workspace_candidate_boundary_rejects_old_and_stale_epochs() {
+        assert!(!workspace_candidate_matches_boundary(4, 5, 12, 12));
+        assert!(!workspace_candidate_matches_boundary(5, 5, 11, 12));
+        assert!(workspace_candidate_matches_boundary(5, 5, 12, 12));
+        assert!(!workspace_candidate_matches_boundary(5, 6, 99, 12));
+    }
+
+    #[test]
+    fn workspace_transition_clock_starts_at_zero_and_clamps_final_frame() {
+        let start = Instant::now();
+        assert_eq!(workspace_transition_progress(start, start), 0.0);
+        assert_eq!(workspace_transition_progress(start, start + WORKSPACE_TRANSITION_DURATION), 1.0);
+        assert_eq!(workspace_transition_progress(start, start + WORKSPACE_TRANSITION_DURATION * 2), 1.0);
+        assert!(!workspace_frame_should_retire_after_swap(
+            RenderOutcome { workspace_progress: Some(1.0) },
+            false,
+        ));
+        assert!(!workspace_frame_should_retire_after_swap(
+            RenderOutcome { workspace_progress: Some(0.99) },
+            true,
+        ));
+        assert!(workspace_frame_should_retire_after_swap(
+            RenderOutcome { workspace_progress: Some(1.0) },
+            true,
+        ));
+    }
+
+    #[test]
+    fn workspace_transition_activation_handles_empty_endpoints_and_present_gate() {
+        assert!(!workspace_transition_should_activate(false, false, true, true));
+        assert!(workspace_transition_should_activate(true, false, true, true));
+        assert!(workspace_transition_should_activate(false, true, true, true));
+        assert!(!workspace_transition_should_activate(true, true, false, true));
+        assert!(!workspace_transition_should_activate(true, true, true, false));
+    }
+
+    #[test]
+    fn workspace_transition_failure_fallback_and_texture_release_are_one_shot() {
+        assert!(workspace_transition_render_needs_fallback(true, false));
+        assert!(!workspace_transition_render_needs_fallback(true, true));
+        assert!(!workspace_transition_render_needs_fallback(false, false));
+
+        let mut released = false;
+        let mut releases = 0;
+        release_workspace_texture_once(&mut released, || releases += 1);
+        release_workspace_texture_once(&mut released, || releases += 1);
+        assert_eq!(releases, 1);
     }
 
     #[test]
@@ -13924,6 +15290,39 @@ mod tests {
         assert_eq!(result.len(), 1, "existing surface must not replay");
         assert!(result.contains_key(&2), "genuinely added surface must be eligible");
         assert!(!result.contains_key(&1));
+    }
+
+    #[test]
+    fn workspace_publication_suppresses_every_candidate_open_without_persisting_it() {
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: full_hd_root(),
+            entries: vec![
+                animation_test_entry(21, SurfaceVisualClass::Normal, false),
+                animation_test_entry(22, SurfaceVisualClass::Normal, false),
+            ],
+        };
+        let old_surfaces = HashSet::new();
+        let persistent = HashMap::from([(9, test_window_animation(Instant::now()))]);
+        let suppressed = candidate_provisional_open_animations(
+            true, &old_surfaces, &snapshot, false, true, test_animation_config(true), Instant::now(),
+        );
+        assert!(suppressed.is_empty());
+        assert_eq!(persistent.len(), 1, "rejected candidate cannot mutate committed animations");
+        assert_eq!(merge_window_animations(&persistent, &suppressed).len(), 1);
+    }
+
+    #[test]
+    fn ordinary_new_surface_after_workspace_publication_still_uses_open_animation() {
+        let snapshot = SceneSnapshot {
+            root: 1,
+            root_geometry: full_hd_root(),
+            entries: vec![animation_test_entry(23, SurfaceVisualClass::Normal, false)],
+        };
+        let result = candidate_provisional_open_animations(
+            false, &HashSet::new(), &snapshot, false, true, test_animation_config(true), Instant::now(),
+        );
+        assert!(result.contains_key(&23));
     }
 
     #[test]

@@ -976,6 +976,7 @@ impl EglSceneRenderer {
             )
     }
 
+    #[allow(dead_code)]
     pub fn draw_blurred_backdrop(
         &mut self,
         texture: u32,
@@ -986,6 +987,19 @@ impl EglSceneRenderer {
             .as_mut()
             .ok_or("EGL scene renderer is unavailable")?
             .draw_blurred_backdrop(texture, params, corner_radius)
+    }
+
+    pub(crate) fn draw_blurred_backdrop_with_opacity(
+        &mut self,
+        texture: u32,
+        params: crate::graphics::renderer::BackdropParams,
+        corner_radius: f32,
+        opacity: f32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.scene_renderer
+            .as_mut()
+            .ok_or("EGL scene renderer is unavailable")?
+            .draw_blurred_backdrop_with_opacity(texture, params, corner_radius, opacity)
     }
 
     /// 3a3fa2b5 — thin wrapper mirroring `capture_and_blur_background`'s

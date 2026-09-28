@@ -86,6 +86,7 @@ struct BackdropProgram {
     texture_uniform: i32,
     surface_size_uniform: i32,
     corner_radius_uniform: i32,
+    opacity_uniform: i32,
 }
 
 impl BackdropProgram {
@@ -94,11 +95,12 @@ impl BackdropProgram {
         let texture_uniform = unsafe { gl::GetUniformLocation(program, b"blurred_root\0".as_ptr().cast()) };
         let surface_size_uniform = unsafe { gl::GetUniformLocation(program, b"surface_size\0".as_ptr().cast()) };
         let corner_radius_uniform = unsafe { gl::GetUniformLocation(program, b"corner_radius\0".as_ptr().cast()) };
-        if texture_uniform < 0 || surface_size_uniform < 0 || corner_radius_uniform < 0 {
+        let opacity_uniform = unsafe { gl::GetUniformLocation(program, b"surface_opacity\0".as_ptr().cast()) };
+        if texture_uniform < 0 || surface_size_uniform < 0 || corner_radius_uniform < 0 || opacity_uniform < 0 {
             unsafe { gl::DeleteProgram(program); }
             return Err("backdrop shader uniforms are unavailable".into());
         }
-        Ok(Self { program, texture_uniform, surface_size_uniform, corner_radius_uniform })
+        Ok(Self { program, texture_uniform, surface_size_uniform, corner_radius_uniform, opacity_uniform })
     }
 }
 
@@ -533,8 +535,9 @@ impl BackgroundBlurResources {
             return Err("background blur region does not match resources".into());
         }
         unsafe {
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            gl::ReadBuffer(gl::BACK);
+            let mut source_framebuffer = 0;
+            gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut source_framebuffer);
+            gl::ReadBuffer(if source_framebuffer == 0 { gl::BACK } else { gl::COLOR_ATTACHMENT0 });
             gl::ActiveTexture(gl::TEXTURE0);
             gl::BindTexture(gl::TEXTURE_2D, self.textures[0]);
             gl::CopyTexSubImage2D(
@@ -565,7 +568,7 @@ impl BackgroundBlurResources {
                 gl::BindTexture(gl::TEXTURE_2D, texture);
                 gl::DrawArrays(gl::TRIANGLES, 0, 3);
             }
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, source_framebuffer as u32);
         }
         Ok(self.textures[0])
     }
@@ -1073,9 +1076,20 @@ impl SceneRenderer {
         params: BackdropParams,
         corner_radius: f32,
     ) -> Result<(), Box<dyn Error>> {
+        self.draw_blurred_backdrop_with_opacity(blurred_texture, params, corner_radius, 1.0)
+    }
+
+    pub(crate) fn draw_blurred_backdrop_with_opacity(
+        &mut self,
+        blurred_texture: u32,
+        params: BackdropParams,
+        corner_radius: f32,
+        opacity: f32,
+    ) -> Result<(), Box<dyn Error>> {
         if !corner_radius.is_finite() || corner_radius < 0.0 {
             return Err("invalid backdrop corner radius".into());
         }
+        let opacity = SurfaceOpacity::new(opacity).ok_or("invalid backdrop opacity")?;
         let left = i64::from(params.draw_x).max(0).min(i64::from(params.root_width));
         let top = i64::from(params.draw_y).max(0).min(i64::from(params.root_height));
         let right = (i64::from(params.draw_x) + i64::from(params.draw_width))
@@ -1115,7 +1129,6 @@ impl SceneRenderer {
             }
             let backdrop = self.backdrop_program.as_ref().expect("backdrop program exists");
             unsafe {
-                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
                 gl::UseProgram(backdrop.program);
                 gl::ActiveTexture(gl::TEXTURE0);
                 gl::BindTexture(gl::TEXTURE_2D, blurred_texture);
@@ -1130,6 +1143,7 @@ impl SceneRenderer {
                 gl::Uniform1i(backdrop.texture_uniform, 0);
                 gl::Uniform2f(backdrop.surface_size_uniform, params.owner_width as f32, params.owner_height as f32);
                 gl::Uniform1f(backdrop.corner_radius_uniform, corner_radius);
+                gl::Uniform1f(backdrop.opacity_uniform, opacity.value());
                 gl::Enable(gl::BLEND);
                 gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
                 gl::BlendEquation(gl::FUNC_ADD);
@@ -2916,7 +2930,8 @@ mod tests {
         assert!(BACKDROP_FRAGMENT_SHADER.contains("uniform float corner_radius"));
         assert!(BACKDROP_FRAGMENT_SHADER.contains("rounded_distance(local_position,surface_size,radius)"));
         assert!(BACKDROP_FRAGMENT_SHADER.contains("vec4(blurred*c,c)"));
-        assert!(!BACKDROP_FRAGMENT_SHADER.contains("surface_opacity"));
+        assert!(BACKDROP_FRAGMENT_SHADER.contains("uniform float surface_opacity"));
+        assert!(BACKDROP_FRAGMENT_SHADER.contains("*surface_opacity"));
         assert!(!BACKDROP_FRAGMENT_SHADER.contains("texture(blurred_root,texcoord).a"));
     }
 
@@ -3097,4 +3112,4 @@ const BLUR_VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 
 #[allow(dead_code)]
 const BLUR_FRAGMENT_SHADER: &str = "#version 330 core\nout vec4 color;\nuniform sampler2D source;\nuniform vec2 texture_size;\nuniform vec2 direction;\nuniform float radius;\nvoid main(){ vec2 texcoord=gl_FragCoord.xy/texture_size; vec2 step_uv=direction*radius/texture_size; vec4 result=texture(source,texcoord)*0.22702703; result+=(texture(source,texcoord+step_uv)+texture(source,texcoord-step_uv))*0.19459459; result+=(texture(source,texcoord+2.0*step_uv)+texture(source,texcoord-2.0*step_uv))*0.12162162; result+=(texture(source,texcoord+3.0*step_uv)+texture(source,texcoord-3.0*step_uv))*0.05405405; result+=(texture(source,texcoord+4.0*step_uv)+texture(source,texcoord-4.0*step_uv))*0.01621622; color=result; }";
 const BACKDROP_VERTEX_SHADER: &str = "#version 330 core\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec2 uv;\nlayout(location=2) in vec2 local_position_in;\nout vec2 texcoord;\nout vec2 local_position;\nvoid main(){ gl_Position=vec4(position,0.0,1.0); texcoord=uv; local_position=local_position_in; }";
-const BACKDROP_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D blurred_root;\nuniform vec2 surface_size;\nuniform float corner_radius;\nfloat rounded_distance(vec2 point, vec2 size, float radius){ vec2 q=abs(point-size*0.5)-(size*0.5-vec2(radius)); return length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; }\nfloat coverage(float distance){ float aa=max(fwidth(distance),0.0001); return 1.0-smoothstep(-aa,aa,distance); }\nvoid main(){ float radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); float c=coverage(rounded_distance(local_position,surface_size,radius)); vec3 blurred=texture(blurred_root,texcoord).rgb; color=vec4(blurred*c,c); }";
+const BACKDROP_FRAGMENT_SHADER: &str = "#version 330 core\nin vec2 texcoord;\nin vec2 local_position;\nout vec4 color;\nuniform sampler2D blurred_root;\nuniform vec2 surface_size;\nuniform float corner_radius;\nuniform float surface_opacity;\nfloat rounded_distance(vec2 point, vec2 size, float radius){ vec2 q=abs(point-size*0.5)-(size*0.5-vec2(radius)); return length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius; }\nfloat coverage(float distance){ float aa=max(fwidth(distance),0.0001); return 1.0-smoothstep(-aa,aa,distance); }\nvoid main(){ float radius=min(corner_radius,min(surface_size.x,surface_size.y)*0.5); float c=coverage(rounded_distance(local_position,surface_size,radius))*surface_opacity; vec3 blurred=texture(blurred_root,texcoord).rgb; color=vec4(blurred*c,c); }";
