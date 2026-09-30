@@ -7478,6 +7478,7 @@ impl<'a> SceneSession<'a> {
         // not a structural reflow target; preserve other candidate-local
         // p=0 layout frames but never animate this surface's move/resize.
         layout_frames.remove(&update.surface_xid);
+        candidate.provisional_tiling_layout_transitions.remove(&update.surface_xid);
         let workspace_render_frame = self.workspace_transition.as_ref().and_then(|transition| {
             candidate_workspace_render_frame(
                 transition,
@@ -13884,6 +13885,77 @@ mod tests {
         let active = tiling_layout_frames(&candidate, &HashMap::new(), start + TILING_LAYOUT_TRANSITION_DURATION / 2);
         assert!((active[&7].progress - 0.875).abs() < 0.001);
         assert!(tiling_layout_frames(&candidate, &HashMap::new(), start + TILING_LAYOUT_TRANSITION_DURATION).is_empty());
+    }
+
+    #[test]
+    fn interactive_rebase_excludes_dragged_surface_from_committed_layout_transitions() {
+        let xid = 7;
+        let started_at = Instant::now();
+        let mut candidate = super::SceneCandidate {
+            snapshot: SceneSnapshot {
+                root: 1,
+                root_geometry: full_hd_root(),
+                entries: vec![{ let mut entry = visibility_test_entry(geo(100, 0, 100, 100), false); entry.surface_xid = xid; entry }],
+            },
+            generation: 1,
+            resources: HashMap::new(),
+            egl_surfaces: HashMap::new(),
+            damage_leases: Vec::new(),
+            pixmaps: Vec::new(),
+            damage_registry: HashMap::new(),
+            watch_ids: HashSet::new(),
+            watch_additions: Vec::new(),
+            ignored_configure_windows: HashSet::new(),
+            provisional_animations: HashMap::new(),
+            provisional_tiling_layout_transitions: HashMap::from([(
+                xid,
+                TilingLayoutTransition { from: geo(0, 0, 100, 100), to: geo(100, 0, 100, 100), started_at },
+            )]),
+            provisional_render_order: Vec::new(),
+            provisional_closing_frames: HashMap::new(),
+            next_close_id_after: 0,
+            workspace_transition_epoch: None,
+            workspace_publication_identity: None,
+            workspace_transition_plan: None,
+            workspace_transition_started_at: None,
+            suppress_workspace_switch_opens: false,
+            render_outcome: RenderOutcome::default(),
+        };
+        let update = PendingGeometry {
+            surface_xid: xid, x: 150, y: 0, width: 100, height: 100,
+            border_width: 0, override_redirect: true,
+        };
+        rebase_candidate_geometry_fields(&mut candidate.snapshot.entries[0], update);
+        let mut layout_frames = tiling_layout_frames(
+            &HashMap::new(), &candidate.provisional_tiling_layout_transitions, started_at,
+        );
+        layout_frames.remove(&update.surface_xid);
+        assert!(!layout_frames.contains_key(&xid));
+        let mut stale_commit = HashMap::new();
+        stale_commit.extend(candidate.provisional_tiling_layout_transitions.clone());
+        assert_eq!(stale_commit[&xid].to, geo(100, 0, 100, 100));
+        assert_ne!(stale_commit[&xid].to, candidate.snapshot.entries[0].geometry);
+
+        // Rendering needs EGL/X11, so verify that the production rebase also
+        // removes the candidate proposal before commit promotes that map.
+        let source = include_str!("scene.rs");
+        let start = source.find("fn rebase_candidate_pure_move(").unwrap();
+        let end = start + source[start..].find("\n    fn commit_candidate(").unwrap();
+        let rebase = &source[start..end];
+        let commit_start = source.find("fn commit_candidate_inner(").unwrap();
+        let commit = &source[commit_start..];
+        assert!(commit.contains("self.tiling_layout_transitions.extend(candidate.provisional_tiling_layout_transitions.into_iter()"));
+        assert!(
+            rebase.contains("candidate.provisional_tiling_layout_transitions.remove(&update.surface_xid);"),
+            "interactive rebase leaves XID {xid} in the candidate map that commit promotes"
+        );
+        candidate.provisional_tiling_layout_transitions.remove(&update.surface_xid);
+        let mut persistent = HashMap::new();
+        persistent.extend(candidate.provisional_tiling_layout_transitions.into_iter().map(|(id, mut transition)| {
+            transition.started_at = Instant::now();
+            (id, transition)
+        }));
+        assert!(!persistent.contains_key(&xid));
     }
 
     #[test]
